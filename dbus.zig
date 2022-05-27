@@ -41,8 +41,10 @@ const endian_header_value = switch (builtin.cpu.arch.endian()) {
 pub fn writeIntNative(comptime T: type, buf: [*]u8, value: T) void {
     @ptrCast(*align(1) T, buf).* = value;
 }
-pub fn readIntNative(comptime T: type, buf: [*]const u8) T {
-    return @ptrCast(*const align(1) T, buf).*;
+
+pub fn readInt(comptime buf_align: u29, comptime T: type, endian: std.builtin.Endian, buf: [*]align(buf_align) const u8) T {
+    const value = @ptrCast(*const align(buf_align) T, buf).*;
+    return if (builtin.cpu.arch.endian() == endian) value else @byteSwap(T, value);
 }
 
 pub fn strSlice(comptime Len: type, comptime s: []const u8) Slice(Len, [*]const u8) {
@@ -116,7 +118,7 @@ fn serializeString(buf: [*]u8, str: Slice(u32, [*]const u8), align_to: u29) usiz
     return final_len;
 }
 
-const MsgType = enum {
+const DbusDataType = enum {
     byte,
     boolean,
     int16,
@@ -138,8 +140,8 @@ const MsgType = enum {
 
 const string_align = 4; // 4 for the uint32 length
 const struct_align = 4; // 4 for the uint32 length
-fn alignment(msg_type: MsgType) u4 {
-    return switch (msg_type) {
+fn alignment(data_type: DbusDataType) u4 {
+    return switch (data_type) {
         .byte => 1,
         .boolean => 4,
         .int16 => 2,
@@ -301,37 +303,82 @@ pub const method_call_msg = struct {
     }
 };
 
-pub const signal_msg = struct {
-    pub const Args = struct {
-        serial: u32,
-        path: Slice(u32, [*]const u8),
-        interface: Slice(u32, [*]const u8),
-        member: Slice(u32, [*]const u8),
+//pub const signal_msg = struct {
+//    pub const Args = struct {
+//        serial: u32,
+//        path: Slice(u32, [*]const u8),
+//        interface: Slice(u32, [*]const u8),
+//        member: Slice(u32, [*]const u8),
+//    };
+//    pub fn getHeaderLen(args: Args) u32 {
+//        const len =
+//            header_fixed_part_len
+//            + stringEncodeLen(args.path.len, 4)
+//            + stringEncodeLen(args.interface.len, 4)
+//            + stringEncodeLen(args.member.len, 4)
+//        ;
+//        return @intCast(u32, std.mem.alignForward(len, 8));
+//    }
+//    pub fn serialize(msg: [*]u8, args: Args) void {
+//        msg[0] = endian_header_value;
+//        msg[1] = @enumToInt(MessageType.signal);
+//        msg[2] = 0; // flags
+//        msg[3] = 1; // protocol version
+//        const body_length = 0;
+//        writeIntNative(u32, msg + 4, body_length);
+//        writeIntNative(u32, msg + 8, args.serial);
+//
+//        if (true) @panic("TODO: serialize the optional header field array length");
+//
+//        var offset: usize = 12;
+//        offset += serializeString(msg + offset, args.path, 4);
+//        offset += serializeString(msg + offset, args.interface, 4);
+//        offset += serializeString(msg + offset, args.member, 4);
+//        std.debug.assert(std.mem.alignForward(offset, 8) == getHeaderLen(args));
+//    }
+//};
+//
+
+pub const GetMsgLenError = error { InvalidEndianValue, TooBig };
+pub fn getMsgLen(msg: []align(8) u8) GetMsgLenError!u27 {
+    // first thing we check is if we have the whole message
+    if (msg.len < 16) return 0;
+    const endian = switch (msg[0]) {
+        'l' => std.builtin.Endian.Little,
+        'B' => std.builtin.Endian.Big,
+        else => return error.InvalidEndianValue,
     };
-    pub fn getHeaderLen(args: Args) u32 {
-        const len =
-            header_fixed_part_len
-            + stringEncodeLen(args.path.len, 4)
-            + stringEncodeLen(args.interface.len, 4)
-            + stringEncodeLen(args.member.len, 4)
-        ;
-        return @intCast(u32, std.mem.alignForward(len, 8));
-    }
-    pub fn serialize(msg: [*]u8, args: Args) void {
-        msg[0] = endian_header_value;
-        msg[1] = @enumToInt(MessageType.signal);
-        msg[2] = 0; // flasg
-        msg[3] = 1; // protocol version
-        const body_length = 0;
-        writeIntNative(u32, msg + 4, body_length);
-        writeIntNative(u32, msg + 8, args.serial);
+    const body_len = readInt(4, u32, endian, msg.ptr + 4);
+    const field_array_len = readInt(4, u32, endian, msg.ptr + 12);
+    const header_end = 16 + std.mem.alignForward(field_array_len, 8);
+    return std.math.cast(u27, header_end + body_len) catch error.TooBig;
+}
 
-        if (true) @panic("TODO: serialize the optional header field array length");
+pub const MsgTaggedUnion = union(enum) {
+    method_return: *align(8) Msg.MethodReturn,
+};
+//pub fn msgAsTaggedUnion(msg: [*]align(8) u8) ?MsgTaggedUnion {
+//    return switch (msg[1]) {
+//        MessageType.method_return => .{ .method_return = @ptrCast(*align(8) Msg.MethodReturn, msg) },
+//        else => null,
+//    }
+//}
 
-        var offset: usize = 12;
-        offset += serializeString(msg + offset, args.path, 4);
-        offset += serializeString(msg + offset, args.interface, 4);
-        offset += serializeString(msg + offset, args.member, 4);
-        std.debug.assert(std.mem.alignForward(offset, 8) == getHeaderLen(args));
-    }
+pub const Msg = extern union {
+//    generic: Generic,
+//    method_call: void,
+    method_return: MethodReturn,
+//    error_reply: void,
+//    signal: void,
+//
+//    pub const Generic = extern struct {
+//        endian: u8,
+//        message_type: u8,
+//        flags: u8,
+//        protocol_version: u8,
+//        body_length: u32,
+//        serial: u32,
+//    };
+    pub const MethodReturn = extern struct {
+    };
 };

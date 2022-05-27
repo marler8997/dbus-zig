@@ -39,13 +39,36 @@ pub fn main() !u8 {
     }
 
     {
-        var buf: [1000]u8 = undefined;
+        var buf: [1000]u8 align(8) = undefined;
         std.log.info("reading reply...", .{});
         const len = connection.reader().read(&buf) catch |err| switch (err) {
             //error.StreamTooLong => return error.MalformedReply,
             else => |e| return e,
         };
-        std.log.info("reply is '{}'", .{std.zig.fmtEscapes(buf[0..len])});
+        if (len == 0) {
+            std.log.info("read EOF", .{});
+            return 0xff;
+        }
+        //std.log.info("reply is {} bytes: '{}'", .{len, std.zig.fmtEscapes(buf[0..len])});
+
+        var offset: usize = 0;
+        while (true) {
+            const msg_len = try dbus.getMsgLen(buf[offset..len]);
+            if (msg_len == 0) break;
+            const msg = buf[offset..offset+msg_len];
+            std.log.info("got {}-byte msg '{}'", .{msg_len, std.zig.fmtEscapes(msg)});
+            offset += msg_len;
+            if (offset == len) break;
+        }
+        if (offset != len) {
+            std.debug.panic("todo: handle partial messages", .{});
+        }
+
+        //switch (try dbus.parseMsg(buf[0..len])) {
+        //.partial => {
+        //@panic("todo");
+    //},
+    //}
     }
 
 
