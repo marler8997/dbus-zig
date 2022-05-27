@@ -23,6 +23,7 @@ pub fn build(b: *Builder) void {
     }
     {
         const exe = b.addExecutable("daemon", "daemon.zig");
+        exe.single_threaded = true;
         exe.setTarget(target);
         exe.setBuildMode(mode);
         exe.addPackagePath("dbus", "dbus.zig");
