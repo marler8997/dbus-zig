@@ -38,40 +38,49 @@ pub fn main() !u8 {
         try connection.writer().writeAll(&msg);
     }
 
-    {
+    while (true) {
+        std.log.info("reading msg...", .{});
         var buf: [1000]u8 align(8) = undefined;
-        std.log.info("reading reply...", .{});
-        const len = connection.reader().read(&buf) catch |err| switch (err) {
-            //error.StreamTooLong => return error.MalformedReply,
-            else => |e| return e,
+        const msg_len = dbus.readOneMsg(connection.reader(), &buf) catch |err| {
+            std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
+            return 0xff;
         };
-        if (len == 0) {
-            std.log.info("read EOF", .{});
+        if (msg_len > buf.len) {
+            std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, msg_len});
             return 0xff;
         }
-        //std.log.info("reply is {} bytes: '{}'", .{len, std.zig.fmtEscapes(buf[0..len])});
-
-        var offset: usize = 0;
-        while (true) {
-            const msg_len = (try dbus.getMsgLen(buf[offset..len])) orelse break;
-            const msg_end = offset + msg_len;
-            if (msg_end > buf.len) break;
-            const msg = buf[offset..msg_end];
-            std.log.info("got {}-byte msg '{}'", .{msg_len, std.zig.fmtEscapes(msg)});
-            offset = msg_end;
-            if (offset == len) break;
-        }
-        if (offset != len) {
-            std.debug.panic("todo: handle partial messages", .{});
-        }
-
-        //switch (try dbus.parseMsg(buf[0..len])) {
-        //.partial => {
-        //@panic("todo");
-    //},
-    //}
+        std.log.info("got {}-byte msg: '{}'", .{msg_len, std.zig.fmtEscapes(buf[0..msg_len])});
     }
 
+//    {
+//        var buf: [1000]u8 align(8) = undefined;
+//        std.log.info("reading reply...", .{});
+//        const len = connection.reader().read(&buf) catch |err| switch (err) {
+//            //error.StreamTooLong => return error.MalformedReply,
+//            else => |e| return e,
+//        };
+//        if (len == 0) {
+//            std.log.info("read EOF", .{});
+//            return 0xff;
+//        }
+//        //std.log.info("reply is {} bytes: '{}'", .{len, std.zig.fmtEscapes(buf[0..len])});
+//
+//        var offset: usize = 0;
+//        while (true) {
+//            const msg_len = (try dbus.getMsgLen(buf[offset..len])) orelse break;
+//            const msg_end = offset + msg_len;
+//            if (msg_end > buf.len) break;
+//            const msg = buf[offset..msg_end];
+//            std.log.info("got {}-byte msg '{}'", .{msg_len, std.zig.fmtEscapes(msg)});
+//            offset = msg_end;
+//            if (offset == len) break;
+//        }
+//        if (offset != len) {
+//            std.debug.panic("todo: handle partial messages", .{});
+//        }
+//
+//    }
+//
 
 //    {
 //        const args = comptime dbus.signal_msg.Args {

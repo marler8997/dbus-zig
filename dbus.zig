@@ -372,6 +372,9 @@ pub const GetMsgLenError = error { InvalidEndianValue, TooBig };
 pub fn getMsgLen(msg: []const align(8) u8) GetMsgLenError!?u27 {
     // first thing we check is if we have the whole message
     if (msg.len < 16) return null;
+    return try getMsgLenAssumeAtLeast16(msg);
+}
+pub fn getMsgLenAssumeAtLeast16(msg: []const align(8) u8) GetMsgLenError!u27 {
     const endian = switch (msg[0]) {
         'l' => std.builtin.Endian.Little,
         'B' => std.builtin.Endian.Big,
@@ -411,3 +414,41 @@ pub const Msg = extern union {
     pub const MethodReturn = extern struct {
     };
 };
+
+fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStream})!void {
+    std.debug.assert(buf.len > 0);
+    var total_received : usize = 0;
+    while (true) {
+        const last_received = try reader.read(buf[total_received..]);
+        if (last_received == 0)
+            return error.EndOfStream;
+        total_received += last_received;
+        if (total_received == buf.len)
+            break;
+    }
+}
+
+/// The caller must check whether the length returned is larger than the provided `buf`.
+/// If it is, then only the first 16-bytes have been read.  The caller can allocate a new
+/// buffer large enough to accomodate and finish reading the message by copying the first
+/// 16 bytes to the new buffer then calling `readOneMsgFinish`.
+pub fn readOneMsg(reader: anytype, buf: []align(8) u8) !u27 {
+    std.debug.assert(buf.len >= 16);
+    try readFull(reader, buf[0 .. 16]);
+    const msg_len = getMsgLenAssumeAtLeast16(buf) catch |err| switch (err) {
+        error.InvalidEndianValue => return error.DbusMsgInvalidEndianValue,
+        error.TooBig => return error.DbusMsgTooBig,
+    };
+    if (msg_len <= buf.len) {
+        try readOneMsgFinish(reader, buf[0 .. msg_len]);
+    }
+    return msg_len;
+}
+
+pub fn readOneMsgFinish(reader: anytype, buf: []align(8) u8) !void {
+    if (builtin.mode == .Debug) {
+        const msg_len = getMsgLenAssumeAtLeast16(buf) catch unreachable;
+        std.debug.assert(buf.len == msg_len);
+    }
+    try readFull(reader, buf[16..]);
+}
