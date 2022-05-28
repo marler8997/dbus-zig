@@ -231,6 +231,58 @@ const pad = struct {
     }
 };
 
+const LenEncoder = struct {
+    len: u27 = 0,
+    pub fn set(self: *LenEncoder, comptime T: type, offset: u27, value: T) void {
+        _ = value;
+        switch (T) {
+            u8 => self.len = std.math.max(self.len, offset + 1),
+            u32 => self.len = std.math.max(self.len, offset + 4),
+            else => @compileError("LenEncoder.set does not support: " ++ @typeName(T)),
+        }
+    }
+    pub fn setBytes(self: *LenEncoder, start: u27, end: u27, val: u8) void {
+        _ = start;
+        _ = val;
+        self.len = std.math.max(self.len, end);
+    }
+    pub fn setHeaderFieldString(
+        self: *LenEncoder,
+        offset: u27,
+        kind: HeaderFieldStringKind,
+        str: Slice(u32, [*]const u8),
+    ) u27 {
+        _ = kind;
+        var len: u27 = pad.getLen(toAlign(offset), struct_align);
+        len += header_field.getLen(toAlign(offset + len), str.len);
+        self.len = std.math.max(self.len, offset + len);
+        return len;
+    }
+};
+
+const MsgEncoder = struct {
+    msg: [*]u8,
+    pub fn set(self: *MsgEncoder, comptime T: type, offset: u27, value: T) void {
+        switch (T) {
+            u8 => self.msg[offset] = value,
+            u32 => writeIntNative(u32, self.msg + offset, value),
+            else => @compileError("MsgEncoder.set does not support: " ++ @typeName(T)),
+        }
+    }
+    pub fn setBytes(self: *MsgEncoder, start: u27, end: u27, val: u8) void {
+        std.mem.set(u8, self.msg[start..end], val);
+    }
+    pub fn setHeaderFieldString(
+        self: *MsgEncoder,
+        offset: u27,
+        kind: HeaderFieldStringKind,
+        str: Slice(u32, [*]const u8),
+    ) u27 {
+        const pad_len = pad.serialize(self.msg + offset, toAlign(offset), struct_align);
+        const str_offset = offset + pad_len;
+        return pad_len + header_field.serialize(self.msg + str_offset, toAlign(str_offset), kind, str);
+    }
+};
 
 pub const method_call_msg = struct {
     pub const Args = struct {
@@ -242,64 +294,41 @@ pub const method_call_msg = struct {
         signature: ?Slice(u32, [*]const u8) = null,
     };
 
-    pub fn getHeaderLen(args: Args) u27 {
-        var len: u27 =
-            4 // endian/type/flags/version
-            + 4 // body_length
-            + 4 // serial
-            + 4 // field array length
-        ;
-        len += pad.getLen(toAlign(len), struct_align);
-        len += header_field.getLen(toAlign(len), args.path.len);
-        if (args.destination) |arg| {
-            len += pad.getLen(toAlign(len), struct_align);
-            len += header_field.getLen(toAlign(len), arg.len);
-        }
-        if (args.interface) |arg| {
-            len += pad.getLen(toAlign(len), struct_align);
-            len += header_field.getLen(toAlign(len), arg.len);
-        }
-        if (args.member) |arg| {
-            len += pad.getLen(toAlign(len), struct_align);
-            len += header_field.getLen(toAlign(len), arg.len);
-        }
-        if (args.signature) |_| @panic("not impl");
-        return @intCast(u27, std.mem.alignForward(len, 8));
-    }
-    pub fn serialize(msg: [*]u8, args: Args) void {
-        msg[0] = endian_header_value;
-        msg[1] = @enumToInt(MessageType.method_call);
-        msg[2] = 0; // flasg
-        msg[3] = 1; // protocol version
+    pub fn encode(comptime Encoder: type, encoder: Encoder, args: Args) void {
+        encoder.set(u8, 0, endian_header_value);
+        encoder.set(u8, 1, @enumToInt(MessageType.method_call));
+        encoder.set(u8, 2, 0); // flags
+        encoder.set(u8, 3, 1); // protocol version
         const body_length = 0;
-        writeIntNative(u32, msg + 4, body_length);
-        writeIntNative(u32, msg + 8, args.serial);
+        encoder.set(u32, 4, body_length);
+        encoder.set(u32, 8, args.serial);
         // offset 12 is the array data length, will serialize below
-
         // note: offset(16) is already 8-byte aligned here
-        var offset = 16 + header_field.serialize(msg + 16, toAlign(16), .path, args.path);
-
+        var field_array_len = encoder.setHeaderFieldString(16, .path, args.path);
         if (args.destination) |arg| {
-            offset += pad.serialize(msg + offset, toAlign(offset), struct_align);
-            offset += header_field.serialize(msg + offset, toAlign(offset), .destination, arg);
+            field_array_len += encoder.setHeaderFieldString(16 + field_array_len, .destination, arg);
         }
         if (args.interface) |arg| {
-            offset += pad.serialize(msg + offset, toAlign(offset), struct_align);
-            offset += header_field.serialize(msg + offset, toAlign(offset), .interface, arg);
+            field_array_len += encoder.setHeaderFieldString(16 + field_array_len, .interface, arg);
         }
         if (args.member) |arg| {
-            offset += pad.serialize(msg + offset, toAlign(offset), struct_align);
-            offset += header_field.serialize(msg + offset, toAlign(offset), .member, arg);
+            field_array_len += encoder.setHeaderFieldString(16 + field_array_len, .member, arg);
         }
 
         // TODO: is the array length the padded or non-padded length?
-        writeIntNative(u32, msg + 12, @intCast(u32, offset - 12 - 4));
+        encoder.set(u32, 12, @intCast(u32, field_array_len));
 
-        const end = std.mem.alignForward(offset, 8);
-        std.mem.set(u8, msg[offset..end], 0);
-
-        std.log.info("end={} getHeaderLen={}", .{end, getHeaderLen(args)});
-        std.debug.assert(end == getHeaderLen(args));
+        const end = @intCast(u27, std.mem.alignForward(16 + field_array_len, 8));
+        encoder.setBytes(16 + field_array_len, end, 0);
+    }
+    pub fn getHeaderLen(args: Args) u27 {
+        var encoder = LenEncoder { };
+        encode(*LenEncoder, &encoder, args);
+        return encoder.len;
+    }
+    pub fn serialize(msg: [*]u8, args: Args) void {
+        var encoder = MsgEncoder { .msg = msg };
+        encode(*MsgEncoder, &encoder, args);
     }
 };
 
@@ -340,9 +369,9 @@ pub const method_call_msg = struct {
 //
 
 pub const GetMsgLenError = error { InvalidEndianValue, TooBig };
-pub fn getMsgLen(msg: []align(8) u8) GetMsgLenError!u27 {
+pub fn getMsgLen(msg: []const align(8) u8) GetMsgLenError!?u27 {
     // first thing we check is if we have the whole message
-    if (msg.len < 16) return 0;
+    if (msg.len < 16) return null;
     const endian = switch (msg[0]) {
         'l' => std.builtin.Endian.Little,
         'B' => std.builtin.Endian.Big,

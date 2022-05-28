@@ -149,7 +149,7 @@ const ListenSockHandler = struct {
             error.Unexpected,
             => unreachable,
         };
-        std.log.info("s={}: accepted", .{new_fd});
+        std.log.info("s={}: new connection", .{new_fd});
     }
 };
 
@@ -157,7 +157,7 @@ const DataSockHandler = struct {
     base: EpollHandler = .{ .handle = handle },
     allocator: std.mem.Allocator,
     sock: os.socket_t,
-    partial: std.ArrayListUnmanaged(u8) = .{},
+    partial: std.ArrayListAlignedUnmanaged(u8, 8) = .{},
     state: union(enum) {
         auth: struct {
             authenticated: bool = false,
@@ -193,7 +193,7 @@ const DataSockHandler = struct {
                 self.partial.items.len = new_len;
             }
         } else {
-            var buf: [2000]u8 = undefined;
+            var buf: [2000]u8 align(8) = undefined;
             const len = try self.read(&buf);
             const processed = try self.process(buf[0 .. len]);
             if (processed < len) {
@@ -226,7 +226,7 @@ const DataSockHandler = struct {
         return len;
     }
 
-    fn process(self: *DataSockHandler, buf: []const u8) error{Handled}!usize {
+    fn process(self: *DataSockHandler, buf: []align(8) const u8) error{Handled}!usize {
         std.debug.assert(buf.len > 0);
         var total_processed: usize = 0;
         while (true) {
@@ -236,13 +236,13 @@ const DataSockHandler = struct {
         }
     }
 
-    fn processSingle(self: *DataSockHandler, buf: []const u8) error{Handled}!usize {
+    fn processSingle(self: *DataSockHandler, buf: []align(8) const u8) error{Handled}!usize {
         switch (self.state) {
             .auth => |*auth| {
                 const offsets = parseLineOffsets(buf);
                 if (offsets.end > 0) {
                     const line = buf[0 .. offsets.len];
-                    std.log.info("got command '{}'", .{std.zig.fmtEscapes(line)});
+                    std.log.info("s={}: got command '{}'", .{self.sock, std.zig.fmtEscapes(line)});
 
                     const auth_external_prefix = "\x00AUTH EXTERNAL ";
                     if (std.mem.startsWith(u8, line, auth_external_prefix)) {
@@ -277,8 +277,17 @@ const DataSockHandler = struct {
                 return offsets.end;
             },
             .begun => {
-                std.log.info("received {} bytes of data: '{}'", .{buf.len, std.zig.fmtEscapes(buf)});
-                return buf.len;
+                const msg_len = (dbus.getMsgLen(buf) catch |err| {
+                    std.log.info("s={}: malformed message: {s}", .{self.sock, @errorName(err)});
+                    self.deinit();
+                    return error.Handled;
+                }) orelse return 0;
+                if (msg_len > buf.len) {
+                    std.log.debug("s={}: received partial message of {} bytes", .{self.sock, buf.len});
+                    return 0;
+                }
+                std.log.info("s={}: got msg {}-byte message '{}'", .{self.sock, msg_len, std.zig.fmtEscapes(buf)});
+                return msg_len;
             },
         }
     }

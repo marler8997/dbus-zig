@@ -53,11 +53,12 @@ pub fn main() !u8 {
 
         var offset: usize = 0;
         while (true) {
-            const msg_len = try dbus.getMsgLen(buf[offset..len]);
-            if (msg_len == 0) break;
-            const msg = buf[offset..offset+msg_len];
+            const msg_len = (try dbus.getMsgLen(buf[offset..len])) orelse break;
+            const msg_end = offset + msg_len;
+            if (msg_end > buf.len) break;
+            const msg = buf[offset..msg_end];
             std.log.info("got {}-byte msg '{}'", .{msg_len, std.zig.fmtEscapes(msg)});
-            offset += msg_len;
+            offset = msg_end;
             if (offset == len) break;
         }
         if (offset != len) {
