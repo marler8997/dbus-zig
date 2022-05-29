@@ -56,12 +56,20 @@ pub fn main() !u8 {
             }
         };
         @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
-        const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, &buf), msg_len));
+        const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, &buf), msg_len)) catch |err| {
+            std.log.err("malformed reply: {s}", .{@errorName(err)});
+            return 0xff;
+        };
         const msg_type = dbus.parseMsgType(&buf) orelse {
             std.log.err("malformed reply, unknown msg type", .{});
             return 0xff;
         };
         std.log.info("type={s} serial={}", .{@tagName(msg_type), parsed.serial(&buf)});
+        switch (parsed.headers) {
+            .method_return => |headers| {
+                std.log.info("MethodReturn {}", .{headers});
+            },
+        }
         {
             var it = parsed.headerArrayIterator();
             while (it.next(&buf) catch |err| switch (err) {

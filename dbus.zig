@@ -408,8 +408,17 @@ pub fn parseMsgType(msg_ptr: [*]const align(8) u8) ?MessageType {
 pub const ParsedMsg = struct {
     endian: std.builtin.Endian,
     header_end: u27,
-    //required_headers: union(enum) {
-    //},
+    unknown_header_count: u32,
+    headers: Headers,
+    pub const Headers = union(enum) {
+        method_return: struct {
+            reply_serial: u32,
+            destination: ?[]const u8,
+            sender: ?[]const u8,
+            signature: ?[]const u8,
+            unix_fds: ?u32,
+        },
+    };
 
     pub fn serial(self: ParsedMsg, msg_ptr: [*]const align(8) u8) u32 {
         return readInt(u32, self.endian, 8, msg_ptr + 8);
@@ -512,18 +521,124 @@ pub const ParsedMsg = struct {
     }
 };
 
+
+pub const ParsedMsgError = error {
+    InvalidMsgType,
+    DuplicateHeader,
+}
+|| ParsedMsg.HeaderArrayIterator.NextError
+|| HeaderParser.ToParsedHeadersError
+;
+
 /// parse a complete message (msg is exactly 1 complete message)
-pub fn parseMsgAssumeGetMsgLen(msg: Slice(u27, [*]const align(8) u8)) ParsedMsg {
+pub fn parseMsgAssumeGetMsgLen(msg: Slice(u27, [*]const align(8) u8)) ParsedMsgError!ParsedMsg {
     std.debug.assert((getMsgLenAssumeAtLeast16(msg.nativeSlice()) catch unreachable) == msg.len);
     // an invalid endian value should be impossible because this would have been caught in getMsgLen
     const endian = getEndian(msg.ptr[0]) orelse unreachable;
     const header_array_len = readInt(u32, endian, comptime toAlign(4), msg.ptr + 12);
     const header_end = @intCast(u27, 16 + std.mem.alignForward(header_array_len, 8));
-    return .{
+    const msg_type = parseMsgType(msg.ptr) orelse return error.InvalidMsgType;
+    var header_parser = HeaderParser{};
+    {
+        var it = ParsedMsg.HeaderArrayIterator{
+            .endian = endian,
+            .header_end = header_end,
+        };
+        while (try it.next(msg.ptr)) |header_field| {
+            switch (header_field) {
+                .unknown => header_parser.unknown_header_count += 1,
+                .string => |str| {
+                    const str_ptr = header_parser.getStringHeaderPtr(str.kind);
+                    if (str_ptr.*) |_| return error.DuplicateHeader;
+                    str_ptr.* = str.str;
+                },
+                .uint32 => |u| {
+                    const uint_ptr = header_parser.getUint32HeaderPtr(u.kind);
+                    if (uint_ptr.*) |_| return error.DuplicateHeader;
+                    uint_ptr.* = u.val;
+                },
+                .sig => |s| {
+                    if (header_parser.signature) |_| return error.DuplicateHeader;
+                    header_parser.signature = s;
+                },
+            }
+        }
+    }
+
+    return ParsedMsg{
         .endian = endian,
         .header_end = header_end,
+        .unknown_header_count = header_parser.unknown_header_count,
+        .headers = try header_parser.toParsedHeaders(msg_type),
     };
 }
+
+const HeaderParser = struct {
+    unknown_header_count: u32 = 0,
+    path        : ?[:0]const u8 = null,
+    interface   : ?[:0]const u8 = null,
+    member      : ?[:0]const u8 = null,
+    error_name  : ?[:0]const u8 = null,
+    reply_serial: ?u32 = null,
+    destination : ?[:0]const u8 = null,
+    sender      : ?[:0]const u8 = null,
+    signature   : ?[:0]const u8 = null,
+    unix_fds    : ?u32 = null,
+    pub fn getStringHeaderPtr(
+        self: *HeaderParser,
+        kind: HeaderFieldStringKind,
+    ) *?[:0]const u8 {
+        return switch (kind) {
+            .path => &self.path,
+            .interface => &self.interface,
+            .member => &self.member,
+            .error_name => &self.error_name,
+            .destination => &self.destination,
+            .sender => &self.sender,
+        };
+    }
+    pub fn getUint32HeaderPtr(
+        self: *HeaderParser,
+        kind: HeaderFieldUint32Kind,
+    ) *?u32 {
+        return switch (kind) {
+            .reply_serial => &self.reply_serial,
+            .unix_fds => &self.unix_fds,
+        };
+    }
+    pub const ToParsedHeadersError = error {
+        MissingSerialHeader,
+        UnexpectedPathHeader,
+        UnexpectedInterfaceHeader,
+        UnexpectedMemberHeader,
+        UnexpectedErrorHeader,
+    };
+    pub fn toParsedHeaders(
+        self: HeaderParser,
+        msg_type: MessageType,
+    ) ToParsedHeadersError!ParsedMsg.Headers {
+        switch (msg_type) {
+            .method_call => @panic("todo"),
+            .method_return => {
+                if (self.path) |_| return error.UnexpectedPathHeader;
+                if (self.interface) |_| return error.UnexpectedInterfaceHeader;
+                if (self.member) |_| return error.UnexpectedMemberHeader;
+                if (self.error_name) |_| return error.UnexpectedErrorHeader;
+                return ParsedMsg.Headers{
+                    .method_return = .{
+                        .reply_serial = self.reply_serial orelse return error.MissingSerialHeader,
+                        .destination = self.destination,
+                        .sender = self.sender,
+                        .signature = self.signature,
+                        .unix_fds = self.unix_fds,
+                    },
+                };
+            },
+            .error_reply => @panic("todo"),
+            .signal => @panic("todo: header_parser to signal"),
+        }
+    }
+};
 
 pub const MsgTaggedUnion = union(enum) {
     method_return: *align(8) Msg.MethodReturn,
