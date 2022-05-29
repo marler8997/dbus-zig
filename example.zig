@@ -49,7 +49,13 @@ pub fn main() !u8 {
             std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, msg_len});
             return 0xff;
         }
-        std.log.info("got {}-byte msg: '{}'", .{msg_len, std.zig.fmtEscapes(buf[0..msg_len])});
+        std.log.info("got {}-byte msg:", .{msg_len});
+        const func = struct {
+            pub fn log(line: []const u8) void {
+                std.log.info("{s}", .{line});
+            }
+        };
+        @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
         const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, &buf), msg_len));
         const msg_type = dbus.parseMsgType(&buf) orelse {
             std.log.err("malformed reply, unknown msg type", .{});
