@@ -185,15 +185,15 @@ const HeaderFieldUint32Kind = enum(u8) {
     unix_fds = 9,
 };
 const HeaderFieldKind = enum(u8) {
-    path = @enumToInt(HeaderFieldStringKind.path),
-    interface = @enumToInt(HeaderFieldStringKind.interface),
-    member = @enumToInt(HeaderFieldStringKind.member),
-    error_name = @enumToInt(HeaderFieldStringKind.error_name),
+    path         = @enumToInt(HeaderFieldStringKind.path),
+    interface    = @enumToInt(HeaderFieldStringKind.interface),
+    member       = @enumToInt(HeaderFieldStringKind.member),
+    error_name   = @enumToInt(HeaderFieldStringKind.error_name),
     reply_serial = @enumToInt(HeaderFieldUint32Kind.reply_serial),
-    destination = @enumToInt(HeaderFieldStringKind.destination),
-    sender = @enumToInt(HeaderFieldStringKind.sender),
-    signature = 8,
-    unix_fds = @enumToInt(HeaderFieldUint32Kind.unix_fds),
+    destination  = @enumToInt(HeaderFieldStringKind.destination),
+    sender       = @enumToInt(HeaderFieldStringKind.sender),
+    signature    = 8,
+    unix_fds     = @enumToInt(HeaderFieldUint32Kind.unix_fds),
 };
 
 fn toAlign(len: usize) u4 {
@@ -203,27 +203,27 @@ fn alignAdd(in_align: u4, addend: usize) u4 {
     return toAlign(@intCast(usize, in_align) + addend);
 }
 
-const header_field = struct {
-    fn getLen(in_align: u4, string_len: u32) u27 {
+const header_field_string = struct {
+    fn getLen(string_len: u32) u27 {
         return @intCast(u27,
-            3 + // kind, typesig
-            pad.getLen(alignAdd(in_align, 3), string_align) +
-            4 + // string length uint32
+            4 + // 1 for kind, 3 for type sig
+            4 + // string length uint32 (already aligned to 4)
             string_len + 1 // add 1 for null-terminator
         );
     }
-    fn serialize(msg: [*]u8, in_align: u4, kind: HeaderFieldStringKind, str: Slice(u32, [*]const u8)) u27 {
+    fn serialize(msg: [*]u8, kind: HeaderFieldStringKind, str: Slice(u32, [*]const u8)) u27 {
         msg[0] = @enumToInt(kind);
         msg[1] = 1; // type-sig length
         msg[2] = kind.typeSig();
-        const pad_len = pad.getLen(alignAdd(in_align, 3), string_align);
-        std.mem.set(u8, msg[3..3 + pad_len], 0);
-        const str_off = 3 + pad_len;
+        msg[3] = 0; // null-terminator
+        const str_off = 4;
+        // no padding
+        comptime std.debug.assert(0 == pad.getLen(str_off, string_align));
         writeIntNative(u32, msg + str_off, str.len);
         @memcpy(msg + str_off + 4, str.ptr, str.len);
         const end = str_off + 4 + str.len;
         msg[end] = 0;
-        std.debug.assert(getLen(in_align, str.len) == end + 1);
+        std.debug.assert(getLen(str.len) == end + 1);
         return @intCast(u27, end + 1);
     }
 };
@@ -261,7 +261,7 @@ const LenEncoder = struct {
     ) u27 {
         _ = kind;
         var len: u27 = pad.getLen(toAlign(offset), struct_align);
-        len += header_field.getLen(toAlign(offset + len), str.len);
+        len += header_field_string.getLen(str.len);
         self.len = std.math.max(self.len, offset + len);
         return len;
     }
@@ -287,7 +287,7 @@ const MsgEncoder = struct {
     ) u27 {
         const pad_len = pad.serialize(self.msg + offset, toAlign(offset), struct_align);
         const str_offset = offset + pad_len;
-        return pad_len + header_field.serialize(self.msg + str_offset, toAlign(str_offset), kind, str);
+        return pad_len + header_field_string.serialize(self.msg + str_offset, kind, str);
     }
 };
 
@@ -408,6 +408,8 @@ pub fn parseMsgType(msg_ptr: [*]const align(8) u8) ?MessageType {
 pub const ParsedMsg = struct {
     endian: std.builtin.Endian,
     header_end: u27,
+    //required_headers: union(enum) {
+    //},
 
     pub fn serial(self: ParsedMsg, msg_ptr: [*]const align(8) u8) u32 {
         return readInt(u32, self.endian, 8, msg_ptr + 8);
@@ -444,6 +446,7 @@ pub const ParsedMsg = struct {
                 string: HeaderFieldStringKind,
                 uint32: HeaderFieldUint32Kind,
                 signature: void,
+                unknown: u8,
             } = switch (msg_ptr[start]) {
                 @enumToInt(HeaderFieldKind.path) => .{ .string = .path },
                 @enumToInt(HeaderFieldKind.interface) => .{ .string = .interface },
@@ -454,10 +457,7 @@ pub const ParsedMsg = struct {
                 @enumToInt(HeaderFieldKind.sender) => .{ .string = .sender },
                 @enumToInt(HeaderFieldKind.signature) => .signature,
                 @enumToInt(HeaderFieldKind.unix_fds) => .{ .uint32 = .unix_fds },
-                else => |id| {
-                    self.offset = self.header_end; // we have to skip the rest of the fields
-                    return HeaderField{ .unknown = .{ .id = id } };
-                },
+                else => |id| .{ .unknown = id },
             };
             switch (parse_type) {
                 .string => |kind| {
@@ -465,6 +465,7 @@ pub const ParsedMsg = struct {
                     if (string_start > self.header_end) return error.FieldTooBig;
                     if (msg_ptr[start + 1] != 1) return error.UnexpectedTypeSig;
                     if (msg_ptr[start + 2] != kind.typeSig()) return error.UnexpectedTypeSig;
+                    if (msg_ptr[start + 3] != 0) return error.UnexpectedTypeSig;
                     const string_len = readInt(u32, self.endian, 4, @alignCast(4, msg_ptr + start + 4));
                     // string_len + 1 for null terminator
                     const field_end = string_start + std.mem.alignForward(string_len + 1, 8);
@@ -484,21 +485,24 @@ pub const ParsedMsg = struct {
                     return HeaderField{ .uint32 = .{ .kind = kind, .val = val } };
                 },
                 .signature => {
-                    // NOTE: this appears to be a departure from the spec, the signature value itself
-                    //       seems to be 4-byte aligned
-                    const sig_start = start + 5;
-                    if (sig_start > self.header_end) return error.FieldTooBig;
+                    const sig_content_start = start + 5;
+                    if (sig_content_start > self.header_end) return error.FieldTooBig;
                     if (msg_ptr[start + 1] != 1) return error.UnexpectedTypeSig;
                     if (msg_ptr[start + 2] != 'g') return error.UnexpectedTypeSig;
-                    // NOTE: if sig is not 4-byte-aligned then this would be +3 instead of +4
+                    if (msg_ptr[start + 3] != 0) return error.UnexpectedTypeSig;
                     const sig_len = msg_ptr[start + 4];
                     // sign_len + 1 for null terminator
-                    const field_end = std.mem.alignForward(sig_start + sig_len + 1, 8);
+                    const field_end = std.mem.alignForward(sig_content_start + sig_len + 1, 8);
                     if (field_end > self.header_end) return error.FieldTooBig;
-                    const sig = msg_ptr[sig_start .. sig_start + sig_len];
+                    const sig = msg_ptr[sig_content_start .. sig_content_start + sig_len];
                     if (sig.ptr[sig_len] != 0) return error.NoNullTerm;
                     self.offset = @intCast(u27, field_end);
                     return HeaderField{ .sig = std.meta.assumeSentinel(sig, 0) };
+                },
+                .unknown => |id| {
+                    std.log.warn("TODO: got unknown header field id '{}', use the type signature to skip it", .{id});
+                    self.offset = self.header_end;
+                    return HeaderField{ .unknown = .{ .id = id } };
                 },
             }
         }
