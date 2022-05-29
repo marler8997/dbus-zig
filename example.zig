@@ -50,6 +50,35 @@ pub fn main() !u8 {
             return 0xff;
         }
         std.log.info("got {}-byte msg: '{}'", .{msg_len, std.zig.fmtEscapes(buf[0..msg_len])});
+        const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, &buf), msg_len));
+        const msg_type = dbus.parseMsgType(&buf) orelse {
+            std.log.err("malformed reply, unknown msg type", .{});
+            return 0xff;
+        };
+        std.log.info("type={s} serial={}", .{@tagName(msg_type), parsed.serial(&buf)});
+        {
+            var it = parsed.headerArrayIterator();
+            while (it.next(&buf) catch |err| switch (err) {
+                error.FieldTooBig,
+                error.UnexpectedTypeSig,
+                error.NoNullTerm,
+                => {
+                    std.log.info("malformed reply {s}", .{@errorName(err)});
+                    return 0xff;
+                },
+            }) |header_field| {
+                switch (header_field) {
+                    .unknown => |id| {
+                        std.log.info("malformed reply, uknown header field {}", .{id});
+                        return 0xff;
+                    },
+                    .string => |str| std.log.info("header_field {s} '{s}'", .{@tagName(str.kind), str.str}),
+                    .uint32 => |u| std.log.info("header_field {s} {}", .{@tagName(u.kind), u.val}),
+                    .sig => |s| std.log.info("header_field signature '{s}'", .{s}),
+                }
+            }
+        }
+        _ = parsed;
     }
 
 //    {
