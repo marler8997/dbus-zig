@@ -682,21 +682,26 @@ fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStr
     }
 }
 
+
+pub const ReadOneMsg = union(enum) {
+    partial: u27,
+    complete: u27,
+};
 /// The caller must check whether the length returned is larger than the provided `buf`.
 /// If it is, then only the first 16-bytes have been read.  The caller can allocate a new
 /// buffer large enough to accomodate and finish reading the message by copying the first
 /// 16 bytes to the new buffer then calling `readOneMsgFinish`.
-pub fn readOneMsg(reader: anytype, buf: []align(8) u8) !u27 {
+pub fn readOneMsg(reader: anytype, buf: []align(8) u8) !ReadOneMsg {
     std.debug.assert(buf.len >= 16);
     try readFull(reader, buf[0 .. 16]);
     const msg_len = getMsgLenAssumeAtLeast16(buf) catch |err| switch (err) {
         error.InvalidEndianValue => return error.DbusMsgInvalidEndianValue,
         error.TooBig => return error.DbusMsgTooBig,
     };
-    if (msg_len <= buf.len) {
-        try readOneMsgFinish(reader, buf[0 .. msg_len]);
-    }
-    return msg_len;
+    if (msg_len > buf.len) return ReadOneMsg{ .partial = msg_len };
+
+    try readOneMsgFinish(reader, buf[0 .. msg_len]);
+    return ReadOneMsg{ .complete = msg_len };
 }
 
 pub fn readOneMsgFinish(reader: anytype, buf: []align(8) u8) !void {

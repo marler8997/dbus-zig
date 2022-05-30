@@ -38,11 +38,46 @@ pub fn main() !u8 {
         try connection.writer().writeAll(&msg);
     }
 
+    const recv_buf_len = 4096;
+
     {
-        var buf: [1000]u8 align(8) = undefined;
+        var buf: [recv_buf_len]u8 align(8) = undefined;
         const result = recvMethodReturn(connection.reader(), &buf, 1);
         _ = result;
         // TODO: parse the body
+    }
+
+    while (true) {
+        var buf: [recv_buf_len]u8 align(8) = undefined;
+        const msg_len = switch (dbus.readOneMsg(connection.reader(), &buf) catch |err| {
+            std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
+            std.os.exit(0xff);
+        }) {
+            .partial => |len| {
+                std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, len});
+                std.os.exit(0xff);
+            },
+            .complete => |len| len,
+        };
+
+        std.log.debug("got {}-byte msg:", .{msg_len});
+        const func = struct {
+            pub fn log(line: []const u8) void {
+                std.log.debug("{s}", .{line});
+            }
+        };
+        @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
+        const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, &buf), msg_len)) catch |err| {
+            std.log.err("malformed reply: {s}", .{@errorName(err)});
+            std.os.exit(0xff);
+        };
+        switch (parsed.headers) {
+            .method_return => |headers| {
+                std.log.err("unexpected MethodReturn {}", .{headers});
+                std.os.exit(0xff);
+            },
+            .signal => |headers| std.log.info("Signal {}", .{headers}),
+        }
     }
 
 //    {
@@ -105,14 +140,16 @@ pub fn main() !u8 {
 fn recvMethodReturn(reader: anytype, buf: []align(8) u8, serial: u32) dbus.ParsedMsg {
     while (true) {
         std.log.info("waiting for method return msg (serial={})...", .{serial});
-        const msg_len = dbus.readOneMsg(reader, buf) catch |err| {
+        const msg_len = switch (dbus.readOneMsg(reader, buf) catch |err| {
             std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
             std.os.exit(0xff);
+        }) {
+            .partial => |len| {
+                std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, len});
+                std.os.exit(0xff);
+            },
+            .complete => |len|  len,
         };
-        if (msg_len > buf.len) {
-            std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, msg_len});
-            std.os.exit(0xff);
-        }
 
         std.log.debug("got {}-byte msg:", .{msg_len});
         const func = struct {
