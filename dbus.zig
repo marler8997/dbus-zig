@@ -413,6 +413,17 @@ pub const ParsedMsg = struct {
     pub const Headers = union(enum) {
         method_return: struct {
             reply_serial: u32,
+            // TODO: are all these really option for method_return?
+            destination: ?[]const u8,
+            sender: ?[]const u8,
+            signature: ?[]const u8,
+            unix_fds: ?u32,
+        },
+        signal: struct {
+            path: []const u8,
+            interface: []const u8,
+            member: []const u8,
+            // TODO: are all these really option for signal?
             destination: ?[]const u8,
             sender: ?[]const u8,
             signature: ?[]const u8,
@@ -607,11 +618,15 @@ const HeaderParser = struct {
         };
     }
     pub const ToParsedHeadersError = error {
+        MissingPathHeader,
+        MissingInterfaceHeader,
+        MissingMemberHeader,
         MissingSerialHeader,
         UnexpectedPathHeader,
         UnexpectedInterfaceHeader,
         UnexpectedMemberHeader,
         UnexpectedErrorHeader,
+        UnexpectedSerialHeader,
     };
     pub fn toParsedHeaders(
         self: HeaderParser,
@@ -635,38 +650,23 @@ const HeaderParser = struct {
                 };
             },
             .error_reply => @panic("todo"),
-            .signal => @panic("todo: header_parser to signal"),
+            .signal => {
+                if (self.error_name) |_| return error.UnexpectedErrorHeader;
+                if (self.reply_serial) |_| return error.UnexpectedSerialHeader;
+                return ParsedMsg.Headers{
+                    .signal = .{
+                        .path = self.path orelse return error.MissingPathHeader,
+                        .interface = self.interface orelse return error.MissingInterfaceHeader,
+                        .member = self.member orelse return error.MissingMemberHeader,
+                        .destination = self.destination,
+                        .sender = self.sender,
+                        .signature = self.signature,
+                        .unix_fds = self.unix_fds,
+                    },
+                };
+            },
         }
     }
-};
-
-pub const MsgTaggedUnion = union(enum) {
-    method_return: *align(8) Msg.MethodReturn,
-};
-//pub fn msgAsTaggedUnion(msg: [*]align(8) u8) ?MsgTaggedUnion {
-//    return switch (msg[1]) {
-//        MessageType.method_return => .{ .method_return = @ptrCast(*align(8) Msg.MethodReturn, msg) },
-//        else => null,
-//    }
-//}
-
-pub const Msg = extern union {
-//    generic: Generic,
-//    method_call: void,
-    method_return: MethodReturn,
-//    error_reply: void,
-//    signal: void,
-//
-//    pub const Generic = extern struct {
-//        endian: u8,
-//        message_type: u8,
-//        flags: u8,
-//        protocol_version: u8,
-//        body_length: u32,
-//        serial: u32,
-//    };
-    pub const MethodReturn = extern struct {
-    };
 };
 
 fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStream})!void {

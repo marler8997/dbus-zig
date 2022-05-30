@@ -38,61 +38,11 @@ pub fn main() !u8 {
         try connection.writer().writeAll(&msg);
     }
 
-    while (true) {
-        std.log.info("reading msg...", .{});
+    {
         var buf: [1000]u8 align(8) = undefined;
-        const msg_len = dbus.readOneMsg(connection.reader(), &buf) catch |err| {
-            std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
-            return 0xff;
-        };
-        if (msg_len > buf.len) {
-            std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, msg_len});
-            return 0xff;
-        }
-        std.log.info("got {}-byte msg:", .{msg_len});
-        const func = struct {
-            pub fn log(line: []const u8) void {
-                std.log.info("{s}", .{line});
-            }
-        };
-        @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
-        const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, &buf), msg_len)) catch |err| {
-            std.log.err("malformed reply: {s}", .{@errorName(err)});
-            return 0xff;
-        };
-        const msg_type = dbus.parseMsgType(&buf) orelse {
-            std.log.err("malformed reply, unknown msg type", .{});
-            return 0xff;
-        };
-        std.log.info("type={s} serial={}", .{@tagName(msg_type), parsed.serial(&buf)});
-        switch (parsed.headers) {
-            .method_return => |headers| {
-                std.log.info("MethodReturn {}", .{headers});
-            },
-        }
-        {
-            var it = parsed.headerArrayIterator();
-            while (it.next(&buf) catch |err| switch (err) {
-                error.FieldTooBig,
-                error.UnexpectedTypeSig,
-                error.NoNullTerm,
-                => {
-                    std.log.info("malformed reply {s}", .{@errorName(err)});
-                    return 0xff;
-                },
-            }) |header_field| {
-                switch (header_field) {
-                    .unknown => |id| {
-                        std.log.info("malformed reply, uknown header field {}", .{id});
-                        return 0xff;
-                    },
-                    .string => |str| std.log.info("header_field {s} '{s}'", .{@tagName(str.kind), str.str}),
-                    .uint32 => |u| std.log.info("header_field {s} {}", .{@tagName(u.kind), u.val}),
-                    .sig => |s| std.log.info("header_field signature '{s}'", .{s}),
-                }
-            }
-        }
-        _ = parsed;
+        const result = recvMethodReturn(connection.reader(), &buf, 1);
+        _ = result;
+        // TODO: parse the body
     }
 
 //    {
@@ -150,4 +100,40 @@ pub fn main() !u8 {
 //        try connection.writer().writeAll(&msg);
 //    }
     return 0;
+}
+
+fn recvMethodReturn(reader: anytype, buf: []align(8) u8, serial: u32) dbus.ParsedMsg {
+    while (true) {
+        std.log.info("waiting for method return msg (serial={})...", .{serial});
+        const msg_len = dbus.readOneMsg(reader, buf) catch |err| {
+            std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
+            std.os.exit(0xff);
+        };
+        if (msg_len > buf.len) {
+            std.log.err("buffer of size {} is not large enough (need {})", .{buf.len, msg_len});
+            std.os.exit(0xff);
+        }
+
+        std.log.debug("got {}-byte msg:", .{msg_len});
+        const func = struct {
+            pub fn log(line: []const u8) void {
+                std.log.debug("{s}", .{line});
+            }
+        };
+        @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
+        const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]const align(8) u8, buf.ptr), msg_len)) catch |err| {
+            std.log.err("malformed reply: {s}", .{@errorName(err)});
+            std.os.exit(0xff);
+        };
+        switch (parsed.headers) {
+            .method_return => |headers| {
+                if (serial != headers.reply_serial) {
+                    std.log.info("expected method return serial {} but got {}", .{serial, headers.reply_serial});
+                    continue;
+                }
+                return parsed;
+            },
+            .signal => |headers| std.log.info("Signal {}", .{headers}),
+        }
+    }
 }
