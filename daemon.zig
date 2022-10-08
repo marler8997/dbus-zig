@@ -87,7 +87,7 @@ fn epollAddHandler(epoll_fd: os.fd_t, fd: os.fd_t, handler: *EpollHandler) !void
 }
 
 const EpollHandler = struct {
-    handle: fn(base: *EpollHandler) anyerror!void,
+    handle: std.meta.FnPtr(fn(base: *EpollHandler) anyerror!void),
 };
 
 const ListenSockHandler = struct {
@@ -182,7 +182,7 @@ const DataSockHandler = struct {
                 self.deinit();
                 return;
             };
-            const len = try self.read(self.partial.unusedCapacitySlice());
+            const len = try self.read(unusedCapacitySlice(u8, 8, self.partial));
             self.partial.items.len += len;
             const processed = try self.process(self.partial.items);
             if (processed == self.partial.items.len) {
@@ -230,7 +230,7 @@ const DataSockHandler = struct {
         std.debug.assert(buf.len > 0);
         var total_processed: usize = 0;
         while (true) {
-            const processed = try self.processSingle(buf[total_processed..]);
+            const processed = try self.processSingle(@alignCast(8, buf[total_processed..]));
             if (processed == 0) return total_processed;
             total_processed += processed;
         }
@@ -307,3 +307,12 @@ const DataSockHandler = struct {
         return std.os.write(self.sock, buf);
     }
 };
+
+// TODO: workaround a bug in Zig's std library
+pub fn unusedCapacitySlice(
+    comptime T: type,
+    comptime alignment: u29,
+    self: std.ArrayListAlignedUnmanaged(T, alignment),
+) []align(alignment) T {
+    return @alignCast(alignment, self.allocatedSlice()[self.items.len..]);
+}

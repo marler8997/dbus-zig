@@ -4,7 +4,11 @@ pub const HexdumpOptions = struct {
     width: usize = 16,
 };
 
-pub fn hexdump(out_line: fn(line: []const u8) void, data: []const u8, options: HexdumpOptions) void {
+pub fn hexdump(
+    out_line: std.meta.FnPtr(fn(line: []const u8) void),
+    data: []const u8,
+    options: HexdumpOptions,
+) void {
     const max_line = 200;
     
     var offset: usize = 0;

@@ -44,7 +44,7 @@ pub fn writeIntNative(comptime T: type, buf: [*]u8, value: T) void {
 
 pub fn readInt(comptime T: type, endian: std.builtin.Endian, comptime buf_align: u29, buf: [*]align(buf_align) const u8) T {
     const value = @ptrCast(*const align(buf_align) T, buf).*;
-    return if (builtin.cpu.arch.endian() == endian) value else @byteSwap(T, value);
+    return if (builtin.cpu.arch.endian() == endian) value else @byteSwap(value);
 }
 
 pub fn strSlice(comptime Len: type, comptime s: []const u8) Slice(Len, [*]const u8) {
@@ -393,7 +393,7 @@ pub fn getMsgLenAssumeAtLeast16(msg: []const align(8) u8) GetMsgLenError!u27 {
     const body_len = readInt(u32, endian, comptime toAlign(4), msg.ptr + 4);
     const header_array_len = readInt(u32, endian, comptime toAlign(12), msg.ptr + 12);
     const header_end = 16 + std.mem.alignForward(header_array_len, 8);
-    return std.math.cast(u27, header_end + body_len) catch error.TooBig;
+    return std.math.cast(u27, header_end + body_len) orelse error.TooBig;
 }
 
 pub fn parseMsgType(msg_ptr: [*]const align(8) u8) ?MessageType {
@@ -493,7 +493,10 @@ pub const ParsedMsg = struct {
                     const str = msg_ptr[string_start .. string_start + string_len];
                     if (str.ptr[string_len] != 0) return error.NoNullTerm;
                     self.offset = @intCast(u27, field_end);
-                    return HeaderField{ .string = .{ .kind = kind, .str = std.meta.assumeSentinel(str, 0) } };
+                    return HeaderField{ .string = .{
+                        .kind = kind,
+                        .str = std.meta.assumeSentinel(@alignCast(4, str), 0),
+                    } };
                 },
                 .uint32 => |kind| {
                     const field_end = start + 8;
