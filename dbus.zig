@@ -291,6 +291,115 @@ const MsgEncoder = struct {
     }
 };
 
+const DbusType = union(enum) {
+    byte,
+    boolean,
+    int16,
+    uint16,
+    int32,
+    uint32,
+    int64,
+    uint64,
+    double,
+    fd,
+    string,
+    path,
+    map,
+    variant,
+    array,
+    pub fn getType(comptime self: DbusType) type {
+        return switch (self) {
+            .uint32 => u32,
+            .string => Slice(u32, [*:0]const u8),
+            else => @compileError("todo"),
+        };
+    }
+};
+const SigIterator = struct {
+    sig_str: []const u8,
+    index: usize,
+    pub fn init(sig_str: []const u8) SigIterator {
+        return .{ .sig_str = sig_str, .index = 0 };
+    }
+    pub fn next(self: *SigIterator) ?DbusType {
+        if (self.index >= self.sig_str.len) return null;
+        const i = self.index;
+        self.index += 1;
+        switch (self.sig_str[i]) {
+            's' => return .string,
+            'u' => return .uint32,
+            else => |c| std.debug.panic("TODO: signature character '{}'", .{c}),
+        }
+    }
+};
+
+fn getShallowFieldCount(comptime sig_str: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < sig_str.len) : (i += 1) {
+        if (std.mem.indexOfScalar(u8, "su", sig_str[i])) |_| {
+            count += 1;
+        } else {
+            @compileError("TODO: handle signature character: " ++ sig_str[i..i+1]);
+        }
+    }
+    return count;
+}
+
+pub fn sigInfo(comptime sig_str: []const u8) type {
+    return struct {
+        pub const shallow_field_count = getShallowFieldCount(sig_str);
+        pub const Tuple = blk: {
+            var fields: [shallow_field_count]std.builtin.TypeInfo.StructField = undefined;
+            var it = SigIterator.init(sig_str);
+            for (fields) |*field, i| {
+                const dbus_type = it.next().?;
+                const zig_type = dbus_type.getType();
+                field = .{
+                    .name = std.fmt.comptimePrint("{}", .{i}),
+                    .field_type = zig_type,
+                    .default_value = null,
+                    .is_comptime = false,
+                    .alignment = @alignOf(zig_type),
+                };
+            }
+            std.debug.assert(it.next() == null);
+            break :blk @Type(std.builtin.TypeInfo { .Struct = .{
+                .is_tuple = true,
+                .layout = .Auto,
+                .decls = &.{},
+                .fields = &fields,
+            }});
+        };
+        pub const method_call = struct {
+            pub fn args(o: struct {
+                serial: u32,
+                path: Slice(u32, [*]const u8),
+                destination: ?Slice(u32, [*]const u8) = null,
+                interface: ?Slice(u32, [*]const u8) = null,
+                member: ?Slice(u32, [*]const u8) = null,
+            }) method_call_msg.Args {
+                return method_call_msg.Args{
+                    .serial = o.serial,
+                    .path = o.path,
+                    .destination = o.destination,
+                    .interface = o.interface,
+                    .member = o.member,
+                    .signature = sig_str,
+                };
+            }
+        };
+    };
+}
+
+test "signature" {
+    //const a = signature("su").Args;
+    //_ = a.Args{ "foo", 100 };
+    //const Tuple = @TypeOf(.{ "foo", @as(u32 100)});
+    //std
+    _ = comptime getShallowFieldCount("su");
+}
+
 pub const method_call_msg = struct {
     pub const Args = struct {
         serial: u32,
@@ -298,9 +407,9 @@ pub const method_call_msg = struct {
         destination: ?Slice(u32, [*]const u8) = null,
         interface: ?Slice(u32, [*]const u8) = null,
         member: ?Slice(u32, [*]const u8) = null,
-        signature: ?Slice(u32, [*]const u8) = null,
+        signature: []const u8,
+        args: []cont u8,
     };
-
     pub fn encode(comptime Encoder: type, encoder: Encoder, args: Args) void {
         encoder.set(u8, 0, endian_header_value);
         encoder.set(u8, 1, @enumToInt(MessageType.method_call));
@@ -327,6 +436,7 @@ pub const method_call_msg = struct {
 
         const end = @intCast(u27, std.mem.alignForward(16 + field_array_len, 8));
         encoder.setBytes(16 + field_array_len, end, 0);
+        encoder.setBytes();
     }
     pub fn getHeaderLen(args: Args) u27 {
         var encoder = LenEncoder { };
