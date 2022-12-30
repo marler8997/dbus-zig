@@ -5,12 +5,12 @@ pub const HexdumpOptions = struct {
 };
 
 pub fn hexdump(
-    out_line: std.meta.FnPtr(fn(line: []const u8) void),
+    out_line: *const fn (line: []const u8) void,
     data: []const u8,
     options: HexdumpOptions,
 ) void {
     const max_line = 200;
-    
+
     var offset: usize = 0;
     while (true) {
         const next = offset + options.width;
@@ -18,13 +18,13 @@ pub fn hexdump(
 
         var buf: [max_line]u8 = undefined;
         const len = formatLine(&buf, data[offset..next], options);
-        out_line(buf[0 .. len]);
+        out_line(buf[0..len]);
         offset = next;
     }
     if (offset < data.len) {
         var buf: [max_line]u8 = undefined;
         const len = formatLine(&buf, data[offset..], options);
-        out_line(buf[0 .. len]);
+        out_line(buf[0..len]);
     }
 }
 
@@ -34,7 +34,7 @@ fn formatLine(out_buf: []u8, line: []const u8, options: HexdumpOptions) usize {
         error.NoSpaceLeft => unreachable,
     }).len;
     const hex_end = 2 * options.width;
-    std.mem.set(u8, out_buf[2*(line.len) .. hex_end], ' ');
+    std.mem.set(u8, out_buf[2 * (line.len) .. hex_end], ' ');
 
     out_buf[hex_end + 0] = ' ';
     out_buf[hex_end + 1] = '|';

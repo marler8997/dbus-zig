@@ -8,7 +8,7 @@ const Address = address_mod.Address;
 
 fd: std.os.fd_t,
 
-pub const ConnectError = error {
+pub const ConnectError = error{
     DbusAddrUnixPathTooBig,
     DBusAddrBadEscapeSequence,
     PermissionDenied,
@@ -24,7 +24,7 @@ pub const ConnectError = error {
 pub fn connect(addr: Address) ConnectError!Connection {
     switch (addr) {
         .unix => |unix_addr| {
-            var sockaddr = os.sockaddr.un { .family = os.AF.UNIX, .path = undefined };
+            var sockaddr = os.sockaddr.un{ .family = os.AF.UNIX, .path = undefined };
             const path_len = address_mod.resolveEscapes(&sockaddr.path, unix_addr.unescaped_path) catch |err| switch (err) {
                 error.DestTooSmall => return error.DbusAddrUnixPathTooBig,
                 error.BadEscapeSequence => return error.DBusAddrBadEscapeSequence,
@@ -72,21 +72,23 @@ pub fn connect(addr: Address) ConnectError!Connection {
     }
 }
 
-
 pub const Writer = std.io.Writer(Connection, std.os.WriteError, write);
-pub fn writer(self: Connection) Writer { return .{ .context = self }; }
+pub fn writer(self: Connection) Writer {
+    return .{ .context = self };
+}
 fn write(self: Connection, buf: []const u8) std.os.WriteError!usize {
     return std.os.write(self.fd, buf);
 }
 
 pub const Reader = std.io.Reader(Connection, std.os.ReadError, read);
-pub fn reader(self: Connection) Reader { return .{ .context = self }; }
+pub fn reader(self: Connection) Reader {
+    return .{ .context = self };
+}
 fn read(self: Connection, buf: []u8) std.os.ReadError!usize {
     return std.os.read(self.fd, buf);
 }
 
 pub fn authenticate(self: Connection) !void {
-
     {
         var msg_buf: [100]u8 = undefined;
         const msg = blk: {

@@ -43,7 +43,7 @@ pub fn writeIntNative(comptime T: type, buf: [*]u8, value: T) void {
 }
 
 pub fn readInt(comptime T: type, endian: std.builtin.Endian, comptime buf_align: u29, buf: [*]align(buf_align) const u8) T {
-    const value = @ptrCast(*const align(buf_align) T, buf).*;
+    const value = @ptrCast(*align(buf_align) const T, buf).*;
     return if (builtin.cpu.arch.endian() == endian) value else @byteSwap(value);
 }
 
@@ -56,58 +56,64 @@ pub fn strSlice(comptime Len: type, comptime s: []const u8) Slice(Len, [*]const 
 pub fn sliceLen(ptr: anytype, len: anytype) Slice(@TypeOf(len), @TypeOf(ptr)) {
     return Slice(@TypeOf(len), @TypeOf(ptr)){ .ptr = ptr, .len = len };
 }
-pub fn Slice(comptime LenType: type, comptime Ptr: type) type { return struct {
-    const Self = @This();
-    const ptr_info = @typeInfo(Ptr).Pointer;
-    pub const NativeSlice = @Type(std.builtin.TypeInfo {
-        .Pointer = .{
-            .size = .Slice,
-            .is_const = ptr_info.is_const,
-            .is_volatile = ptr_info.is_volatile,
-            .alignment = ptr_info.alignment,
-            .address_space = ptr_info.address_space,
-            .child = ptr_info.child,
-            .is_allowzero = ptr_info.is_allowzero,
-            .sentinel = ptr_info.sentinel,
-        },
-    });
+pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
+    return struct {
+        const Self = @This();
+        const ptr_info = @typeInfo(Ptr).Pointer;
+        pub const NativeSlice = @Type(std.builtin.Type{
+            .Pointer = .{
+                .size = .Slice,
+                .is_const = ptr_info.is_const,
+                .is_volatile = ptr_info.is_volatile,
+                .alignment = ptr_info.alignment,
+                .address_space = ptr_info.address_space,
+                .child = ptr_info.child,
+                .is_allowzero = ptr_info.is_allowzero,
+                .sentinel = ptr_info.sentinel,
+            },
+        });
 
-    ptr: Ptr,
-    len: LenType,
+        ptr: Ptr,
+        len: LenType,
 
-    pub fn nativeSlice(self: @This()) NativeSlice {
-        return self.ptr[0 .. self.len];
-    }
+        pub fn nativeSlice(self: @This()) NativeSlice {
+            return self.ptr[0..self.len];
+        }
 
-    pub fn initComptime(comptime ct_slice: NativeSlice) @This() {
-        return .{ .ptr = ct_slice.ptr, .len = @intCast(LenType, ct_slice.len) };
-    }
+        pub fn initComptime(comptime ct_slice: NativeSlice) @This() {
+            return .{ .ptr = ct_slice.ptr, .len = @intCast(LenType, ct_slice.len) };
+        }
 
-    pub fn lenCast(self: @This(), comptime NewLenType: type) Slice(NewLenType, Ptr) {
-        return .{ .ptr = self.ptr, .len = @intCast(NewLenType, self.len) };
-    }
+        pub fn lenCast(self: @This(), comptime NewLenType: type) Slice(NewLenType, Ptr) {
+            return .{ .ptr = self.ptr, .len = @intCast(NewLenType, self.len) };
+        }
 
-    pub usingnamespace switch (@typeInfo(Ptr).Pointer.child) {
-        u8 => struct {
-            pub fn format(
-                self: Self,
-                comptime fmt: []const u8,
-                options: std.fmt.FormatOptions,
-                writer: anytype,
-            ) !void {
-                _ = fmt; _ = options;
-                try writer.writeAll(self.ptr[0 .. self.len]);
-            }
-        },
-        else => struct {},
+        pub usingnamespace switch (@typeInfo(Ptr).Pointer.child) {
+            u8 => struct {
+                pub fn format(
+                    self: Self,
+                    comptime fmt: []const u8,
+                    options: std.fmt.FormatOptions,
+                    writer: anytype,
+                ) !void {
+                    _ = fmt;
+                    _ = options;
+                    try writer.writeAll(self.ptr[0..self.len]);
+                }
+            },
+            else => struct {},
+        };
     };
-};}
+}
 
+// zig fmt: off
 const header_fixed_part_len =
       4 // endian/type/flags/version
     + 4 // body_length
     + 4 // serial
 ;
+// zig fmt: on
+
 fn stringEncodeLen(string_len: u32, align_to: u29) u32 {
     return @intCast(u32, 4 + std.mem.alignForward(string_len + 1, align_to));
 }
@@ -185,15 +191,15 @@ const HeaderFieldUint32Kind = enum(u8) {
     unix_fds = 9,
 };
 const HeaderFieldKind = enum(u8) {
-    path         = @enumToInt(HeaderFieldStringKind.path),
-    interface    = @enumToInt(HeaderFieldStringKind.interface),
-    member       = @enumToInt(HeaderFieldStringKind.member),
-    error_name   = @enumToInt(HeaderFieldStringKind.error_name),
+    path = @enumToInt(HeaderFieldStringKind.path),
+    interface = @enumToInt(HeaderFieldStringKind.interface),
+    member = @enumToInt(HeaderFieldStringKind.member),
+    error_name = @enumToInt(HeaderFieldStringKind.error_name),
     reply_serial = @enumToInt(HeaderFieldUint32Kind.reply_serial),
-    destination  = @enumToInt(HeaderFieldStringKind.destination),
-    sender       = @enumToInt(HeaderFieldStringKind.sender),
-    signature    = 8,
-    unix_fds     = @enumToInt(HeaderFieldUint32Kind.unix_fds),
+    destination = @enumToInt(HeaderFieldStringKind.destination),
+    sender = @enumToInt(HeaderFieldStringKind.sender),
+    signature = 8,
+    unix_fds = @enumToInt(HeaderFieldUint32Kind.unix_fds),
 };
 
 fn toAlign(len: usize) u4 {
@@ -205,8 +211,7 @@ fn alignAdd(in_align: u4, addend: usize) u4 {
 
 const header_field_string = struct {
     fn getLen(string_len: u32) u27 {
-        return @intCast(u27,
-            4 + // 1 for kind, 3 for type sig
+        return @intCast(u27, 4 + // 1 for kind, 3 for type sig
             4 + // string length uint32 (already aligned to 4)
             string_len + 1 // add 1 for null-terminator
         );
@@ -233,7 +238,7 @@ const pad = struct {
     }
     pub fn serialize(msg: [*]u8, in_align: u4, out_align: u4) u4 {
         const len = getLen(in_align, out_align);
-        std.mem.set(u8, msg[0 .. len], 0);
+        std.mem.set(u8, msg[0..len], 0);
         return len;
     }
 };
@@ -329,12 +334,12 @@ pub const method_call_msg = struct {
         encoder.setBytes(16 + field_array_len, end, 0);
     }
     pub fn getHeaderLen(args: Args) u27 {
-        var encoder = LenEncoder { };
+        var encoder = LenEncoder{};
         encode(*LenEncoder, &encoder, args);
         return encoder.len;
     }
     pub fn serialize(msg: [*]u8, args: Args) void {
-        var encoder = MsgEncoder { .msg = msg };
+        var encoder = MsgEncoder{ .msg = msg };
         encode(*MsgEncoder, &encoder, args);
     }
 };
@@ -383,12 +388,12 @@ fn getEndian(first_msg_byte: u8) ?std.builtin.Endian {
     };
 }
 
-pub const GetMsgLenError = error { InvalidEndianValue, TooBig };
-pub fn getMsgLen(msg: []const align(8) u8) GetMsgLenError!?u27 {
+pub const GetMsgLenError = error{ InvalidEndianValue, TooBig };
+pub fn getMsgLen(msg: []align(8) const u8) GetMsgLenError!?u27 {
     if (msg.len < 16) return null;
     return try getMsgLenAssumeAtLeast16(msg);
 }
-pub fn getMsgLenAssumeAtLeast16(msg: []const align(8) u8) GetMsgLenError!u27 {
+pub fn getMsgLenAssumeAtLeast16(msg: []align(8) const u8) GetMsgLenError!u27 {
     const endian = getEndian(msg[0]) orelse return error.InvalidEndianValue;
     const body_len = readInt(u32, endian, comptime toAlign(4), msg.ptr + 4);
     const header_array_len = readInt(u32, endian, comptime toAlign(12), msg.ptr + 12);
@@ -396,7 +401,7 @@ pub fn getMsgLenAssumeAtLeast16(msg: []const align(8) u8) GetMsgLenError!u27 {
     return std.math.cast(u27, header_end + body_len) orelse error.TooBig;
 }
 
-pub fn parseMsgType(msg_ptr: [*]const align(8) u8) ?MessageType {
+pub fn parseMsgType(msg_ptr: [*]align(8) const u8) ?MessageType {
     return switch (msg_ptr[1]) {
         @enumToInt(MessageType.method_call) => MessageType.method_call,
         @enumToInt(MessageType.method_return) => MessageType.method_return,
@@ -431,7 +436,7 @@ pub const ParsedMsg = struct {
         },
     };
 
-    pub fn serial(self: ParsedMsg, msg_ptr: [*]const align(8) u8) u32 {
+    pub fn serial(self: ParsedMsg, msg_ptr: [*]align(8) const u8) u32 {
         return readInt(u32, self.endian, 8, msg_ptr + 8);
     }
 
@@ -441,7 +446,7 @@ pub const ParsedMsg = struct {
         },
         string: struct {
             kind: HeaderFieldStringKind,
-            str: [:0]const align(4) u8,
+            str: [:0]align(4) const u8,
         },
         uint32: struct {
             kind: HeaderFieldUint32Kind,
@@ -454,12 +459,12 @@ pub const ParsedMsg = struct {
         header_end: u27,
         offset: u27 = 16,
 
-        pub const NextError = error {
+        pub const NextError = error{
             FieldTooBig,
             UnexpectedTypeSig,
             NoNullTerm,
         };
-        pub fn next(self: *HeaderArrayIterator, msg_ptr: [*]const align(8) u8) NextError!?HeaderField {
+        pub fn next(self: *HeaderArrayIterator, msg_ptr: [*]align(8) const u8) NextError!?HeaderField {
             const start = self.offset;
             if (start == self.header_end) return null;
             const parse_type: union(enum) {
@@ -535,17 +540,13 @@ pub const ParsedMsg = struct {
     }
 };
 
-
-pub const ParsedMsgError = error {
+pub const ParsedMsgError = error{
     InvalidMsgType,
     DuplicateHeader,
-}
-|| ParsedMsg.HeaderArrayIterator.NextError
-|| HeaderParser.ToParsedHeadersError
-;
+} || ParsedMsg.HeaderArrayIterator.NextError || HeaderParser.ToParsedHeadersError;
 
 /// parse a complete message (msg is exactly 1 complete message)
-pub fn parseMsgAssumeGetMsgLen(msg: Slice(u27, [*]const align(8) u8)) ParsedMsgError!ParsedMsg {
+pub fn parseMsgAssumeGetMsgLen(msg: Slice(u27, [*]align(8) const u8)) ParsedMsgError!ParsedMsg {
     std.debug.assert((getMsgLenAssumeAtLeast16(msg.nativeSlice()) catch unreachable) == msg.len);
     // an invalid endian value should be impossible because this would have been caught in getMsgLen
     const endian = getEndian(msg.ptr[0]) orelse unreachable;
@@ -589,15 +590,15 @@ pub fn parseMsgAssumeGetMsgLen(msg: Slice(u27, [*]const align(8) u8)) ParsedMsgE
 
 const HeaderParser = struct {
     unknown_header_count: u32 = 0,
-    path        : ?[:0]const u8 = null,
-    interface   : ?[:0]const u8 = null,
-    member      : ?[:0]const u8 = null,
-    error_name  : ?[:0]const u8 = null,
+    path: ?[:0]const u8 = null,
+    interface: ?[:0]const u8 = null,
+    member: ?[:0]const u8 = null,
+    error_name: ?[:0]const u8 = null,
     reply_serial: ?u32 = null,
-    destination : ?[:0]const u8 = null,
-    sender      : ?[:0]const u8 = null,
-    signature   : ?[:0]const u8 = null,
-    unix_fds    : ?u32 = null,
+    destination: ?[:0]const u8 = null,
+    sender: ?[:0]const u8 = null,
+    signature: ?[:0]const u8 = null,
+    unix_fds: ?u32 = null,
     pub fn getStringHeaderPtr(
         self: *HeaderParser,
         kind: HeaderFieldStringKind,
@@ -620,7 +621,7 @@ const HeaderParser = struct {
             .unix_fds => &self.unix_fds,
         };
     }
-    pub const ToParsedHeadersError = error {
+    pub const ToParsedHeadersError = error{
         MissingPathHeader,
         MissingInterfaceHeader,
         MissingMemberHeader,
@@ -674,7 +675,7 @@ const HeaderParser = struct {
 
 fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStream})!void {
     std.debug.assert(buf.len > 0);
-    var total_received : usize = 0;
+    var total_received: usize = 0;
     while (true) {
         const last_received = try reader.read(buf[total_received..]);
         if (last_received == 0)
@@ -684,7 +685,6 @@ fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStr
             break;
     }
 }
-
 
 pub const ReadOneMsg = union(enum) {
     partial: u27,
@@ -696,14 +696,14 @@ pub const ReadOneMsg = union(enum) {
 /// 16 bytes to the new buffer then calling `readOneMsgFinish`.
 pub fn readOneMsg(reader: anytype, buf: []align(8) u8) !ReadOneMsg {
     std.debug.assert(buf.len >= 16);
-    try readFull(reader, buf[0 .. 16]);
+    try readFull(reader, buf[0..16]);
     const msg_len = getMsgLenAssumeAtLeast16(buf) catch |err| switch (err) {
         error.InvalidEndianValue => return error.DbusMsgInvalidEndianValue,
         error.TooBig => return error.DbusMsgTooBig,
     };
     if (msg_len > buf.len) return ReadOneMsg{ .partial = msg_len };
 
-    try readOneMsgFinish(reader, buf[0 .. msg_len]);
+    try readOneMsgFinish(reader, buf[0..msg_len]);
     return ReadOneMsg{ .complete = msg_len };
 }
 
