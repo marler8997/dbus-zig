@@ -163,6 +163,7 @@ const DataSockHandler = struct {
         },
         begun: void,
     } = .{ .auth = .{} },
+    first_byte_seen: bool = false,
 
     fn deinit(self: *DataSockHandler) void {
         os.close(self.sock);
@@ -238,18 +239,46 @@ const DataSockHandler = struct {
     fn processSingle(self: *DataSockHandler, buf: []align(8) const u8) error{Handled}!usize {
         switch (self.state) {
             .auth => |*auth| {
-                const offsets = parseLineOffsets(buf);
+                var line_buf: []const u8 = buf;
+                var processed: usize = 0;
+
+                if (!self.first_byte_seen) {
+                    if (buf[0] == 0) {
+                        line_buf = buf[1..];
+                        processed += 1;
+                        self.first_byte_seen = true;
+                    } else {
+                        std.log.info("s={}: First byte of stream is not nul, disconnecting", .{self.sock});
+                        self.deinit();
+                        return error.Handled;
+                    }
+                }
+
+                const offsets = parseLineOffsets(line_buf);
                 if (offsets.end > 0) {
-                    const line = buf[0..offsets.len];
+                    const line = line_buf[0..offsets.len];
                     std.log.info("s={}: got command '{}'", .{ self.sock, std.zig.fmtEscapes(line) });
 
-                    const auth_external_prefix = "\x00AUTH EXTERNAL ";
-                    if (std.mem.startsWith(u8, line, auth_external_prefix)) {
+                    const auth_external_prefix = "AUTH EXTERNAL ";
+                    if (std.mem.eql(u8, line, "AUTH")) {
                         if (auth.authenticated) {
                             std.log.info("s={}: got AUTH but already authenticatd", .{self.sock});
                             self.deinit();
                             return error.Handled;
                         }
+
+                        self.writer().writeAll("REJECTED EXTERNAL\r\n") catch |err| {
+                            std.log.err("s={}: failed to write reply with {s}", .{ self.sock, @errorName(err) });
+                            self.deinit();
+                            return error.Handled;
+                        };
+                    } else if (std.mem.startsWith(u8, line, auth_external_prefix)) {
+                        if (auth.authenticated) {
+                            std.log.info("s={}: got AUTH but already authenticatd", .{self.sock});
+                            self.deinit();
+                            return error.Handled;
+                        }
+
                         const uid_str = line[auth_external_prefix.len..];
                         std.log.info("TODO: authenticate uid '{s}'", .{uid_str});
                         self.writer().writeAll("OK 993c625b4b6d3b14c4eff3a4627ea9bf\r\n") catch |err| {
@@ -273,7 +302,9 @@ const DataSockHandler = struct {
                         return error.Handled;
                     }
                 }
-                return offsets.end;
+
+                processed += offsets.end;
+                return processed;
             },
             .begun => {
                 const msg_len = (dbus.getMsgLen(buf) catch |err| {
