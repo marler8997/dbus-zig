@@ -4,13 +4,12 @@ const os = std.os;
 const dbus = @import("dbus");
 
 pub fn main() !u8 {
-
     const path = "/tmp/dbus-test";
 
     std.fs.cwd().deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => |e| {
-            std.log.err("failed to remove old socket file '{s}': {s}", .{path, @errorName(e)});
+            std.log.err("failed to remove old socket file '{s}': {s}", .{ path, @errorName(e) });
             return 0xff;
         },
     };
@@ -20,7 +19,7 @@ pub fn main() !u8 {
         return 0xff;
     };
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}) {};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     //defer gpa.deinit();
 
     var listen_sock_handler: ListenSockHandler = undefined;
@@ -32,7 +31,7 @@ pub fn main() !u8 {
         };
         //errdefer os.close(sock);
 
-        var sockaddr = os.sockaddr.un { .family = os.AF.UNIX, .path = undefined };
+        var sockaddr = os.sockaddr.un{ .family = os.AF.UNIX, .path = undefined };
 
         const addr_len = @intCast(os.socklen_t, @offsetOf(os.sockaddr.un, "path") + path.len + 1);
         if (addr_len > @sizeOf(os.sockaddr.un)) {
@@ -43,7 +42,7 @@ pub fn main() !u8 {
         sockaddr.path[path.len] = 0;
 
         os.bind(sock, @ptrCast(*os.sockaddr, &sockaddr), addr_len) catch |err| {
-            std.log.err("failed to bind unix socket to '{s}': {s}", .{path, @errorName(err)});
+            std.log.err("failed to bind unix socket to '{s}': {s}", .{ path, @errorName(err) });
             return 0xff;
         };
         std.log.info("bound socket to '{s}'", .{path});
@@ -61,7 +60,7 @@ pub fn main() !u8 {
     }
 
     while (true) {
-        var events : [10]os.linux.epoll_event = undefined;
+        var events: [10]os.linux.epoll_event = undefined;
         const count = os.epoll_wait(epoll_fd, &events, 0);
         switch (os.errno(count)) {
             .SUCCESS => {},
@@ -79,15 +78,15 @@ pub fn main() !u8 {
 }
 
 fn epollAddHandler(epoll_fd: os.fd_t, fd: os.fd_t, handler: *EpollHandler) !void {
-    var event = os.linux.epoll_event {
+    var event = os.linux.epoll_event{
         .events = os.linux.EPOLL.IN,
-        .data = os.linux.epoll_data { .ptr = @ptrToInt(handler) },
+        .data = os.linux.epoll_data{ .ptr = @ptrToInt(handler) },
     };
     try os.epoll_ctl(epoll_fd, os.linux.EPOLL.CTL_ADD, fd, &event);
 }
 
 const EpollHandler = struct {
-    handle: std.meta.FnPtr(fn(base: *EpollHandler) anyerror!void),
+    handle: *const fn (base: *EpollHandler) anyerror!void,
 };
 
 const ListenSockHandler = struct {
@@ -139,7 +138,7 @@ const ListenSockHandler = struct {
             error.SystemResources,
             error.UserResourceLimitReached,
             => |e| {
-                std.log.err("s={}: epoll add failed with {s}", .{new_fd, @errorName(e)});
+                std.log.err("s={}: epoll add failed with {s}", .{ new_fd, @errorName(e) });
                 return error.Handled;
             },
             error.FileDescriptorIncompatibleWithEpoll,
@@ -178,7 +177,7 @@ const DataSockHandler = struct {
 
         if (self.partial.items.len > 0) {
             self.partial.ensureUnusedCapacity(self.allocator, min_read_len) catch {
-                std.log.err("s={}: unable to allocate more memory (already at {})", .{self.sock, self.partial.items.len});
+                std.log.err("s={}: unable to allocate more memory (already at {})", .{ self.sock, self.partial.items.len });
                 self.deinit();
                 return;
             };
@@ -189,17 +188,17 @@ const DataSockHandler = struct {
                 self.partial.clearRetainingCapacity();
             } else {
                 const new_len = self.partial.items.len - processed;
-                std.mem.copy(u8, self.partial.items[0 .. new_len], self.partial.items[processed..]);
+                std.mem.copy(u8, self.partial.items[0..new_len], self.partial.items[processed..]);
                 self.partial.items.len = new_len;
             }
         } else {
             var buf: [2000]u8 align(8) = undefined;
             const len = try self.read(&buf);
-            const processed = try self.process(buf[0 .. len]);
+            const processed = try self.process(buf[0..len]);
             if (processed < len) {
                 const save_len = len - processed;
                 self.partial.ensureUnusedCapacity(self.allocator, save_len) catch {
-                    std.log.err("s={}: unable to allocate memory for {} bytes of partial data", .{self.sock, save_len});
+                    std.log.err("s={}: unable to allocate memory for {} bytes of partial data", .{ self.sock, save_len });
                     self.deinit();
                     return;
                 };
@@ -213,7 +212,7 @@ const DataSockHandler = struct {
 
     fn read(self: *DataSockHandler, buf: []u8) error{Handled}!usize {
         const len = os.read(self.sock, buf) catch |err| {
-            std.log.err("s={}: read failed with {s}, closing", .{self.sock, @errorName(err)});
+            std.log.err("s={}: read failed with {s}, closing", .{ self.sock, @errorName(err) });
             self.deinit();
             return error.Handled;
         };
@@ -241,8 +240,8 @@ const DataSockHandler = struct {
             .auth => |*auth| {
                 const offsets = parseLineOffsets(buf);
                 if (offsets.end > 0) {
-                    const line = buf[0 .. offsets.len];
-                    std.log.info("s={}: got command '{}'", .{self.sock, std.zig.fmtEscapes(line)});
+                    const line = buf[0..offsets.len];
+                    std.log.info("s={}: got command '{}'", .{ self.sock, std.zig.fmtEscapes(line) });
 
                     const auth_external_prefix = "\x00AUTH EXTERNAL ";
                     if (std.mem.startsWith(u8, line, auth_external_prefix)) {
@@ -254,7 +253,7 @@ const DataSockHandler = struct {
                         const uid_str = line[auth_external_prefix.len..];
                         std.log.info("TODO: authenticate uid '{s}'", .{uid_str});
                         self.writer().writeAll("OK 993c625b4b6d3b14c4eff3a4627ea9bf\r\n") catch |err| {
-                            std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
+                            std.log.err("s={}: failed to write reply with {s}", .{ self.sock, @errorName(err) });
                             self.deinit();
                             return error.Handled;
                         };
@@ -262,14 +261,14 @@ const DataSockHandler = struct {
                     } else if (std.mem.eql(u8, line, "NEGOTIATE_UNIX_FD")) {
                         std.log.info("s={}: NEGOTIATE_UNIX_FD not implemented, sending ERROR", .{self.sock});
                         self.writer().writeAll("ERROR\r\n") catch |err| {
-                            std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
+                            std.log.err("s={}: failed to write reply with {s}", .{ self.sock, @errorName(err) });
                             self.deinit();
                             return error.Handled;
                         };
                     } else if (std.mem.eql(u8, line, "BEGIN")) {
                         self.state = .begun;
                     } else {
-                        std.log.info("s={}: unhandled request '{}'", .{self.sock, std.zig.fmtEscapes(line)});
+                        std.log.info("s={}: unhandled request '{}'", .{ self.sock, std.zig.fmtEscapes(line) });
                         self.deinit();
                         return error.Handled;
                     }
@@ -278,15 +277,15 @@ const DataSockHandler = struct {
             },
             .begun => {
                 const msg_len = (dbus.getMsgLen(buf) catch |err| {
-                    std.log.info("s={}: malformed message: {s}", .{self.sock, @errorName(err)});
+                    std.log.info("s={}: malformed message: {s}", .{ self.sock, @errorName(err) });
                     self.deinit();
                     return error.Handled;
                 }) orelse return 0;
                 if (msg_len > buf.len) {
-                    std.log.debug("s={}: received partial message of {} bytes", .{self.sock, buf.len});
+                    std.log.debug("s={}: received partial message of {} bytes", .{ self.sock, buf.len });
                     return 0;
                 }
-                std.log.info("s={}: got msg {}-byte message '{}'", .{self.sock, msg_len, std.zig.fmtEscapes(buf)});
+                std.log.info("s={}: got msg {}-byte message '{}'", .{ self.sock, msg_len, std.zig.fmtEscapes(buf) });
                 return msg_len;
             },
         }
@@ -302,7 +301,9 @@ const DataSockHandler = struct {
     }
 
     pub const Writer = std.io.Writer(DataSockHandler, std.os.WriteError, write);
-    pub fn writer(self: DataSockHandler) Writer { return .{ .context = self }; }
+    pub fn writer(self: DataSockHandler) Writer {
+        return .{ .context = self };
+    }
     fn write(self: DataSockHandler, buf: []const u8) std.os.WriteError!usize {
         return std.os.write(self.sock, buf);
     }
