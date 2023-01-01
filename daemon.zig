@@ -159,11 +159,12 @@ const DataSockHandler = struct {
     sock: os.socket_t,
     partial: std.ArrayListAlignedUnmanaged(u8, 8) = .{},
     state: union(enum) {
+        start: void,
         auth: struct {
             authenticated: bool = false,
         },
         begun: void,
-    } = .{ .auth = .{} },
+    } = .start,
 
     fn deinit(self: *DataSockHandler) void {
         os.close(self.sock);
@@ -230,21 +231,31 @@ const DataSockHandler = struct {
         std.debug.assert(buf.len > 0);
         var total_processed: usize = 0;
         while (true) {
-            const processed = try self.processSingle(@alignCast(8, buf[total_processed..]));
+            const processed = try self.processSingle(buf[total_processed..]);
             if (processed == 0) return total_processed;
             total_processed += processed;
         }
     }
 
-    fn processSingle(self: *DataSockHandler, buf: []align(8) const u8) error{Handled}!usize {
+    fn processSingle(self: *DataSockHandler, buf: []const u8) error{Handled}!usize {
         switch (self.state) {
+            .start => {
+                if (buf.len == 0) return 0;
+                if (buf[0] != 0) {
+                    std.log.err("s={}: expected message to start with 0 but got 0x{x}", .{ self.sock, buf[0] });
+                    self.deinit();
+                    return error.Handled;
+                }
+                self.state = .{ .auth = .{} };
+                return 1;
+            },
             .auth => |*auth| {
                 const offsets = parseLineOffsets(buf);
                 if (offsets.end > 0) {
                     const line = buf[0 .. offsets.len];
                     std.log.info("s={}: got command '{}'", .{self.sock, std.zig.fmtEscapes(line)});
 
-                    const auth_external_prefix = "\x00AUTH EXTERNAL ";
+                    const auth_external_prefix = "AUTH EXTERNAL ";
                     if (std.mem.startsWith(u8, line, auth_external_prefix)) {
                         if (auth.authenticated) {
                             std.log.info("s={}: got AUTH but already authenticatd", .{self.sock});
@@ -277,7 +288,7 @@ const DataSockHandler = struct {
                 return offsets.end;
             },
             .begun => {
-                const msg_len = (dbus.getMsgLen(buf) catch |err| {
+                const msg_len = (dbus.getMsgLen(@alignCast(8, buf)) catch |err| {
                     std.log.info("s={}: malformed message: {s}", .{self.sock, @errorName(err)});
                     self.deinit();
                     return error.Handled;
