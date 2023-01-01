@@ -153,17 +153,20 @@ const ListenSockHandler = struct {
     }
 };
 
+const AuthState = struct {
+    authenticated: bool = false,
+};
+
 const DataSockHandler = struct {
     base: EpollHandler = .{ .handle = handle },
     allocator: std.mem.Allocator,
     sock: os.socket_t,
     partial: std.ArrayListAlignedUnmanaged(u8, 8) = .{},
     state: union(enum) {
-        auth: struct {
-            authenticated: bool = false,
-        },
+        start: void,
+        auth: AuthState,
         begun: void,
-    } = .{ .auth = .{} },
+    } = .start,
 
     fn deinit(self: *DataSockHandler) void {
         os.close(self.sock);
@@ -230,66 +233,92 @@ const DataSockHandler = struct {
         std.debug.assert(buf.len > 0);
         var total_processed: usize = 0;
         while (true) {
-            const processed = try self.processSingle(@alignCast(8, buf[total_processed..]));
-            if (processed == 0) return total_processed;
-            total_processed += processed;
-        }
-    }
-
-    fn processSingle(self: *DataSockHandler, buf: []align(8) const u8) error{Handled}!usize {
-        switch (self.state) {
-            .auth => |*auth| {
-                const offsets = parseLineOffsets(buf);
-                if (offsets.end > 0) {
-                    const line = buf[0 .. offsets.len];
-                    std.log.info("s={}: got command '{}'", .{self.sock, std.zig.fmtEscapes(line)});
-
-                    const auth_external_prefix = "\x00AUTH EXTERNAL ";
-                    if (std.mem.startsWith(u8, line, auth_external_prefix)) {
-                        if (auth.authenticated) {
-                            std.log.info("s={}: got AUTH but already authenticatd", .{self.sock});
+            const last_msg_was_auth = switch (self.state) { .start, .auth => true, .begun => false };
+            const processed = blk: {
+                switch (self.state) {
+                    .start => {
+                        if (total_processed >= buf.len) return total_processed;
+                        if (buf[total_processed] != 0) {
+                            std.log.info("s={}: expected first byte to be 0 but got {}", .{self.sock, buf[total_processed]});
                             self.deinit();
                             return error.Handled;
                         }
-                        const uid_str = line[auth_external_prefix.len..];
-                        std.log.info("TODO: authenticate uid '{s}'", .{uid_str});
-                        self.writer().writeAll("OK 993c625b4b6d3b14c4eff3a4627ea9bf\r\n") catch |err| {
-                            std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
-                            self.deinit();
-                            return error.Handled;
-                        };
-                        auth.authenticated = true;
-                    } else if (std.mem.eql(u8, line, "NEGOTIATE_UNIX_FD")) {
-                        std.log.info("s={}: NEGOTIATE_UNIX_FD not implemented, sending ERROR", .{self.sock});
-                        self.writer().writeAll("ERROR\r\n") catch |err| {
-                            std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
-                            self.deinit();
-                            return error.Handled;
-                        };
-                    } else if (std.mem.eql(u8, line, "BEGIN")) {
-                        self.state = .begun;
-                    } else {
-                        std.log.info("s={}: unhandled request '{}'", .{self.sock, std.zig.fmtEscapes(line)});
-                        self.deinit();
-                        return error.Handled;
-                    }
+                        self.state = .{ .auth = .{} };
+                        break :blk 1;
+                    },
+                    .auth => |*auth| break :blk try self.processAuth(buf[total_processed..], auth),
+                    .begun => break :blk try self.processMsg(@alignCast(8, buf[total_processed..])),
                 }
-                return offsets.end;
-            },
-            .begun => {
-                const msg_len = (dbus.getMsgLen(buf) catch |err| {
-                    std.log.info("s={}: malformed message: {s}", .{self.sock, @errorName(err)});
+            };
+            if (processed == 0) return total_processed;
+            total_processed += processed;
+
+            switch (self.state) {
+                .start, .auth => {},
+                .begun => if (last_msg_was_auth) {
+                    // can this happen? if so then we need to do something about getting re-aligned, this
+                    // could be as simple as copying the rest of the data to the beginning of the buffer
+                    if (total_processed != buf.len) std.debug.panic(
+                        "TODO: handle {} extra bytes of data in the same read call that got the auth data",
+                        .{buf.len - total_processed},
+                    );
+
+                },
+            }
+        }
+    }
+
+    fn processAuth(self: *DataSockHandler, buf: []const u8, auth_state: *AuthState) error{Handled}!usize {
+        const offsets = parseLineOffsets(buf);
+        if (offsets.end > 0) {
+            const line = buf[0 .. offsets.len];
+            std.log.info("s={}: got command '{}'", .{self.sock, std.zig.fmtEscapes(line)});
+
+            const auth_external_prefix = "AUTH EXTERNAL ";
+            if (std.mem.startsWith(u8, line, auth_external_prefix)) {
+                if (auth_state.authenticated) {
+                    std.log.info("s={}: got AUTH but already authenticatd", .{self.sock});
                     self.deinit();
                     return error.Handled;
-                }) orelse return 0;
-                if (msg_len > buf.len) {
-                    std.log.debug("s={}: received partial message of {} bytes", .{self.sock, buf.len});
-                    return 0;
                 }
-                std.log.info("s={}: got msg {}-byte message '{}'", .{self.sock, msg_len, std.zig.fmtEscapes(buf)});
-                return msg_len;
-            },
+                const uid_str = line[auth_external_prefix.len..];
+                std.log.info("TODO: authenticate uid '{s}'", .{uid_str});
+                self.writer().writeAll("OK 993c625b4b6d3b14c4eff3a4627ea9bf\r\n") catch |err| {
+                    std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
+                    self.deinit();
+                    return error.Handled;
+                };
+                auth_state.authenticated = true;
+            } else if (std.mem.eql(u8, line, "NEGOTIATE_UNIX_FD")) {
+                std.log.info("s={}: NEGOTIATE_UNIX_FD not implemented, sending ERROR", .{self.sock});
+                self.writer().writeAll("ERROR\r\n") catch |err| {
+                    std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
+                    self.deinit();
+                    return error.Handled;
+                };
+            } else if (std.mem.eql(u8, line, "BEGIN")) {
+                self.state = .begun;
+            } else {
+                std.log.info("s={}: unhandled request '{}'", .{self.sock, std.zig.fmtEscapes(line)});
+                self.deinit();
+                return error.Handled;
+            }
         }
+        return offsets.end;
+    }
+
+    fn processMsg(self: *DataSockHandler, buf: []align(8) const u8) error{Handled}!usize {
+        const msg_len = (dbus.getMsgLen(buf) catch |err| {
+            std.log.info("s={}: malformed message: {s}", .{self.sock, @errorName(err)});
+            self.deinit();
+            return error.Handled;
+        }) orelse return 0;
+        if (msg_len > buf.len) {
+            std.log.debug("s={}: received partial message of {} bytes", .{self.sock, buf.len});
+            return 0;
+        }
+        std.log.info("s={}: got msg {}-byte message '{}'", .{self.sock, msg_len, std.zig.fmtEscapes(buf)});
+        return msg_len;
     }
 
     fn parseLineOffsets(buf: []const u8) struct { end: usize, len: usize } {
