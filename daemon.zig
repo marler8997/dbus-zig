@@ -274,21 +274,35 @@ const DataSockHandler = struct {
             const line = buf[0 .. offsets.len];
             std.log.info("s={}: got command '{}'", .{self.sock, std.zig.fmtEscapes(line)});
 
-            const auth_external_prefix = "AUTH EXTERNAL ";
-            if (std.mem.startsWith(u8, line, auth_external_prefix)) {
+            const AUTH = "AUTH";
+            const EXTERNAL = " EXTERNAL ";
+            if (std.mem.startsWith(u8, line, AUTH)) {
                 if (auth_state.authenticated) {
                     std.log.info("s={}: got AUTH but already authenticatd", .{self.sock});
                     self.deinit();
                     return error.Handled;
                 }
-                const uid_str = line[auth_external_prefix.len..];
-                std.log.info("TODO: authenticate uid '{s}'", .{uid_str});
-                self.writer().writeAll("OK 993c625b4b6d3b14c4eff3a4627ea9bf\r\n") catch |err| {
-                    std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
+                const the_rest = line[AUTH.len..];
+                if (the_rest.len == 0) {
+                    self.writer().writeAll("REJECTED EXTERNAL\r\n") catch |err| {
+                        std.log.err("s={}: failed to write reply with {s}", .{ self.sock, @errorName(err) });
+                        self.deinit();
+                        return error.Handled;
+                    };
+                } else if (std.mem.startsWith(u8, the_rest, EXTERNAL)) {
+                    const uid_str = the_rest[EXTERNAL.len..];
+                    std.log.info("TODO: authenticate uid '{s}'", .{uid_str});
+                    self.writer().writeAll("OK 993c625b4b6d3b14c4eff3a4627ea9bf\r\n") catch |err| {
+                        std.log.err("s={}: failed to write reply with {s}", .{self.sock, @errorName(err)});
+                        self.deinit();
+                        return error.Handled;
+                    };
+                    auth_state.authenticated = true;
+                } else {
+                    std.log.info("s={}: unhandled AUTH request '{}'", .{self.sock, std.zig.fmtEscapes(line)});
                     self.deinit();
                     return error.Handled;
-                };
-                auth_state.authenticated = true;
+                }
             } else if (std.mem.eql(u8, line, "NEGOTIATE_UNIX_FD")) {
                 std.log.info("s={}: NEGOTIATE_UNIX_FD not implemented, sending ERROR", .{self.sock});
                 self.writer().writeAll("ERROR\r\n") catch |err| {
