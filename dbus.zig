@@ -59,7 +59,7 @@ pub fn sliceLen(ptr: anytype, len: anytype) Slice(@TypeOf(len), @TypeOf(ptr)) {
 pub fn Slice(comptime LenType: type, comptime Ptr: type) type { return struct {
     const Self = @This();
     const ptr_info = @typeInfo(Ptr).Pointer;
-    pub const NativeSlice = @Type(std.builtin.TypeInfo {
+    pub const NativeSlice = @Type(std.builtin.Type{
         .Pointer = .{
             .size = .Slice,
             .is_const = ptr_info.is_const,

@@ -87,7 +87,7 @@ fn epollAddHandler(epoll_fd: os.fd_t, fd: os.fd_t, handler: *EpollHandler) !void
 }
 
 const EpollHandler = struct {
-    handle: std.meta.FnPtr(fn(base: *EpollHandler) anyerror!void),
+    handle: *const fn(base: *EpollHandler) anyerror!void,
 };
 
 const ListenSockHandler = struct {

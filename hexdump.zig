@@ -5,7 +5,7 @@ pub const HexdumpOptions = struct {
 };
 
 pub fn hexdump(
-    out_line: std.meta.FnPtr(fn(line: []const u8) void),
+    out_line: *const fn(line: []const u8) void,
     data: []const u8,
     options: HexdumpOptions,
 ) void {
