@@ -24,14 +24,27 @@ pub fn main() !u8 {
     std.log.info("authenticated", .{});
 
     {
-        const args = comptime dbus.method_call_msg.Args {
+        const args = comptime dbus.sigInfo("").method_call.args(.{
             .serial = 1,
             .path = dbus.strSlice(u32, "/org/freedesktop/DBus"),
             // TODO: do we need a destination?
             .destination = dbus.strSlice(u32, "org.freedesktop.DBus"),
             .interface = dbus.strSlice(u32, "org.freedesktop.DBus"),
             .member = dbus.strSlice(u32, "Hello"),
-            //.signature = "su",
+        });
+        var msg: [dbus.method_call_msg.getHeaderLen(args)]u8 = undefined;
+        dbus.method_call_msg.serialize(&msg, args);
+        try connection.writer().writeAll(&msg);
+    }
+
+    {
+        const args = comptime dbus.method_call_msg.Args {
+            .serial = 1,
+            .path = dbus.strSlice(u32, "/org/freedesktop/login1/session/auto"),
+            .destination = dbus.strSlice(u32, "org.freedesktop.login1.Session"),
+            .interface = dbus.strSlice(u32, "org.freedesktop.login1"),
+            .member = dbus.strSlice(u32, "SetBrightness"),
+            .signature = "ssu",
         };
         var msg: [dbus.method_call_msg.getHeaderLen(args)]u8 = undefined;
         dbus.method_call_msg.serialize(&msg, args);
