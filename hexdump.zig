@@ -38,7 +38,7 @@ fn formatLine(out_buf: []u8, line: []const u8, options: HexdumpOptions) usize {
 
     out_buf[hex_end + 0] = ' ';
     out_buf[hex_end + 1] = '|';
-    for (line) |c, i| {
+    for (line, 0..) |c, i| {
         out_buf[hex_end + 2 + i] = if (std.ascii.isPrint(c)) c else ' ';
     }
     out_buf[hex_end + 2 + line.len] = '|';
