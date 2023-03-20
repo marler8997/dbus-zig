@@ -495,7 +495,7 @@ pub const ParsedMsg = struct {
                     self.offset = @intCast(u27, field_end);
                     return HeaderField{ .string = .{
                         .kind = kind,
-                        .str = std.meta.assumeSentinel(@alignCast(4, str), 0),
+                        .str = @ptrCast([:0]const u8, @alignCast(4, str)),
                     } };
                 },
                 .uint32 => |kind| {
@@ -520,7 +520,7 @@ pub const ParsedMsg = struct {
                     const sig = msg_ptr[sig_content_start .. sig_content_start + sig_len];
                     if (sig.ptr[sig_len] != 0) return error.NoNullTerm;
                     self.offset = @intCast(u27, field_end);
-                    return HeaderField{ .sig = std.meta.assumeSentinel(sig, 0) };
+                    return HeaderField{ .sig = @ptrCast([:0]const u8, sig) };
                 },
                 .unknown => |id| {
                     std.log.warn("TODO: got unknown header field id '{}', use the type signature to skip it", .{id});
