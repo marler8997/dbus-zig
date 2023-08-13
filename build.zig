@@ -3,16 +3,24 @@ const Builder = std.build.Builder;
 
 pub fn build(b: *Builder) void {
     const target = b.standardTargetOptions(.{});
-    const mode = b.standardReleaseOptions();
+    const mode = b.standardOptimizeOption(.{});
+
+    const dbus_module = b.addModule("dbus", .{
+        .source_file = .{ .path = "dbus.zig" },
+    });
 
     {
-        const exe = b.addExecutable("example", "example.zig");
-        exe.setTarget(target);
-        exe.setBuildMode(mode);
-        exe.addPackagePath("dbus", "dbus.zig");
-        exe.install();
+        const exe = b.addExecutable(.{
+            .name = "example",
+            .root_source_file = .{ .path = "example.zig" },
+            .target = target,
+            .optimize = mode,
+        });
 
-        const run_cmd = exe.run();
+        exe.addModule("dbus", dbus_module);
+        b.installArtifact(exe);
+
+        const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
         if (b.args) |args| {
             run_cmd.addArgs(args);
@@ -22,14 +30,18 @@ pub fn build(b: *Builder) void {
         run_step.dependOn(&run_cmd.step);
     }
     {
-        const exe = b.addExecutable("daemon", "daemon.zig");
-        exe.single_threaded = true;
-        exe.setTarget(target);
-        exe.setBuildMode(mode);
-        exe.addPackagePath("dbus", "dbus.zig");
-        exe.install();
+        const exe = b.addExecutable(.{
+            .name = "daemon",
+            .root_source_file = .{ .path = "daemon.zig" },
+            .single_threaded = true,
+            .target = target,
+            .optimize = mode,
+        });
 
-        const run_cmd = exe.run();
+        exe.addModule("dbus", dbus_module);
+        b.installArtifact(exe);
+
+        const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
         if (b.args) |args| {
             run_cmd.addArgs(args);
