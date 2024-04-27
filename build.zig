@@ -1,12 +1,11 @@
 const std = @import("std");
-const Builder = std.build.Builder;
 
-pub fn build(b: *Builder) void {
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardOptimizeOption(.{});
 
     const dbus_module = b.addModule("dbus", .{
-        .source_file = .{ .path = "dbus.zig" },
+        .root_source_file = .{ .path = "dbus.zig" },
     });
 
     {
@@ -17,7 +16,7 @@ pub fn build(b: *Builder) void {
             .optimize = mode,
         });
 
-        exe.addModule("dbus", dbus_module);
+        exe.root_module.addImport("dbus", dbus_module);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
@@ -38,7 +37,7 @@ pub fn build(b: *Builder) void {
             .optimize = mode,
         });
 
-        exe.addModule("dbus", dbus_module);
+        exe.root_module.addImport("dbus", dbus_module);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
