@@ -6,8 +6,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "example.zig",
-        "hexdump.zig",
         "src",
+        "examples",
     },
 }

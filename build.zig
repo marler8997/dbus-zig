@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
 
     const examples = b.step("examples", "build/install all the examples");
 
-    inline for (&.{"basic"}) |example_name| {
+    inline for (&.{ "hello", "monitor" }) |example_name| {
         const exe = b.addExecutable(.{
             .name = example_name,
             .root_module = b.createModule(.{

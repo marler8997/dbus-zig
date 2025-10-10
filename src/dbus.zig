@@ -11,6 +11,9 @@ pub const default_system_bus_address_str = "unix:path=" ++ default_system_bus_pa
 //    .unix = .{ .path =
 //};
 
+// This maximum length applies to bus names, interfaces and members
+pub const max_name = 255;
+
 pub const BusAddressString = struct {
     origin: enum { hardcoded_default, environment_variable },
     str: []const u8,
@@ -386,10 +389,12 @@ fn getEndian(first_msg_byte: u8) ?std.builtin.Endian {
 }
 
 pub const GetMsgLenError = error{ InvalidEndianValue, TooBig };
+/// Returned len is guaranteed to be 8-byte aligned
 pub fn getMsgLen(msg: []align(8) const u8) GetMsgLenError!?u27 {
     if (msg.len < 16) return null;
     return try getMsgLenAssumeAtLeast16(msg);
 }
+/// Returned len is guaranteed to be 8-byte aligned
 pub fn getMsgLenAssumeAtLeast16(msg: []align(8) const u8) GetMsgLenError!u27 {
     const endian = getEndian(msg[0]) orelse return error.InvalidEndianValue;
     const body_len = readInt(u32, endian, comptime toAlign(4), msg.ptr + 4);
@@ -537,6 +542,12 @@ pub const ParsedMsg = struct {
     }
 };
 
+pub fn parseMsg(msg: []align(8) const u8) ParsedMsgError!ParsedMsg {
+    const msg_len = getMsgLenAssumeAtLeast16(msg) catch unreachable;
+    std.debug.assert(msg.len == msg_len);
+    return parseMsgAssumeGetMsgLen(.{ .ptr = msg.ptr, .len = msg_len });
+}
+
 pub const ParsedMsgError = error{
     InvalidMsgType,
     DuplicateHeader,
@@ -670,6 +681,19 @@ const HeaderParser = struct {
     }
 };
 
+// TODO: not sure if this is the right function and/or place for this
+pub fn parseString(endian: std.builtin.Endian, buf: []const u8, offset: usize) ?struct {
+    string: [:0]const u8,
+    end: usize,
+} {
+    if (offset + 4 > buf.len) return null;
+    const len = std.mem.readInt(u32, buf[offset..][0..4], endian);
+    const null_index = offset + 4 + len;
+    if (null_index >= buf.len) return null;
+    if (buf[null_index] != 0) return null;
+    return .{ .string = buf[offset + 4 .. null_index :0], .end = null_index + 1 };
+}
+
 fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStream})!void {
     std.debug.assert(buf.len > 0);
     var total_received: usize = 0;
@@ -710,4 +734,21 @@ pub fn readOneMsgFinish(reader: anytype, buf: []align(8) u8) !void {
         std.debug.assert(buf.len == msg_len);
     }
     try readFull(reader, buf[16..]);
+}
+
+pub fn readOneMsgArrayList(reader: anytype, al: *std.ArrayListAligned(u8, 8)) !void {
+    std.debug.assert(std.mem.isAligned(al.items.len, 8));
+
+    try al.ensureUnusedCapacity(16);
+    const header: []align(8) u8 = @alignCast(al.unusedCapacitySlice()[0..16]);
+    try readFull(reader, header);
+    al.items.len += 16;
+    const msg_len = getMsgLenAssumeAtLeast16(header) catch |err| switch (err) {
+        error.InvalidEndianValue => return error.DbusMsgInvalidEndianValue,
+        error.TooBig => return error.DbusMsgTooBig,
+    };
+    const remaining = msg_len - 16;
+    try al.ensureUnusedCapacity(remaining);
+    try readFull(reader, al.unusedCapacitySlice()[0..remaining]);
+    al.items.len += remaining;
 }
