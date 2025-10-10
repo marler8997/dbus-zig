@@ -8,11 +8,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/dbus.zig"),
     });
 
-    {
+    const examples = b.step("examples", "build/install all the examples");
+
+    inline for (&.{"basic"}) |example_name| {
         const exe = b.addExecutable(.{
-            .name = "example",
+            .name = example_name,
             .root_module = b.createModule(.{
-                .root_source_file = b.path("example.zig"),
+                .root_source_file = b.path("examples/" ++ example_name ++ ".zig"),
                 .target = target,
                 .optimize = mode,
                 .imports = &.{
@@ -20,17 +22,21 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        b.installArtifact(exe);
+        const install = b.addInstallArtifact(exe, .{});
+        b.getInstallStep().dependOn(&install.step);
+        b.step("build-" ++ example_name, "Build the " ++ example_name ++ " example").dependOn(&install.step);
+        examples.dependOn(&install.step);
 
         const run_cmd = b.addRunArtifact(exe);
-        run_cmd.step.dependOn(b.getInstallStep());
+        run_cmd.step.dependOn(&install.step);
         if (b.args) |args| {
             run_cmd.addArgs(args);
         }
 
-        const run_step = b.step("example", "Run the app");
+        const run_step = b.step(example_name, "Run the " ++ example_name ++ " example");
         run_step.dependOn(&run_cmd.step);
     }
+
     {
         const exe = b.addExecutable(.{
             .name = "daemon",
