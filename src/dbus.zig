@@ -21,7 +21,7 @@ pub fn getSystemBusAddress() Address {
     //return std.os.getenv("DBUS_SYSTEM_BUS_ADDRESS") orelse default_system_bus_address;
 }
 pub fn getSessionBusAddressString() BusAddressString {
-    if (std.os.getenv("DBUS_SESSION_BUS_ADDRESS")) |s|
+    if (std.posix.getenv("DBUS_SESSION_BUS_ADDRESS")) |s|
         return BusAddressString{ .origin = .environment_variable, .str = s };
     return BusAddressString{ .origin = .hardcoded_default, .str = default_system_bus_address_str };
 }
@@ -34,8 +34,8 @@ pub const MessageType = enum(u8) {
 };
 
 const endian_header_value = switch (builtin.cpu.arch.endian()) {
-    .Big => 'B',
-    .Little => 'l',
+    .big => 'B',
+    .little => 'l',
 };
 
 pub fn writeIntNative(comptime T: type, buf: [*]u8, value: T) void {
@@ -59,17 +59,17 @@ pub fn sliceLen(ptr: anytype, len: anytype) Slice(@TypeOf(len), @TypeOf(ptr)) {
 pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
     return struct {
         const Self = @This();
-        const ptr_info = @typeInfo(Ptr).Pointer;
+        const ptr_info = @typeInfo(Ptr).pointer;
         pub const NativeSlice = @Type(std.builtin.Type{
-            .Pointer = .{
-                .size = .Slice,
+            .pointer = .{
+                .size = .slice,
                 .is_const = ptr_info.is_const,
                 .is_volatile = ptr_info.is_volatile,
                 .alignment = ptr_info.alignment,
                 .address_space = ptr_info.address_space,
                 .child = ptr_info.child,
                 .is_allowzero = ptr_info.is_allowzero,
-                .sentinel = ptr_info.sentinel,
+                .sentinel_ptr = ptr_info.sentinel_ptr,
             },
         });
 
@@ -88,7 +88,7 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
             return .{ .ptr = self.ptr, .len = @as(NewLenType, @intCast(self.len)) };
         }
 
-        pub usingnamespace switch (@typeInfo(Ptr).Pointer.child) {
+        pub usingnamespace switch (@typeInfo(Ptr).pointer.child) {
             u8 => struct {
                 pub fn format(
                     self: Self,
@@ -108,8 +108,8 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
 
 const header_fixed_part_len =
     4 // endian/type/flags/version
-+ 4 // body_length
-+ 4 // serial
+    + 4 // body_length
+    + 4 // serial
 ;
 fn stringEncodeLen(string_len: u32, align_to: u29) u32 {
     return @as(u32, @intCast(4 + std.mem.alignForward(u32, string_len + 1, align_to)));
@@ -379,8 +379,8 @@ pub const method_call_msg = struct {
 
 fn getEndian(first_msg_byte: u8) ?std.builtin.Endian {
     return switch (first_msg_byte) {
-        'l' => std.builtin.Endian.Little,
-        'B' => std.builtin.Endian.Big,
+        'l' => std.builtin.Endian.little,
+        'B' => std.builtin.Endian.big,
         else => null,
     };
 }

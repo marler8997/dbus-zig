@@ -5,7 +5,7 @@ const Transport = enum {
     unix,
 };
 
-const transport_name_map = std.ComptimeStringMap(Transport, .{
+const transport_name_map = std.StaticStringMap(Transport).initComptime(.{
     .{ "unix", .unix },
 });
 
@@ -14,16 +14,12 @@ pub const Address = union(Transport) {
         unescaped_path: []const u8,
     },
 
-    pub const FromStringError = error {
+    pub const FromStringError = error{
         UnknownTransport,
         UnknownUnixOption,
         MultipleUnixPaths,
         UnixMissingPath,
-    }
-    || AddrParser.InitError
-    || AddrParser.KeysIterator.NextError
-    || ResolveEscapesError
-    ;
+    } || AddrParser.InitError || AddrParser.KeysIterator.NextError || ResolveEscapesError;
     pub fn fromString(str: []const u8) FromStringError!Address {
         var parser = try AddrParser.init(str);
         const transport_str = parser.transport();
@@ -76,7 +72,7 @@ pub fn hasEscapes(unescaped_value: []const u8) bool {
     return false;
 }
 
-const ResolveEscapesError = error {
+const ResolveEscapesError = error{
     DestTooSmall,
     BadEscapeSequence,
 };
@@ -90,9 +86,9 @@ pub fn resolveEscapes(dest: []u8, unescaped_value: []const u8) ResolveEscapesErr
         if (value == '%') {
             if (value_index + 2 >= unescaped_value.len)
                 return error.BadEscapeSequence;
-            value = hexDigitVal(unescaped_value[value_index+2]) orelse
+            value = hexDigitVal(unescaped_value[value_index + 2]) orelse
                 return error.BadEscapeSequence;
-            value |= (hexDigitVal(unescaped_value[value_index+1]) orelse
+            value |= (hexDigitVal(unescaped_value[value_index + 1]) orelse
                 return error.BadEscapeSequence) << 4;
             value_index += 2;
         }
@@ -106,7 +102,7 @@ pub const AddrParser = struct {
     addr: []const u8,
     colon_index: usize,
 
-    pub const InitError = error { MissingColonToTerminateTransport };
+    pub const InitError = error{MissingColonToTerminateTransport};
     pub fn init(addr: []const u8) InitError!AddrParser {
         const colon_index = std.mem.indexOfScalar(u8, addr, ':') orelse
             return InitError.MissingColonToTerminateTransport;
@@ -114,7 +110,7 @@ pub const AddrParser = struct {
     }
 
     pub fn transport(self: AddrParser) []const u8 {
-        return self.addr[0 .. self.colon_index];
+        return self.addr[0..self.colon_index];
     }
 
     pub const KeysIterator = struct {
@@ -126,10 +122,10 @@ pub const AddrParser = struct {
             unescaped_value: []const u8,
         };
 
-        pub const NextError = error {
+        pub const NextError = error{
             KeyValueMissignAssignChar,
         };
-        
+
         pub fn next(self: *KeysIterator) !?KeyValue {
             if (self.index >= self.str.len) return null;
             const assign_index = std.mem.indexOfScalarPos(u8, self.str, self.index, '=') orelse
@@ -145,13 +141,13 @@ pub const AddrParser = struct {
             };
             return KeyValue{
                 .key = self.str[index..assign_index],
-                .unescaped_value = self.str[assign_index+1..end],
+                .unescaped_value = self.str[assign_index + 1 .. end],
             };
         }
     };
-    
+
     pub fn keysIterator(self: AddrParser) KeysIterator {
-        return .{ .str = self.addr[self.colon_index + 1..], .index = 0 };
+        return .{ .str = self.addr[self.colon_index + 1 ..], .index = 0 };
     }
 };
 
@@ -187,7 +183,7 @@ test {
             try testing.expectEqualSlices(u8, "path", kv.key);
             try testing.expectEqualSlices(u8, "/a-fun-path/%68%65%6c%6C%6f-weird-chars%3a%00%01%2c", kv.unescaped_value);
             var buffer: [100]u8 = undefined;
-            const value = buffer[0 .. try resolveEscapes(&buffer, kv.unescaped_value)];
+            const value = buffer[0..try resolveEscapes(&buffer, kv.unescaped_value)];
             try testing.expectEqualSlices(u8, "/a-fun-path/hello-weird-chars:\x00\x01,", value);
         }
         try testing.expect(null == try it.next());
@@ -221,24 +217,24 @@ fn isOptionallyEscapedByte(b: u8) bool {
 test "isOptionallyEscapedByte" {
     try testing.expect(!isOptionallyEscapedByte(0));
     try testing.expect(!isOptionallyEscapedByte('*' - 1));
-    try testing.expect( isOptionallyEscapedByte('*'    ));
+    try testing.expect(isOptionallyEscapedByte('*'));
     try testing.expect(!isOptionallyEscapedByte('*' + 1));
     try testing.expect(!isOptionallyEscapedByte('-' - 1));
-    try testing.expect( isOptionallyEscapedByte('-'    ));
-    try testing.expect( isOptionallyEscapedByte('.'    ));
-    try testing.expect( isOptionallyEscapedByte('/'    ));
-    try testing.expect( isOptionallyEscapedByte('0'    ));
-    try testing.expect( isOptionallyEscapedByte('9'    ));
+    try testing.expect(isOptionallyEscapedByte('-'));
+    try testing.expect(isOptionallyEscapedByte('.'));
+    try testing.expect(isOptionallyEscapedByte('/'));
+    try testing.expect(isOptionallyEscapedByte('0'));
+    try testing.expect(isOptionallyEscapedByte('9'));
     try testing.expect(!isOptionallyEscapedByte('9' + 1));
     try testing.expect(!isOptionallyEscapedByte('A' - 1));
-    try testing.expect( isOptionallyEscapedByte('A'    ));
-    try testing.expect( isOptionallyEscapedByte('Z'    ));
+    try testing.expect(isOptionallyEscapedByte('A'));
+    try testing.expect(isOptionallyEscapedByte('Z'));
     try testing.expect(!isOptionallyEscapedByte('Z' + 1));
     try testing.expect(!isOptionallyEscapedByte('_' - 1));
-    try testing.expect( isOptionallyEscapedByte('_'    ));
+    try testing.expect(isOptionallyEscapedByte('_'));
     try testing.expect(!isOptionallyEscapedByte('_' + 1));
     try testing.expect(!isOptionallyEscapedByte('a' - 1));
-    try testing.expect( isOptionallyEscapedByte('a'    ));
-    try testing.expect( isOptionallyEscapedByte('a'    ));
+    try testing.expect(isOptionallyEscapedByte('a'));
+    try testing.expect(isOptionallyEscapedByte('a'));
     try testing.expect(!isOptionallyEscapedByte('z' + 1));
 }

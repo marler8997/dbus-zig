@@ -14,7 +14,7 @@ pub fn main() !u8 {
         },
     };
 
-    const epoll_fd = os.epoll_create1(os.linux.EPOLL.CLOEXEC) catch |err| {
+    const epoll_fd = std.posix.epoll_create1(os.linux.EPOLL.CLOEXEC) catch |err| {
         std.log.err("epoll_create failed with {s}", .{@errorName(err)});
         return 0xff;
     };
@@ -25,29 +25,29 @@ pub fn main() !u8 {
     var listen_sock_handler: ListenSockHandler = undefined;
 
     {
-        const sock = os.socket(os.AF.UNIX, os.SOCK.STREAM | os.SOCK.NONBLOCK | os.SOCK.CLOEXEC, 0) catch |err| {
+        const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0) catch |err| {
             std.log.err("failed to create unix socket: {s}", .{@errorName(err)});
             return 0xff;
         };
-        //errdefer os.close(sock);
+        //errdefer std.posix.close(sock);
 
-        var sockaddr = os.sockaddr.un{ .family = os.AF.UNIX, .path = undefined };
+        var sockaddr = std.posix.sockaddr.un{ .family = std.posix.AF.UNIX, .path = undefined };
 
-        const addr_len = @as(os.socklen_t, @intCast(@offsetOf(os.sockaddr.un, "path") + path.len + 1));
-        if (addr_len > @sizeOf(os.sockaddr.un)) {
+        const addr_len = @as(std.posix.socklen_t, @intCast(@offsetOf(std.posix.sockaddr.un, "path") + path.len + 1));
+        if (addr_len > @sizeOf(std.posix.sockaddr.un)) {
             std.log.err("unix socket path len {} is too big", .{path.len});
             return 0xff;
         }
         @memcpy(sockaddr.path[0..path.len], path);
         sockaddr.path[path.len] = 0;
 
-        os.bind(sock, @as(*os.sockaddr, @ptrCast(&sockaddr)), addr_len) catch |err| {
+        std.posix.bind(sock, @as(*std.posix.sockaddr, @ptrCast(&sockaddr)), addr_len) catch |err| {
             std.log.err("failed to bind unix socket to '{s}': {s}", .{ path, @errorName(err) });
             return 0xff;
         };
         std.log.info("bound socket to '{s}'", .{path});
 
-        os.listen(sock, 10) catch |err| {
+        std.posix.listen(sock, 10) catch |err| {
             std.log.err("unix socket listen failed with {s}", .{@errorName(err)});
             return 0xff;
         };
@@ -61,8 +61,8 @@ pub fn main() !u8 {
 
     while (true) {
         var events: [10]os.linux.epoll_event = undefined;
-        const count = os.epoll_wait(epoll_fd, &events, 0);
-        switch (os.errno(count)) {
+        const count = std.posix.epoll_wait(epoll_fd, &events, 0);
+        switch (std.posix.errno(count)) {
             .SUCCESS => {},
             else => |e| std.debug.panic("epoll_wait failed, errno={}", .{e}),
         }
@@ -77,12 +77,12 @@ pub fn main() !u8 {
     return 0;
 }
 
-fn epollAddHandler(epoll_fd: os.fd_t, fd: os.fd_t, handler: *EpollHandler) !void {
+fn epollAddHandler(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, handler: *EpollHandler) !void {
     var event = os.linux.epoll_event{
         .events = os.linux.EPOLL.IN,
         .data = os.linux.epoll_data{ .ptr = @intFromPtr(handler) },
     };
-    try os.epoll_ctl(epoll_fd, os.linux.EPOLL.CTL_ADD, fd, &event);
+    try std.posix.epoll_ctl(epoll_fd, os.linux.EPOLL.CTL_ADD, fd, &event);
 }
 
 const EpollHandler = struct {
@@ -91,17 +91,17 @@ const EpollHandler = struct {
 
 const ListenSockHandler = struct {
     base: EpollHandler = .{ .handle = handle },
-    epoll_fd: os.fd_t,
+    epoll_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
-    sock: os.socket_t,
+    sock: std.posix.socket_t,
 
     fn handle(base: *EpollHandler) !void {
-        const self = @fieldParentPtr(ListenSockHandler, "base", base);
+        const self: *ListenSockHandler = @fieldParentPtr("base", base);
 
-        var addr: os.sockaddr.un = undefined;
-        var len: os.socklen_t = @sizeOf(@TypeOf(addr));
+        var addr: std.posix.sockaddr.un = undefined;
+        var len: std.posix.socklen_t = @sizeOf(@TypeOf(addr));
 
-        const new_fd = os.accept(self.sock, @as(*os.sockaddr, @ptrCast(&addr)), &len, os.SOCK.CLOEXEC) catch |err| switch (err) {
+        const new_fd = std.posix.accept(self.sock, @as(*std.posix.sockaddr, @ptrCast(&addr)), &len, std.posix.SOCK.CLOEXEC) catch |err| switch (err) {
             error.ConnectionAborted,
             error.ProcessFdQuotaExceeded,
             error.SystemFdQuotaExceeded,
@@ -121,7 +121,7 @@ const ListenSockHandler = struct {
             error.Unexpected,
             => unreachable,
         };
-        errdefer os.close(new_fd);
+        errdefer std.posix.close(new_fd);
 
         const new_handler = self.allocator.create(DataSockHandler) catch |err| switch (err) {
             error.OutOfMemory => {
@@ -159,7 +159,7 @@ const AuthState = struct {
 const DataSockHandler = struct {
     base: EpollHandler = .{ .handle = handle },
     allocator: std.mem.Allocator,
-    sock: os.socket_t,
+    sock: std.posix.socket_t,
     partial: std.ArrayListAlignedUnmanaged(u8, 8) = .{},
     state: union(enum) {
         start: void,
@@ -168,7 +168,7 @@ const DataSockHandler = struct {
     } = .start,
 
     fn deinit(self: *DataSockHandler) void {
-        os.close(self.sock);
+        std.posix.close(self.sock);
         self.partial.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -176,7 +176,7 @@ const DataSockHandler = struct {
     const min_read_len = 500;
 
     fn handle(base: *EpollHandler) !void {
-        const self = @fieldParentPtr(DataSockHandler, "base", base);
+        const self: *DataSockHandler = @fieldParentPtr("base", base);
 
         if (self.partial.items.len > 0) {
             self.partial.ensureUnusedCapacity(self.allocator, min_read_len) catch {
@@ -191,7 +191,7 @@ const DataSockHandler = struct {
                 self.partial.clearRetainingCapacity();
             } else {
                 const new_len = self.partial.items.len - processed;
-                std.mem.copy(u8, self.partial.items[0..new_len], self.partial.items[processed..]);
+                @memcpy(self.partial.items[0..new_len], self.partial.items[processed..]);
                 self.partial.items.len = new_len;
             }
         } else {
@@ -214,7 +214,7 @@ const DataSockHandler = struct {
     }
 
     fn read(self: *DataSockHandler, buf: []u8) error{Handled}!usize {
-        const len = os.read(self.sock, buf) catch |err| {
+        const len = std.posix.read(self.sock, buf) catch |err| {
             std.log.err("s={}: read failed with {s}, closing", .{ self.sock, @errorName(err) });
             self.deinit();
             return error.Handled;
@@ -345,12 +345,12 @@ const DataSockHandler = struct {
         return .{ .end = newline_index + 1, .len = len };
     }
 
-    pub const Writer = std.io.Writer(DataSockHandler, std.os.WriteError, write);
+    pub const Writer = std.io.Writer(DataSockHandler, std.posix.WriteError, write);
     pub fn writer(self: DataSockHandler) Writer {
         return .{ .context = self };
     }
-    fn write(self: DataSockHandler, buf: []const u8) std.os.WriteError!usize {
-        return std.os.write(self.sock, buf);
+    fn write(self: DataSockHandler, buf: []const u8) std.posix.WriteError!usize {
+        return std.posix.write(self.sock, buf);
     }
 };
 

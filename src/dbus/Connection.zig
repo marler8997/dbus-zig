@@ -1,12 +1,11 @@
 const Connection = @This();
 
 const std = @import("std");
-const os = std.os;
 
 const address_mod = @import("address.zig");
 const Address = address_mod.Address;
 
-fd: std.os.fd_t,
+fd: std.posix.fd_t,
 
 pub const ConnectError = error{
     DbusAddrUnixPathTooBig,
@@ -24,7 +23,7 @@ pub const ConnectError = error{
 pub fn connect(addr: Address) ConnectError!Connection {
     switch (addr) {
         .unix => |unix_addr| {
-            var sockaddr = os.sockaddr.un{ .family = os.AF.UNIX, .path = undefined };
+            var sockaddr = std.posix.sockaddr.un{ .family = std.posix.AF.UNIX, .path = undefined };
             const path_len = address_mod.resolveEscapes(&sockaddr.path, unix_addr.unescaped_path) catch |err| switch (err) {
                 error.DestTooSmall => return error.DbusAddrUnixPathTooBig,
                 error.BadEscapeSequence => return error.DBusAddrBadEscapeSequence,
@@ -32,7 +31,7 @@ pub fn connect(addr: Address) ConnectError!Connection {
             if (path_len == sockaddr.path.len) return error.DbusAddrUnixPathTooBig;
             sockaddr.path[path_len] = 0;
 
-            const sock = os.socket(os.AF.UNIX, os.SOCK.STREAM, 0) catch |err| switch (err) {
+            const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| switch (err) {
                 error.PermissionDenied,
                 error.ProcessFdQuotaExceeded,
                 error.SystemFdQuotaExceeded,
@@ -45,12 +44,12 @@ pub fn connect(addr: Address) ConnectError!Connection {
                 error.Unexpected,
                 => unreachable,
             };
-            errdefer os.close(sock);
+            errdefer std.posix.close(sock);
 
-            const addr_len: os.socklen_t = @intCast(@offsetOf(os.sockaddr.un, "path") + path_len + 1);
+            const addr_len: std.posix.socklen_t = @intCast(@offsetOf(std.posix.sockaddr.un, "path") + path_len + 1);
 
             // TODO: should we set any socket options?
-            os.connect(sock, @as(*os.sockaddr, @ptrCast(&sockaddr)), addr_len) catch |err| switch (err) {
+            std.posix.connect(sock, @as(*std.posix.sockaddr, @ptrCast(&sockaddr)), addr_len) catch |err| switch (err) {
                 error.PermissionDenied,
                 error.AddressInUse,
                 error.SystemResources,
@@ -72,20 +71,20 @@ pub fn connect(addr: Address) ConnectError!Connection {
     }
 }
 
-pub const Writer = std.io.Writer(Connection, std.os.WriteError, write);
+pub const Writer = std.io.Writer(Connection, std.posix.WriteError, write);
 pub fn writer(self: Connection) Writer {
     return .{ .context = self };
 }
-fn write(self: Connection, buf: []const u8) std.os.WriteError!usize {
-    return std.os.write(self.fd, buf);
+fn write(self: Connection, buf: []const u8) std.posix.WriteError!usize {
+    return std.posix.write(self.fd, buf);
 }
 
-pub const Reader = std.io.Reader(Connection, std.os.ReadError, read);
+pub const Reader = std.io.Reader(Connection, std.posix.ReadError, read);
 pub fn reader(self: Connection) Reader {
     return .{ .context = self };
 }
-fn read(self: Connection, buf: []u8) std.os.ReadError!usize {
-    return std.os.read(self.fd, buf);
+fn read(self: Connection, buf: []u8) std.posix.ReadError!usize {
+    return std.posix.read(self.fd, buf);
 }
 
 pub fn authenticate(self: Connection) !void {
@@ -95,7 +94,7 @@ pub fn authenticate(self: Connection) !void {
             //const include_uid = false;
             //if (!include_uid) break :blk "\x00AUTH EXTERNAL\r\n";
             var uid_str_buf: [40]u8 = undefined;
-            const uid = std.os.system.getuid();
+            const uid = std.posix.system.getuid();
             const uid_str = std.fmt.bufPrint(&uid_str_buf, " {}", .{uid}) catch |err| switch (err) {
                 error.NoSpaceLeft => unreachable,
             };

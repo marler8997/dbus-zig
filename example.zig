@@ -51,11 +51,11 @@ pub fn main() !u8 {
         var buf: [recv_buf_len]u8 align(8) = undefined;
         const msg_len = switch (dbus.readOneMsg(connection.reader(), &buf) catch |err| {
             std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
-            std.os.exit(0xff);
+            std.posix.exit(0xff);
         }) {
             .partial => |len| {
                 std.log.err("buffer of size {} is not large enough (need {})", .{ buf.len, len });
-                std.os.exit(0xff);
+                std.posix.exit(0xff);
             },
             .complete => |len| len,
         };
@@ -69,12 +69,12 @@ pub fn main() !u8 {
         @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
         const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]align(8) const u8, &buf), msg_len)) catch |err| {
             std.log.err("malformed reply: {s}", .{@errorName(err)});
-            std.os.exit(0xff);
+            std.posix.exit(0xff);
         };
         switch (parsed.headers) {
             .method_return => |headers| {
                 std.log.err("unexpected MethodReturn {}", .{headers});
-                std.os.exit(0xff);
+                std.posix.exit(0xff);
             },
             .signal => |headers| std.log.info("Signal {}", .{headers}),
         }
@@ -142,11 +142,11 @@ fn recvMethodReturn(reader: anytype, buf: []align(8) u8, serial: u32) dbus.Parse
         std.log.info("waiting for method return msg (serial={})...", .{serial});
         const msg_len = switch (dbus.readOneMsg(reader, buf) catch |err| {
             std.log.err("failed to read dbus msg with {s}", .{@errorName(err)});
-            std.os.exit(0xff);
+            std.posix.exit(0xff);
         }) {
             .partial => |len| {
                 std.log.err("buffer of size {} is not large enough (need {})", .{ buf.len, len });
-                std.os.exit(0xff);
+                std.posix.exit(0xff);
             },
             .complete => |len| len,
         };
@@ -160,7 +160,7 @@ fn recvMethodReturn(reader: anytype, buf: []align(8) u8, serial: u32) dbus.Parse
         @import("hexdump.zig").hexdump(func.log, buf[0..msg_len], .{});
         const parsed = dbus.parseMsgAssumeGetMsgLen(dbus.sliceLen(@as([*]align(8) const u8, buf.ptr), msg_len)) catch |err| {
             std.log.err("malformed reply: {s}", .{@errorName(err)});
-            std.os.exit(0xff);
+            std.posix.exit(0xff);
         };
         switch (parsed.headers) {
             .method_return => |headers| {

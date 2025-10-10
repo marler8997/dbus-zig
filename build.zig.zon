@@ -1,5 +1,13 @@
 .{
-    .name = "dbuszig",
+    .name = .dbuszig,
+    .fingerprint = 0xd19eb08773bedc6b,
     .version = "0.0.0",
-    .minimum_zig_version = "0.11.0",
+    .minimum_zig_version = "0.14.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "example.zig",
+        "hexdump.zig",
+        "src",
+    },
 }

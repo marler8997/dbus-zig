@@ -1,23 +1,25 @@
 const std = @import("std");
-const Builder = std.build.Builder;
 
-pub fn build(b: *Builder) void {
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardOptimizeOption(.{});
 
     const dbus_module = b.addModule("dbus", .{
-        .source_file = .{ .path = "src/dbus.zig" },
+        .root_source_file = b.path("src/dbus.zig"),
     });
 
     {
         const exe = b.addExecutable(.{
             .name = "example",
-            .root_source_file = .{ .path = "example.zig" },
-            .target = target,
-            .optimize = mode,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("example.zig"),
+                .target = target,
+                .optimize = mode,
+                .imports = &.{
+                    .{ .name = "dbus", .module = dbus_module },
+                },
+            }),
         });
-
-        exe.addModule("dbus", dbus_module);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
@@ -32,13 +34,16 @@ pub fn build(b: *Builder) void {
     {
         const exe = b.addExecutable(.{
             .name = "daemon",
-            .root_source_file = .{ .path = "src/daemon.zig" },
-            .single_threaded = true,
-            .target = target,
-            .optimize = mode,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/daemon.zig"),
+                .target = target,
+                .optimize = mode,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "dbus", .module = dbus_module },
+                },
+            }),
         });
-
-        exe.addModule("dbus", dbus_module);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
