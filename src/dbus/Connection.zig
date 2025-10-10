@@ -95,7 +95,7 @@ pub fn authenticate(self: Connection) !void {
             //if (!include_uid) break :blk "\x00AUTH EXTERNAL\r\n";
             var uid_str_buf: [40]u8 = undefined;
             const uid = std.posix.system.getuid();
-            const uid_str = std.fmt.bufPrint(&uid_str_buf, " {}", .{uid}) catch |err| switch (err) {
+            const uid_str = std.fmt.bufPrint(&uid_str_buf, "{}", .{uid}) catch |err| switch (err) {
                 error.NoSpaceLeft => unreachable,
             };
             break :blk std.fmt.bufPrint(&msg_buf, "\x00AUTH EXTERNAL {}\r\n", .{std.fmt.fmtSliceHexLower(uid_str)}) catch |err| switch (err) {
