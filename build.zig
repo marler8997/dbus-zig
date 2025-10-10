@@ -6,7 +6,7 @@ pub fn build(b: *Builder) void {
     const mode = b.standardOptimizeOption(.{});
 
     const dbus_module = b.addModule("dbus", .{
-        .source_file = .{ .path = "dbus.zig" },
+        .source_file = .{ .path = "src/dbus.zig" },
     });
 
     {
@@ -32,7 +32,7 @@ pub fn build(b: *Builder) void {
     {
         const exe = b.addExecutable(.{
             .name = "daemon",
-            .root_source_file = .{ .path = "daemon.zig" },
+            .root_source_file = .{ .path = "src/daemon.zig" },
             .single_threaded = true,
             .target = target,
             .optimize = mode,
