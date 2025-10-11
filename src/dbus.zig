@@ -383,6 +383,19 @@ test pad8Len {
 //       they also must not contain OVERLONG sequences or exceed the value 0x10ffff
 pub const max_codepoint = 0x10ffff;
 
+const Alignment = enum {
+    @"1",
+    @"4",
+    @"8",
+    pub fn int(self: Alignment, comptime Int: type) Int {
+        return switch (self) {
+            .@"1" => 1,
+            .@"4" => 4,
+            .@"8" => 8,
+        };
+    }
+};
+
 pub const Type = enum {
     u8, // 'y'
     bool, // 'b'
@@ -415,14 +428,18 @@ pub const Type = enum {
             .unix_fd => std.posix.fd_t,
         };
     }
-    fn getLen(comptime sig_type: Type, body_align: u3, value: *const sig_type.Native()) u32 {
-        switch (sig_type) {
-            .string, .object_path => {
-                const pad_len: u32 = pad4Len(@truncate(body_align));
-                return pad_len + 4 + value.len + 1;
-            },
+
+    pub fn alignment(sig_type: Type) Alignment {
+        return switch (sig_type) {
+            .string, .object_path => .@"4",
+            else => @compileError("todo: implement alignment for " ++ @tagName(sig_type)),
+        };
+    }
+    pub fn getLenUnaligned(comptime sig_type: Type, value: *const sig_type.Native()) u32 {
+        return switch (sig_type) {
+            .string, .object_path => 4 + value.len + 1,
             else => @compileError("todo: support type: " ++ @tagName(sig_type)),
-        }
+        };
     }
 };
 pub fn Body(comptime signature: []const Type) type {
@@ -450,13 +467,14 @@ pub fn Body(comptime signature: []const Type) type {
 
 fn calcBodyLen(comptime signature: []const Type, body: *const Body(signature)) error{BodyTooBig}!u32 {
     var total_len: u32 = 0;
-    var body_align: u3 = 0;
-    inline for (signature, 0..) |sig_type, i| {
-        const name = std.fmt.comptimePrint("{d}", .{i});
-        const field_len = sig_type.getLen(body_align, &@field(body, name));
+    inline for (signature, @typeInfo(@TypeOf(body.*)).@"struct".fields) |sig_type, field| {
+        {
+            const pad_len = padLen(sig_type.alignment().int(comptime_int), @truncate(total_len));
+            total_len += pad_len;
+        }
+        const field_len = sig_type.getLenUnaligned(&@field(body, field.name));
         total_len, const overflow = @addWithOverflow(total_len, field_len);
         if (overflow == 1) return error.BodyTooBig;
-        body_align +%= @truncate(field_len);
     }
     return total_len;
 }
@@ -583,11 +601,36 @@ pub fn writeMethodCall(
     if (args.member) |arg| {
         try writeHeaderString(writer, &header_align, .member, arg);
     }
-
     {
         const pad_buf = [_]u8{0} ** 8;
         try writer.writeAll(pad_buf[0..pad8Len(header_align)]);
     }
+
+    var body_bytes_written: u32 = 0;
+    inline for (signature, @typeInfo(@TypeOf(body)).@"struct".fields) |sig_type, field| {
+        std.debug.assert(body_bytes_written < body_len);
+
+        {
+            const pad_len = padLen(sig_type.alignment().int(comptime_int), @truncate(body_bytes_written));
+            const pad_buf = [_]u8{0} ** sig_type.alignment().int(comptime_int);
+            try writer.writeAll(pad_buf[0..pad_len]);
+            body_bytes_written += pad_len;
+        }
+
+        switch (sig_type) {
+            .string => {
+                const string = @field(body, field.name);
+                try writer.writeInt(u32, string.len, native_endian);
+                body_bytes_written += 4;
+                try writer.writeAll(string.nativeSlice());
+                body_bytes_written += string.len;
+                try writer.writeByte(0);
+                body_bytes_written += 1;
+            },
+            else => |c| @compileError(std.fmt.comptimePrint("todo: support signature type '{c}'", .{c})),
+        }
+    }
+    std.debug.assert(body_bytes_written == body_len);
 }
 
 pub const MethodCall = struct {
