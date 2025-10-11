@@ -1,5 +1,6 @@
 const std = @import("std");
 const dbus = @import("dbus");
+const hexdump = @import("hexdump.zig").hexdump;
 
 pub fn main() !u8 {
     const session_addr_str = dbus.getSessionBusAddressString();
@@ -23,20 +24,27 @@ pub fn main() !u8 {
 
     std.log.info("authenticated", .{});
 
-    {
-        const args = comptime dbus.method_call_msg.Args{
+    var write_buf: [1000]u8 = undefined;
+    var writer_instance = dbus.Writer{
+        .fd = connection.fd,
+        .buffer = &write_buf,
+    };
+    const writer = &writer_instance;
+
+    try dbus.writeMethodCall(
+        writer,
+        //.signature = "su",
+        &[0]dbus.Type{},
+        .{
             .serial = 1,
             .path = dbus.strSlice(u32, "/org/freedesktop/DBus"),
             // TODO: do we need a destination?
             .destination = dbus.strSlice(u32, "org.freedesktop.DBus"),
             .interface = dbus.strSlice(u32, "org.freedesktop.DBus"),
             .member = dbus.strSlice(u32, "Hello"),
-            //.signature = "su",
-        };
-        var msg: [dbus.method_call_msg.getHeaderLen(args)]u8 = undefined;
-        dbus.method_call_msg.serialize(&msg, args);
-        try connection.writer().writeAll(&msg);
-    }
+        },
+        .{},
+    );
 
     var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     var read_al: std.ArrayListAligned(u8, 8) = .init(read_arena.allocator());
@@ -47,6 +55,8 @@ pub fn main() !u8 {
         const msg = blk_recv: {
             while (true) {
                 const msg = try readMsg(connection.reader(), &read_al);
+                std.log.debug("got {}-byte msg:", .{read_al.items.len});
+                hexdump(hexdumpLine, read_al.items, .{});
                 switch (msg.headers) {
                     .signal => {
                         std.log.info("ignoring signal {}", .{msg});
@@ -55,6 +65,10 @@ pub fn main() !u8 {
                     .method_return => |result| {
                         std.debug.assert(result.reply_serial == 1);
                         break :blk_recv msg;
+                    },
+                    .err => |err| {
+                        std.debug.assert(err.reply_serial == 1);
+                        fatal("Hello failed with error '{s}'", .{err.name});
                     },
                 }
             }
@@ -88,6 +102,10 @@ fn readMsg(reader: anytype, arraylist: *std.ArrayListAligned(u8, 8)) !dbus.Parse
         "parse dbus message failed with {s}",
         .{@errorName(e)},
     );
+}
+
+fn hexdumpLine(line: []const u8) void {
+    std.log.debug("{s}", .{line});
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {

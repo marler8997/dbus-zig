@@ -23,8 +23,18 @@ pub fn main() !u8 {
 
     std.log.info("authenticated", .{});
 
-    {
-        const args = comptime dbus.method_call_msg.Args{
+    var write_buf: [1000]u8 = undefined;
+    var writer_instance = dbus.Writer{
+        .fd = connection.fd,
+        .buffer = &write_buf,
+    };
+    const writer = &writer_instance;
+
+    try dbus.writeMethodCall(
+        writer,
+        //.signature = "su",
+        &[0]dbus.Type{},
+        .{
             .serial = 1,
             .path = dbus.strSlice(u32, "/org/freedesktop/DBus"),
             // TODO: do we need a destination?
@@ -32,11 +42,9 @@ pub fn main() !u8 {
             .interface = dbus.strSlice(u32, "org.freedesktop.DBus"),
             .member = dbus.strSlice(u32, "Hello"),
             //.signature = "su",
-        };
-        var msg: [dbus.method_call_msg.getHeaderLen(args)]u8 = undefined;
-        dbus.method_call_msg.serialize(&msg, args);
-        try connection.writer().writeAll(&msg);
-    }
+        },
+        .{},
+    );
 
     var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     var read_al: std.ArrayListAligned(u8, 8) = .init(read_arena.allocator());
@@ -55,6 +63,10 @@ pub fn main() !u8 {
                     .method_return => |result| {
                         std.debug.assert(result.reply_serial == 1);
                         break :blk_recv msg;
+                    },
+                    .err => |err| {
+                        std.debug.assert(err.reply_serial == 1);
+                        fatal("Hello failed with error '{s}'", .{err.name});
                     },
                 }
             }
@@ -106,6 +118,9 @@ pub fn main() !u8 {
                     s.unix_fds,
                 },
             ),
+            .err => |err| {
+                fatal("got error '{s}'", .{err.name});
+            },
         }
         read_al.clearRetainingCapacity();
     }

@@ -36,7 +36,8 @@ pub const MessageType = enum(u8) {
     signal = 4,
 };
 
-const endian_header_value = switch (builtin.cpu.arch.endian()) {
+const native_endian = builtin.cpu.arch.endian();
+const endian_header_value = switch (native_endian) {
     .big => 'B',
     .little => 'l',
 };
@@ -47,7 +48,7 @@ pub fn writeIntNative(comptime T: type, buf: [*]u8, value: T) void {
 
 pub fn readInt(comptime T: type, endian: std.builtin.Endian, comptime buf_align: u29, buf: [*]align(buf_align) const u8) T {
     const value = @as(*align(buf_align) const T, @ptrCast(buf)).*;
-    return if (builtin.cpu.arch.endian() == endian) value else @byteSwap(value);
+    return if (native_endian == endian) value else @byteSwap(value);
 }
 
 pub fn strSlice(comptime Len: type, comptime s: []const u8) Slice(Len, [*]const u8) {
@@ -209,6 +210,30 @@ fn alignAdd(in_align: u4, addend: usize) u4 {
     return toAlign(@as(usize, @intCast(in_align)) + addend);
 }
 
+// Returns the padding needed to align the given content len to 8-bytes.
+// Note that it returns 0 for values already 8-byte aligned.
+fn pad8Len(len: usize) u3 {
+    return @as(u3, @intCast((8 - (len & 7)) & 7));
+}
+test pad8Len {
+    try std.testing.expectEqual(0, pad8Len(0));
+    try std.testing.expectEqual(0, pad8Len(8));
+    try std.testing.expectEqual(0, pad8Len(16));
+    try std.testing.expectEqual(0, pad8Len(24));
+    try std.testing.expectEqual(0, pad8Len(32));
+
+    try std.testing.expectEqual(7, pad8Len(1)); // 1 -> 8
+    try std.testing.expectEqual(6, pad8Len(2)); // 2 -> 8
+    try std.testing.expectEqual(5, pad8Len(3)); // 3 -> 8
+    try std.testing.expectEqual(4, pad8Len(4)); // 4 -> 8
+    try std.testing.expectEqual(3, pad8Len(5)); // 5 -> 8
+    try std.testing.expectEqual(2, pad8Len(6)); // 6 -> 8
+    try std.testing.expectEqual(1, pad8Len(7)); // 7 -> 8
+
+    try std.testing.expectEqual(2, pad8Len(14));
+    try std.testing.expectEqual(3, pad8Len(29));
+}
+
 const header_field_string = struct {
     fn getLen(string_len: u32) u27 {
         return @as(u27, @intCast(4 + // 1 for kind, 3 for type sig
@@ -243,104 +268,366 @@ const pad = struct {
     }
 };
 
-const LenEncoder = struct {
-    len: u27 = 0,
-    pub fn set(self: *LenEncoder, comptime T: type, offset: u27, value: T) void {
+// NOTE: strings may not contain the codepoint 0
+//       strings are ALWAYS null-terminated
+//       they also must not contain OVERLONG sequences or exceed the value 0x10ffff
+pub const max_codepoint = 0x10ffff;
+
+pub const Type = enum {
+    u8, // 'y'
+    bool, // 'b'
+    i16, // 'n'
+    u16, // 'q'
+    i32, // 'i'
+    u32, // 'u'
+    i64, // 'x'
+    u64, // 't'
+    f64, // 'd'
+    unix_fd, // 'h'
+    string,
+    object_path, // a string that is also a "syntactically valid object path"
+    signature, // zero or more "single complete types"
+
+    pub fn Native(self: Type) type {
+        return switch (self) {
+            .string => Slice(u32, [*]const u8),
+            .object_path => Slice(u32, [*]const u8),
+            .signature => []const Type,
+            .u8 => u8,
+            .bool => bool,
+            .i16 => i16,
+            .u16 => u16,
+            .i32 => i32,
+            .u32 => u32,
+            .i64 => i64,
+            .u64 => u64,
+            .f64 => f64,
+            .unix_fd => std.posix.fd_t,
+        };
+    }
+    // pub fn sig(self: FixedType) u8 {
+    //     return switch (self) {
+    //         .u8 => 'y',
+    //         .bool => 'b',
+    //         .i16 => 'n',
+    //         .u16 => 'q',
+    //         .i32 => 'i',
+    //         .u32 => 'u',
+    //         .i64 => 'x',
+    //         .u64 => 't',
+    //         .f64 => 'd',
+    //         .unix_fd => 'h',
+    //     };
+    // }
+    fn getLen(sig_type: Type, value: *const sig_type.Zig()) u32 {
         _ = value;
-        switch (T) {
-            u8 => self.len = @max(self.len, offset + 1),
-            u32 => self.len = @max(self.len, offset + 4),
-            else => @compileError("LenEncoder.set does not support: " ++ @typeName(T)),
+        switch (sig_type) {
+            else => @compileError("todo: support type: " ++ @tagName(sig_type)),
         }
     }
-    pub fn setBytes(self: *LenEncoder, start: u27, end: u27, val: u8) void {
-        _ = start;
-        _ = val;
-        self.len = @max(self.len, end);
-    }
-    pub fn setHeaderFieldString(
-        self: *LenEncoder,
-        offset: u27,
-        kind: HeaderFieldStringKind,
-        str: Slice(u32, [*]const u8),
-    ) u27 {
-        _ = kind;
-        var len: u27 = pad.getLen(toAlign(offset), struct_align);
-        len += header_field_string.getLen(str.len);
-        self.len = @max(self.len, offset + len);
-        return len;
-    }
 };
+pub fn Body(comptime signature: []const Type) type {
+    var fields: [signature.len]std.builtin.Type.StructField = undefined;
+    inline for (signature, fields, 0..) |signature_type, *field, i| {
+        var name_buf: [20]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{d}", .{i});
+        const FieldType = signature_type.Native();
+        field.* = .{
+            .name = name,
+            .type = FieldType,
+            .default_value_ptr = null,
+            .is_comptime = false,
+            .alignment = @alignOf(FieldType),
+        };
+    }
+    return @Type(std.builtin.Type{
+        .@"struct" = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = true,
+        },
+    });
+}
 
-const MsgEncoder = struct {
-    msg: [*]u8,
-    pub fn set(self: *MsgEncoder, comptime T: type, offset: u27, value: T) void {
-        switch (T) {
-            u8 => self.msg[offset] = value,
-            u32 => writeIntNative(u32, self.msg + offset, value),
-            else => @compileError("MsgEncoder.set does not support: " ++ @typeName(T)),
+fn calcBodyLen(comptime signature: []const Type, body: *const Body(signature)) error{BodyTooBig}!u32 {
+    var total_len: u32 = 0;
+    inline for (signature, 0..) |sig_type, i| {
+        var name_buf: [20]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{d}", .{i});
+        const field_len = sig_type.getLen(&@field(body, name));
+        total_len, const overflow = @addWithOverflow(total_len, field_len);
+        if (overflow) return error.BodyTooBig;
+    }
+    return total_len;
+}
+
+const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+
+const Iovlen = if (!zig_atleast_15 and builtin.cpu.arch == .x86_64)
+    u32
+else
+    @FieldType(std.posix.msghdr_const, "iovlen");
+
+pub const Writer = if (zig_atleast_15) std.Io.Writer else struct {
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    end: usize = 0,
+    err: ?anyerror = null,
+
+    const max_buffers_len = 8;
+
+    fn addBuf(v: []std.posix.iovec_const, i: *Iovlen, bytes: []const u8) void {
+        // OS checks ptr addr before length so zero length vectors must be omitted.
+        if (bytes.len == 0) return;
+        if (v.len - i.* == 0) return;
+        v[i.*] = .{ .base = bytes.ptr, .len = bytes.len };
+        i.* += 1;
+    }
+    fn flush(w: *Writer) WriteError!void {
+        if (w.end != 0) _ = try w.drain(&.{""}, 1);
+    }
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) WriteError!usize {
+        const buffered2 = w.buffered();
+        var iovecs: [max_buffers_len]std.posix.iovec_const = undefined;
+        var msg: std.posix.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iovecs,
+            .iovlen = 0,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        {
+            var iovlen: Iovlen = @bitCast(msg.iovlen);
+            addBuf(&iovecs, &iovlen, buffered2);
+            msg.iovlen = @bitCast(iovlen);
+        }
+        for (data[0 .. data.len - 1]) |bytes| {
+            var iovlen: Iovlen = @bitCast(msg.iovlen);
+            addBuf(&iovecs, &iovlen, bytes);
+            msg.iovlen = @bitCast(iovlen);
+        }
+        const pattern = data[data.len - 1];
+        if (iovecs.len - @as(Iovlen, @bitCast(msg.iovlen)) != 0) switch (splat) {
+            0 => {},
+            1 => {
+                var iovlen: Iovlen = @bitCast(msg.iovlen);
+                addBuf(&iovecs, &iovlen, pattern);
+                msg.iovlen = @bitCast(iovlen);
+            },
+            else => switch (pattern.len) {
+                0 => {},
+                1 => {
+                    const splat_buffer_candidate = w.buffer[w.end..];
+                    var backup_buffer: [64]u8 = undefined;
+                    const splat_buffer = if (splat_buffer_candidate.len >= backup_buffer.len)
+                        splat_buffer_candidate
+                    else
+                        &backup_buffer;
+                    const memset_len = @min(splat_buffer.len, splat);
+                    const buf = splat_buffer[0..memset_len];
+                    @memset(buf, pattern[0]);
+                    {
+                        var iovlen: Iovlen = @bitCast(msg.iovlen);
+                        addBuf(&iovecs, &iovlen, buf);
+                        msg.iovlen = @bitCast(iovlen);
+                    }
+                    var remaining_splat = splat - buf.len;
+                    while (remaining_splat > splat_buffer.len and iovecs.len - @as(Iovlen, @bitCast(msg.iovlen)) != 0) {
+                        std.debug.assert(buf.len == splat_buffer.len);
+                        var iovlen: Iovlen = @bitCast(msg.iovlen);
+                        addBuf(&iovecs, &iovlen, splat_buffer);
+                        msg.iovlen = @bitCast(iovlen);
+                        remaining_splat -= splat_buffer.len;
+                    }
+
+                    var iovlen: Iovlen = @bitCast(msg.iovlen);
+                    addBuf(&iovecs, &iovlen, splat_buffer[0..remaining_splat]);
+                    msg.iovlen = @bitCast(iovlen);
+                },
+                else => for (0..@min(splat, iovecs.len - @as(Iovlen, @bitCast(msg.iovlen)))) |_| {
+                    var iovlen: Iovlen = @bitCast(msg.iovlen);
+                    addBuf(&iovecs, &iovlen, pattern);
+                    msg.iovlen = @bitCast(iovlen);
+                },
+            },
+        };
+        const flags = std.posix.MSG.NOSIGNAL;
+        return w.consume(std.posix.sendmsg(w.fd, &msg, flags) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        });
+    }
+    fn consume(w: *Writer, n: usize) usize {
+        if (n < w.end) {
+            const remaining = w.buffer[n..w.end];
+            std.mem.copyForwards(u8, w.buffer[0..remaining.len], remaining);
+            w.end = remaining.len;
+            return 0;
+        }
+        defer w.end = 0;
+        return n - w.end;
+    }
+
+    pub fn buffered(w: *const Writer) []u8 {
+        return w.buffer[0..w.end];
+    }
+
+    fn countSplat(data: []const []const u8, splat: usize) usize {
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |buf| total += buf.len;
+        total += data[data.len - 1].len * splat;
+        return total;
+    }
+
+    pub fn writeSplat(w: *Writer, data: []const []const u8, splat: usize) WriteError!usize {
+        std.debug.assert(data.len > 0);
+        const buffer = w.buffer;
+        const count = countSplat(data, splat);
+        if (w.end + count > buffer.len) return w.drain(data, splat);
+        for (data[0 .. data.len - 1]) |bytes| {
+            @memcpy(buffer[w.end..][0..bytes.len], bytes);
+            w.end += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        switch (pattern.len) {
+            0 => {},
+            1 => {
+                @memset(buffer[w.end..][0..splat], pattern[0]);
+                w.end += splat;
+            },
+            else => for (0..splat) |_| {
+                @memcpy(buffer[w.end..][0..pattern.len], pattern);
+                w.end += pattern.len;
+            },
+        }
+        return count;
+    }
+
+    pub fn writeVec(w: *Writer, data: []const []const u8) WriteError!usize {
+        return writeSplat(w, data, 1);
+    }
+
+    pub fn write(w: *Writer, bytes: []const u8) WriteError!usize {
+        if (w.end + bytes.len <= w.buffer.len) {
+            @branchHint(.likely);
+            @memcpy(w.buffer[w.end..][0..bytes.len], bytes);
+            w.end += bytes.len;
+            return bytes.len;
+        }
+        return w.drain(&.{bytes}, 1);
+    }
+    pub fn writeAll(w: *Writer, bytes: []const u8) WriteError!void {
+        var index: usize = 0;
+        while (index < bytes.len) index += try w.write(bytes[index..]);
+    }
+    pub inline fn writeInt(w: *Writer, comptime T: type, value: T, endian: std.builtin.Endian) WriteError!void {
+        var bytes: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
+        std.mem.writeInt(std.math.ByteAlignedInt(@TypeOf(value)), &bytes, value, endian);
+        return w.writeAll(&bytes);
+    }
+    pub fn writeVecAll(w: *Writer, data: [][]const u8) WriteError!void {
+        var index: usize = 0;
+        var truncate: usize = 0;
+        while (index < data.len) {
+            {
+                const untruncated = data[index];
+                data[index] = untruncated[truncate..];
+                defer data[index] = untruncated;
+                truncate += try w.writeVec(data[index..]);
+            }
+            while (index < data.len and truncate >= data[index].len) {
+                truncate -= data[index].len;
+                index += 1;
+            }
         }
     }
-    pub fn setBytes(self: *MsgEncoder, start: u27, end: u27, val: u8) void {
-        @memset(self.msg[start..end], val);
-    }
-    pub fn setHeaderFieldString(
-        self: *MsgEncoder,
-        offset: u27,
-        kind: HeaderFieldStringKind,
-        str: Slice(u32, [*]const u8),
-    ) u27 {
-        const pad_len = pad.serialize(self.msg + offset, toAlign(offset), struct_align);
-        const str_offset = offset + pad_len;
-        return pad_len + header_field_string.serialize(self.msg + str_offset, kind, str);
-    }
 };
+const WriteError = if (zig_atleast_15) std.Io.Writer.Error else anyerror;
 
-pub const method_call_msg = struct {
-    pub const Args = struct {
-        serial: u32,
-        path: Slice(u32, [*]const u8),
-        destination: ?Slice(u32, [*]const u8) = null,
-        interface: ?Slice(u32, [*]const u8) = null,
-        member: ?Slice(u32, [*]const u8) = null,
-        signature: ?Slice(u32, [*]const u8) = null,
+fn calcHeaderStringLen(header_align: *u3, str: Slice(u32, [*]const u8)) u32 {
+    const pad_len = pad8Len(header_align.*);
+    const string_len: u32 = @as(u32, pad_len) + 8 + str.len + 1;
+    header_align.* +%= @truncate(string_len);
+    return string_len;
+}
+fn writeHeaderString(
+    writer: *Writer,
+    header_align: *u3,
+    kind: HeaderFieldStringKind,
+    str: Slice(u32, [*]const u8),
+) WriteError!void {
+    const pad_len = pad8Len(header_align.*);
+    var buf: [8]u8 = undefined;
+    buf[0] = @intFromEnum(kind);
+    buf[1] = 1; // type-sig length
+    buf[2] = kind.typeSig();
+    buf[3] = 0; // type-sig null terminator
+    std.mem.writeInt(u32, buf[4..8], str.len, native_endian);
+    const pad_buf = [1]u8{0} ** 8;
+    var data = [_][]const u8{
+        pad_buf[0..pad_len],
+        &buf,
+        str.nativeSlice(),
+        &[_]u8{0},
     };
+    try writer.writeVecAll(&data);
+    const string_len: u32 = @as(u32, pad_len) + 8 + str.len + 1;
+    header_align.* +%= @truncate(string_len);
+}
 
-    pub fn encode(comptime Encoder: type, encoder: Encoder, args: Args) void {
-        encoder.set(u8, 0, endian_header_value);
-        encoder.set(u8, 1, @intFromEnum(MessageType.method_call));
-        encoder.set(u8, 2, 0); // flags
-        encoder.set(u8, 3, 1); // protocol version
-        const body_length = 0;
-        encoder.set(u32, 4, body_length);
-        encoder.set(u32, 8, args.serial);
-        // offset 12 is the array data length, will serialize below
-        // note: offset(16) is already 8-byte aligned here
-        var field_array_len = encoder.setHeaderFieldString(16, .path, args.path);
-        if (args.destination) |arg| {
-            field_array_len += encoder.setHeaderFieldString(16 + field_array_len, .destination, arg);
-        }
-        if (args.interface) |arg| {
-            field_array_len += encoder.setHeaderFieldString(16 + field_array_len, .interface, arg);
-        }
-        if (args.member) |arg| {
-            field_array_len += encoder.setHeaderFieldString(16 + field_array_len, .member, arg);
-        }
-
-        // TODO: is the array length the padded or non-padded length?
-        encoder.set(u32, 12, @as(u32, @intCast(field_array_len)));
-
-        const end = @as(u27, @intCast(std.mem.alignForward(u32, 16 + field_array_len, 8)));
-        encoder.setBytes(16 + field_array_len, end, 0);
+pub fn writeMethodCall(
+    writer: *Writer,
+    comptime signature: []const Type,
+    args: MethodCall,
+    body: Body(signature),
+) (error{BodyTooBig} || WriteError)!void {
+    const body_len = try calcBodyLen(signature, &body);
+    const array_data_len = args.calcHeaderArrayLen();
+    try writer.writeAll(&[_]u8{
+        endian_header_value,
+        @intFromEnum(MessageType.method_call), // 1
+        0, // flags,
+        1, // protocol version
+    });
+    try writer.writeInt(u32, body_len, native_endian);
+    try writer.writeInt(u32, args.serial, native_endian);
+    try writer.writeInt(u32, array_data_len, native_endian);
+    var header_align: u3 = 0;
+    try writeHeaderString(writer, &header_align, .path, args.path);
+    if (args.destination) |arg| {
+        try writeHeaderString(writer, &header_align, .destination, arg);
     }
-    pub fn getHeaderLen(args: Args) u27 {
-        var encoder = LenEncoder{};
-        encode(*LenEncoder, &encoder, args);
-        return encoder.len;
+    if (args.interface) |arg| {
+        try writeHeaderString(writer, &header_align, .interface, arg);
     }
-    pub fn serialize(msg: [*]u8, args: Args) void {
-        var encoder = MsgEncoder{ .msg = msg };
-        encode(*MsgEncoder, &encoder, args);
+    if (args.member) |arg| {
+        try writeHeaderString(writer, &header_align, .member, arg);
+    }
+
+    {
+        const pad_buf = [_]u8{0} ** 8;
+        try writer.writeAll(pad_buf[0..pad8Len(header_align)]);
+    }
+
+    try writer.flush();
+}
+
+pub const MethodCall = struct {
+    serial: u32,
+    path: Slice(u32, [*]const u8),
+    destination: ?Slice(u32, [*]const u8) = null,
+    interface: ?Slice(u32, [*]const u8) = null,
+    member: ?Slice(u32, [*]const u8) = null,
+    pub fn calcHeaderArrayLen(self: *const MethodCall) u32 {
+        var header_align: u3 = 0;
+        const path_len = calcHeaderStringLen(&header_align, self.path);
+        const dest_len = if (self.destination) |s| calcHeaderStringLen(&header_align, s) else 0;
+        const iface_len = if (self.interface) |s| calcHeaderStringLen(&header_align, s) else 0;
+        const member_len = if (self.member) |s| calcHeaderStringLen(&header_align, s) else 0;
+        return path_len + dest_len + iface_len + member_len;
     }
 };
 
@@ -431,6 +718,17 @@ pub const ParsedMsg = struct {
             interface: []const u8,
             member: []const u8,
             // TODO: are all these really option for signal?
+            destination: ?[]const u8,
+            sender: ?[]const u8,
+            signature: ?[]const u8,
+            unix_fds: ?u32,
+        },
+        err: struct {
+            reply_serial: u32,
+            name: []const u8,
+            path: ?[]const u8,
+            interface: ?[]const u8,
+            member: ?[]const u8,
             destination: ?[]const u8,
             sender: ?[]const u8,
             signature: ?[]const u8,
@@ -634,6 +932,7 @@ const HeaderParser = struct {
         MissingInterfaceHeader,
         MissingMemberHeader,
         MissingSerialHeader,
+        MissingErrorName,
         UnexpectedPathHeader,
         UnexpectedInterfaceHeader,
         UnexpectedMemberHeader,
@@ -645,7 +944,11 @@ const HeaderParser = struct {
         msg_type: MessageType,
     ) ToParsedHeadersError!ParsedMsg.Headers {
         switch (msg_type) {
-            .method_call => @panic("todo"),
+            .method_call => {
+                const path = self.path orelse return error.MissingPathHeader;
+                _ = path;
+                @panic("todo");
+            },
             .method_return => {
                 if (self.path) |_| return error.UnexpectedPathHeader;
                 if (self.interface) |_| return error.UnexpectedInterfaceHeader;
@@ -661,7 +964,19 @@ const HeaderParser = struct {
                     },
                 };
             },
-            .error_reply => @panic("todo"),
+            .error_reply => {
+                return ParsedMsg.Headers{ .err = .{
+                    .reply_serial = self.reply_serial orelse return error.MissingSerialHeader,
+                    .name = self.error_name orelse return error.MissingErrorName,
+                    .path = self.path,
+                    .interface = self.interface,
+                    .member = self.member,
+                    .destination = self.destination,
+                    .sender = self.sender,
+                    .signature = self.signature,
+                    .unix_fds = self.unix_fds,
+                } };
+            },
             .signal => {
                 if (self.error_name) |_| return error.UnexpectedErrorHeader;
                 if (self.reply_serial) |_| return error.UnexpectedSerialHeader;
