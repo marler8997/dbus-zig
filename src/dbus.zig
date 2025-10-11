@@ -210,28 +210,50 @@ fn alignAdd(in_align: u4, addend: usize) u4 {
     return toAlign(@as(usize, @intCast(in_align)) + addend);
 }
 
+fn Pad(comptime align_to: comptime_int) type {
+    return switch (align_to) {
+        4 => u2,
+        8 => u3,
+        else => @compileError("unsupported alignment"),
+    };
+}
+/// Returns the padding needed to align the given len.
+fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
+    return (0 -% len) & (align_to - 1);
+}
+
+// Returns the padding needed to align the given content len to 4-bytes.
+// Note that it returns 0 for values already 4-byte aligned.
+fn pad4Len(len: u2) u2 {
+    return padLen(4, len);
+}
+
 // Returns the padding needed to align the given content len to 8-bytes.
 // Note that it returns 0 for values already 8-byte aligned.
-fn pad8Len(len: usize) u3 {
-    return @as(u3, @intCast((8 - (len & 7)) & 7));
+fn pad8Len(len: u3) u3 {
+    return padLen(8, len);
 }
 test pad8Len {
     try std.testing.expectEqual(0, pad8Len(0));
-    try std.testing.expectEqual(0, pad8Len(8));
-    try std.testing.expectEqual(0, pad8Len(16));
-    try std.testing.expectEqual(0, pad8Len(24));
-    try std.testing.expectEqual(0, pad8Len(32));
-
+    try std.testing.expectEqual(0, pad8Len(@truncate(8)));
+    try std.testing.expectEqual(0, pad8Len(@truncate(16)));
     try std.testing.expectEqual(7, pad8Len(1)); // 1 -> 8
     try std.testing.expectEqual(6, pad8Len(2)); // 2 -> 8
-    try std.testing.expectEqual(5, pad8Len(3)); // 3 -> 8
-    try std.testing.expectEqual(4, pad8Len(4)); // 4 -> 8
-    try std.testing.expectEqual(3, pad8Len(5)); // 5 -> 8
     try std.testing.expectEqual(2, pad8Len(6)); // 6 -> 8
     try std.testing.expectEqual(1, pad8Len(7)); // 7 -> 8
+    try std.testing.expectEqual(2, pad8Len(@truncate(14)));
+    try std.testing.expectEqual(3, pad8Len(@truncate(29)));
 
-    try std.testing.expectEqual(2, pad8Len(14));
-    try std.testing.expectEqual(3, pad8Len(29));
+    inline for (&.{ 4, 8 }) |align_to| {
+        for (0..10) |multiplier| {
+            std.debug.print("test align={} value={}\n", .{ align_to, multiplier * align_to });
+            try std.testing.expectEqual(0, padLen(align_to, @truncate(multiplier * align_to)));
+        }
+        for (1..align_to + 1) |i| {
+            std.debug.print("test align={} value={}\n", .{ align_to, i });
+            try std.testing.expectEqual(align_to - i, padLen(align_to, @truncate(i)));
+        }
+    }
 }
 
 const header_field_string = struct {
@@ -319,18 +341,20 @@ pub const Type = enum {
     //         .unix_fd => 'h',
     //     };
     // }
-    fn getLen(sig_type: Type, value: *const sig_type.Zig()) u32 {
-        _ = value;
+    fn getLen(comptime sig_type: Type, body_align: u3, value: *const sig_type.Native()) u32 {
         switch (sig_type) {
+            .string, .object_path => {
+                const pad_len: u32 = pad4Len(@truncate(body_align));
+                return pad_len + 4 + value.len + 1;
+            },
             else => @compileError("todo: support type: " ++ @tagName(sig_type)),
         }
     }
 };
 pub fn Body(comptime signature: []const Type) type {
     var fields: [signature.len]std.builtin.Type.StructField = undefined;
-    inline for (signature, fields, 0..) |signature_type, *field, i| {
-        var name_buf: [20]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "{d}", .{i});
+    inline for (signature, &fields, 0..) |signature_type, *field, i| {
+        const name = std.fmt.comptimePrint("{d}", .{i});
         const FieldType = signature_type.Native();
         field.* = .{
             .name = name,
@@ -352,12 +376,13 @@ pub fn Body(comptime signature: []const Type) type {
 
 fn calcBodyLen(comptime signature: []const Type, body: *const Body(signature)) error{BodyTooBig}!u32 {
     var total_len: u32 = 0;
+    var body_align: u3 = 0;
     inline for (signature, 0..) |sig_type, i| {
-        var name_buf: [20]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "{d}", .{i});
-        const field_len = sig_type.getLen(&@field(body, name));
+        const name = std.fmt.comptimePrint("{d}", .{i});
+        const field_len = sig_type.getLen(body_align, &@field(body, name));
         total_len, const overflow = @addWithOverflow(total_len, field_len);
-        if (overflow) return error.BodyTooBig;
+        if (overflow == 1) return error.BodyTooBig;
+        body_align +%= @truncate(field_len);
     }
     return total_len;
 }
