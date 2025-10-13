@@ -394,183 +394,13 @@ const Iovlen = if (!zig_atleast_15 and builtin.cpu.arch == .x86_64)
 else
     @FieldType(std.posix.msghdr_const, "iovlen");
 
-pub const Writer = if (zig_atleast_15) std.Io.Writer else struct {
-    fd: std.posix.fd_t,
-    buffer: []u8,
-    end: usize = 0,
-    err: ?anyerror = null,
-
-    const max_buffers_len = 8;
-
-    fn addBuf(v: []std.posix.iovec_const, i: *Iovlen, bytes: []const u8) void {
-        // OS checks ptr addr before length so zero length vectors must be omitted.
-        if (bytes.len == 0) return;
-        if (v.len - i.* == 0) return;
-        v[i.*] = .{ .base = bytes.ptr, .len = bytes.len };
-        i.* += 1;
-    }
-    fn flush(w: *Writer) WriteError!void {
-        if (w.end != 0) _ = try w.drain(&.{""}, 1);
-    }
-    fn drain(w: *Writer, data: []const []const u8, splat: usize) WriteError!usize {
-        const buffered2 = w.buffered();
-        var iovecs: [max_buffers_len]std.posix.iovec_const = undefined;
-        var msg: std.posix.msghdr_const = .{
-            .name = null,
-            .namelen = 0,
-            .iov = &iovecs,
-            .iovlen = 0,
-            .control = null,
-            .controllen = 0,
-            .flags = 0,
-        };
-        {
-            var iovlen: Iovlen = @bitCast(msg.iovlen);
-            addBuf(&iovecs, &iovlen, buffered2);
-            msg.iovlen = @bitCast(iovlen);
-        }
-        for (data[0 .. data.len - 1]) |bytes| {
-            var iovlen: Iovlen = @bitCast(msg.iovlen);
-            addBuf(&iovecs, &iovlen, bytes);
-            msg.iovlen = @bitCast(iovlen);
-        }
-        const pattern = data[data.len - 1];
-        if (iovecs.len - @as(Iovlen, @bitCast(msg.iovlen)) != 0) switch (splat) {
-            0 => {},
-            1 => {
-                var iovlen: Iovlen = @bitCast(msg.iovlen);
-                addBuf(&iovecs, &iovlen, pattern);
-                msg.iovlen = @bitCast(iovlen);
-            },
-            else => switch (pattern.len) {
-                0 => {},
-                1 => {
-                    const splat_buffer_candidate = w.buffer[w.end..];
-                    var backup_buffer: [64]u8 = undefined;
-                    const splat_buffer = if (splat_buffer_candidate.len >= backup_buffer.len)
-                        splat_buffer_candidate
-                    else
-                        &backup_buffer;
-                    const memset_len = @min(splat_buffer.len, splat);
-                    const buf = splat_buffer[0..memset_len];
-                    @memset(buf, pattern[0]);
-                    {
-                        var iovlen: Iovlen = @bitCast(msg.iovlen);
-                        addBuf(&iovecs, &iovlen, buf);
-                        msg.iovlen = @bitCast(iovlen);
-                    }
-                    var remaining_splat = splat - buf.len;
-                    while (remaining_splat > splat_buffer.len and iovecs.len - @as(Iovlen, @bitCast(msg.iovlen)) != 0) {
-                        std.debug.assert(buf.len == splat_buffer.len);
-                        var iovlen: Iovlen = @bitCast(msg.iovlen);
-                        addBuf(&iovecs, &iovlen, splat_buffer);
-                        msg.iovlen = @bitCast(iovlen);
-                        remaining_splat -= splat_buffer.len;
-                    }
-
-                    var iovlen: Iovlen = @bitCast(msg.iovlen);
-                    addBuf(&iovecs, &iovlen, splat_buffer[0..remaining_splat]);
-                    msg.iovlen = @bitCast(iovlen);
-                },
-                else => for (0..@min(splat, iovecs.len - @as(Iovlen, @bitCast(msg.iovlen)))) |_| {
-                    var iovlen: Iovlen = @bitCast(msg.iovlen);
-                    addBuf(&iovecs, &iovlen, pattern);
-                    msg.iovlen = @bitCast(iovlen);
-                },
-            },
-        };
-        const flags = std.posix.MSG.NOSIGNAL;
-        return w.consume(std.posix.sendmsg(w.fd, &msg, flags) catch |err| {
-            w.err = err;
-            return error.WriteFailed;
-        });
-    }
-    fn consume(w: *Writer, n: usize) usize {
-        if (n < w.end) {
-            const remaining = w.buffer[n..w.end];
-            std.mem.copyForwards(u8, w.buffer[0..remaining.len], remaining);
-            w.end = remaining.len;
-            return 0;
-        }
-        defer w.end = 0;
-        return n - w.end;
-    }
-
-    pub fn buffered(w: *const Writer) []u8 {
-        return w.buffer[0..w.end];
-    }
-
-    fn countSplat(data: []const []const u8, splat: usize) usize {
-        var total: usize = 0;
-        for (data[0 .. data.len - 1]) |buf| total += buf.len;
-        total += data[data.len - 1].len * splat;
-        return total;
-    }
-
-    pub fn writeSplat(w: *Writer, data: []const []const u8, splat: usize) WriteError!usize {
-        std.debug.assert(data.len > 0);
-        const buffer = w.buffer;
-        const count = countSplat(data, splat);
-        if (w.end + count > buffer.len) return w.drain(data, splat);
-        for (data[0 .. data.len - 1]) |bytes| {
-            @memcpy(buffer[w.end..][0..bytes.len], bytes);
-            w.end += bytes.len;
-        }
-        const pattern = data[data.len - 1];
-        switch (pattern.len) {
-            0 => {},
-            1 => {
-                @memset(buffer[w.end..][0..splat], pattern[0]);
-                w.end += splat;
-            },
-            else => for (0..splat) |_| {
-                @memcpy(buffer[w.end..][0..pattern.len], pattern);
-                w.end += pattern.len;
-            },
-        }
-        return count;
-    }
-
-    pub fn writeVec(w: *Writer, data: []const []const u8) WriteError!usize {
-        return writeSplat(w, data, 1);
-    }
-
-    pub fn write(w: *Writer, bytes: []const u8) WriteError!usize {
-        if (w.end + bytes.len <= w.buffer.len) {
-            @branchHint(.likely);
-            @memcpy(w.buffer[w.end..][0..bytes.len], bytes);
-            w.end += bytes.len;
-            return bytes.len;
-        }
-        return w.drain(&.{bytes}, 1);
-    }
-    pub fn writeAll(w: *Writer, bytes: []const u8) WriteError!void {
-        var index: usize = 0;
-        while (index < bytes.len) index += try w.write(bytes[index..]);
-    }
-    pub inline fn writeInt(w: *Writer, comptime T: type, value: T, endian: std.builtin.Endian) WriteError!void {
-        var bytes: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
-        std.mem.writeInt(std.math.ByteAlignedInt(@TypeOf(value)), &bytes, value, endian);
-        return w.writeAll(&bytes);
-    }
-    pub fn writeVecAll(w: *Writer, data: [][]const u8) WriteError!void {
-        var index: usize = 0;
-        var truncate: usize = 0;
-        while (index < data.len) {
-            {
-                const untruncated = data[index];
-                data[index] = untruncated[truncate..];
-                defer data[index] = untruncated;
-                truncate += try w.writeVec(data[index..]);
-            }
-            while (index < data.len and truncate >= data[index].len) {
-                truncate -= data[index].len;
-                index += 1;
-            }
-        }
-    }
-};
-const WriteError = if (zig_atleast_15) std.Io.Writer.Error else anyerror;
+const socketwriter = @import("socketwriter.zig");
+pub const SocketWriter = socketwriter.SocketWriter;
+pub fn socketWriter(sock: std.posix.socket_t, buffer: []u8) SocketWriter {
+    if (zig_atleast_15) return (std.net.Stream{ .handle = sock }).writer(buffer);
+    return .init(.{ .handle = sock }, buffer);
+}
+pub const Writer = @import("writer.zig").Writer;
 
 fn calcHeaderStringLen(header_align: *u3, str: Slice(u32, [*]const u8)) u32 {
     const pad_len = pad8Len(header_align.*);
@@ -583,7 +413,7 @@ fn writeHeaderString(
     header_align: *u3,
     kind: HeaderFieldStringKind,
     str: Slice(u32, [*]const u8),
-) WriteError!void {
+) Writer.Error!void {
     const pad_len = pad8Len(header_align.*);
     var buf: [8]u8 = undefined;
     buf[0] = @intFromEnum(kind);
@@ -608,7 +438,7 @@ pub fn writeMethodCall(
     comptime signature: []const Type,
     args: MethodCall,
     body: Body(signature),
-) (error{BodyTooBig} || WriteError)!void {
+) (error{BodyTooBig} || Writer.Error)!void {
     const body_len = try calcBodyLen(signature, &body);
     const array_data_len = args.calcHeaderArrayLen();
     try writer.writeAll(&[_]u8{

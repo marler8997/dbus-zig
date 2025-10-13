@@ -25,11 +25,8 @@ pub fn main() !u8 {
     std.log.info("authenticated", .{});
 
     var write_buf: [1000]u8 = undefined;
-    var writer_instance = dbus.Writer{
-        .fd = connection.fd,
-        .buffer = &write_buf,
-    };
-    const writer = &writer_instance;
+    var socket_writer = dbus.socketWriter(connection.fd, &write_buf);
+    const writer = &socket_writer.interface;
 
     try dbus.writeMethodCall(
         writer,
