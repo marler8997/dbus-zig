@@ -14,91 +14,75 @@ pub fn main() !u8 {
         return 0xff;
     };
 
-    var connection = dbus.Connection.connect(addr) catch |err| {
+    const stream = dbus.connect(addr) catch |err| {
         std.log.info("failed to connect to '{s}': {s}", .{ session_addr_str.str, @errorName(err) });
         return 0xff;
     };
-    // defer connection.deinit();
+    // defer stream.deinit();
     std.log.info("connected to session bus '{s}', authenticating...", .{session_addr_str.str});
-    try connection.authenticate();
+    var write_buf: [1000]u8 = undefined;
+    var read_buf: [1000]u8 = undefined;
+    var socket_writer = dbus.socketWriter(stream, &write_buf);
+    var socket_reader = dbus.socketReader(stream, &read_buf);
+    const writer = &socket_writer.interface;
+    const reader = socket_reader.interface();
 
+    try dbus.flushAuth(writer);
+    try dbus.readAuth(reader);
     std.log.info("authenticated", .{});
 
-    var write_buf: [1000]u8 = undefined;
-    var socket_writer = dbus.socketWriter(connection.fd, &write_buf);
-    const writer = &socket_writer.interface;
-
+    try writer.writeAll("BEGIN\r\n");
     try dbus.writeMethodCall(
         writer,
-        //.signature = "su",
         &[0]dbus.Type{},
         .{
             .serial = 1,
-            .path = dbus.strSlice(u32, "/org/freedesktop/DBus"),
+            .path = .initStatic("/org/freedesktop/DBus"),
             // TODO: do we need a destination?
-            .destination = dbus.strSlice(u32, "org.freedesktop.DBus"),
-            .interface = dbus.strSlice(u32, "org.freedesktop.DBus"),
-            .member = dbus.strSlice(u32, "Hello"),
+            .destination = .initStatic("org.freedesktop.DBus"),
+            .interface = .initStatic("org.freedesktop.DBus"),
+            .member = .initStatic("Hello"),
         },
         .{},
     );
-
-    var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    var read_al: std.ArrayListAligned(u8, 8) = .init(read_arena.allocator());
+    try writer.flush();
 
     var name_buf: [dbus.max_name:0]u8 = undefined;
 
-    const name = blk_name: {
-        const msg = blk_recv: {
-            while (true) {
-                const msg = try readMsg(connection.reader(), &read_al);
-                std.log.debug("got {}-byte msg:", .{read_al.items.len});
-                hexdump(hexdumpLine, read_al.items, .{});
-                switch (msg.headers) {
-                    .signal => {
-                        std.log.info("ignoring signal {}", .{msg});
-                        read_al.clearRetainingCapacity();
-                    },
-                    .method_return => |result| {
-                        std.debug.assert(result.reply_serial == 1);
-                        break :blk_recv msg;
-                    },
-                    .err => |err| {
-                        std.debug.assert(err.reply_serial == 1);
-                        fatal("Hello failed with error '{s}'", .{err.name});
-                    },
-                }
+    const name = blk: {
+        while (true) {
+            const fixed = try dbus.readFixed(reader);
+            switch (fixed.type) {
+                .method_call => return error.UnexpectedDbusMethodCall,
+                .method_return => {
+                    const headers = try fixed.readMethodReturnHeaders(reader, &.{});
+                    if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+                    const signature: ?[]const u8 = if (headers.signature) |*s| s.sliceConst() else null;
+                    if (!std.mem.eql(u8, "s", if (signature) |s| s else "")) std.debug.panic("unexpected signature '{?s}'", .{signature});
+                    const string_len = try reader.takeInt(u32, fixed.endian);
+                    if (string_len > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string_len});
+                    const name_slice = try reader.take(string_len);
+                    @memcpy(name_buf[0..string_len], name_slice);
+                    const nullterm = try reader.takeByte();
+                    if (nullterm != 0) {
+                        std.log.err("Hello reply name missing null-terminator", .{});
+                        return error.DbusProtocol;
+                    }
+                    break :blk name_buf[0..string_len];
+                },
+                .error_reply => {
+                    @panic("todo");
+                },
+                .signal => {
+                    std.log.info("ignoring signal", .{});
+                    try fixed.discard(reader);
+                },
             }
-        };
-
-        defer read_al.clearRetainingCapacity();
-        const name = dbus.parseString(msg.endian, read_al.items, msg.header_end) orelse fatal(
-            "unexpected Hello response, invalid name string",
-            .{},
-        );
-        if (name.end != read_al.items.len) fatal(
-            "Hello response had {} bytes of extra data",
-            .{read_al.items.len - name.end},
-        );
-        if (name.string.len > dbus.max_name) fatal(
-            "our assigned name '{s}' is too big({} > {})",
-            .{ name.string, name.string.len, dbus.max_name },
-        );
-        @memcpy(name_buf[0..name.string.len], name.string);
-        name_buf[name.string.len] = 0;
-        break :blk_name name_buf[0..name.string.len :0];
+        }
     };
+
     std.log.info("our name is '{s}'", .{name});
     return 0;
-}
-
-fn readMsg(reader: anytype, arraylist: *std.ArrayListAligned(u8, 8)) !dbus.ParsedMsg {
-    std.debug.assert(arraylist.items.len == 0);
-    try dbus.readOneMsgArrayList(reader, arraylist);
-    return dbus.parseMsg(arraylist.items) catch |e| fatal(
-        "parse dbus message failed with {s}",
-        .{@errorName(e)},
-    );
 }
 
 fn hexdumpLine(line: []const u8) void {

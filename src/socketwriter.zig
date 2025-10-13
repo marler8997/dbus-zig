@@ -215,4 +215,4 @@ pub const SocketWriter = if (zig_atleast_15) std.net.Stream.Writer else struct {
 const builtin = @import("builtin");
 const std = @import("std");
 const windows = std.os.windows;
-const Writer = @import("writer.zig").Writer;
+const Writer = if (zig_atleast_15) std.Io.Writer else @import("0.14/Writer.zig");

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+
 pub const HexdumpOptions = struct {
     width: usize = 16,
 };
@@ -30,9 +32,11 @@ pub fn hexdump(
 
 fn formatLine(out_buf: []u8, line: []const u8, options: HexdumpOptions) usize {
     std.debug.assert(line.len <= options.width);
-    _ = (std.fmt.bufPrint(out_buf, "{}", .{std.fmt.fmtSliceHexLower(line)}) catch |err| switch (err) {
+    _ = if (zig_atleast_15) std.fmt.bufPrint(out_buf, "{x}", .{line}) catch |err| switch (err) {
         error.NoSpaceLeft => unreachable,
-    }).len;
+    } else std.fmt.bufPrint(out_buf, "{}", .{std.fmt.fmtSliceHexLower(line)}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     const hex_end = 2 * options.width;
     @memset(out_buf[2 * (line.len) .. hex_end], ' ');
 

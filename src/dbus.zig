@@ -1,9 +1,28 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-pub const Connection = @import("dbus/Connection.zig");
 pub const address = @import("dbus/address.zig");
 pub const Address = address.Address;
+
+const log_dbus = std.log.scoped(.dbus);
+
+const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+const zig_atleast_15_2 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 2 }) != .lt;
+
+pub const Writer = if (zig_atleast_15) std.Io.Writer else @import("0.14/Writer.zig");
+pub const Reader = if (zig_atleast_15) std.Io.Reader else @import("0.14/Reader.zig");
+
+pub const SocketWriter = @import("socketwriter.zig").SocketWriter;
+pub const SocketReader = @import("socketreader.zig").Reader;
+
+pub fn socketWriter(stream: std.net.Stream, buffer: []u8) SocketWriter {
+    if (zig_atleast_15) return stream.writer(buffer);
+    return .init(stream, buffer);
+}
+pub fn socketReader(stream: std.net.Stream, buffer: []u8) SocketReader {
+    if (zig_atleast_15) return stream.reader(buffer);
+    return .init(stream, buffer);
+}
 
 const default_system_bus_path = "/var/run/dbus/system_bus_socket";
 pub const default_system_bus_address_str = "unix:path=" ++ default_system_bus_path;
@@ -13,6 +32,7 @@ pub const default_system_bus_address_str = "unix:path=" ++ default_system_bus_pa
 
 // This maximum length applies to bus names, interfaces and members
 pub const max_name = 255;
+pub const max_sig = 255;
 
 pub const BusAddressString = struct {
     origin: enum { hardcoded_default, environment_variable },
@@ -29,11 +49,121 @@ pub fn getSessionBusAddressString() BusAddressString {
     return BusAddressString{ .origin = .hardcoded_default, .str = default_system_bus_address_str };
 }
 
+pub const ConnectError = if (zig_atleast_15) error{
+    DbusAddrUnixPathTooBig,
+    DbusAddrBadEscapeSequence,
+    AccessDenied,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    AddressInUse,
+    ConnectionRefused,
+    ConnectionTimedOut,
+    FileNotFound,
+} else error{
+    DbusAddrUnixPathTooBig,
+    DbusAddrBadEscapeSequence,
+    PermissionDenied,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    AddressInUse,
+    ConnectionRefused,
+    ConnectionTimedOut,
+    FileNotFound,
+};
+pub fn connect(addr: Address) ConnectError!std.net.Stream {
+    switch (addr) {
+        .unix => |unix_addr| {
+            var sockaddr = std.posix.sockaddr.un{ .family = std.posix.AF.UNIX, .path = undefined };
+            const path_len = address.resolveEscapes(&sockaddr.path, unix_addr.unescaped_path) catch |err| switch (err) {
+                error.DestTooSmall => return error.DbusAddrUnixPathTooBig,
+                error.BadEscapeSequence => return error.DbusAddrBadEscapeSequence,
+            };
+            if (path_len == sockaddr.path.len) return error.DbusAddrUnixPathTooBig;
+            sockaddr.path[path_len] = 0;
+
+            const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| if (zig_atleast_15) switch (err) {
+                error.AccessDenied,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.SystemResources,
+                => |e| return e,
+                error.ProtocolFamilyNotAvailable,
+                error.AddressFamilyNotSupported,
+                error.ProtocolNotSupported,
+                error.SocketTypeNotSupported,
+                error.Unexpected,
+                => unreachable,
+            } else switch (err) {
+                error.PermissionDenied,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.SystemResources,
+                => |e| return e,
+                error.ProtocolFamilyNotAvailable,
+                error.AddressFamilyNotSupported,
+                error.ProtocolNotSupported,
+                error.SocketTypeNotSupported,
+                error.Unexpected,
+                => unreachable,
+            };
+            errdefer std.posix.close(sock);
+
+            const addr_len: std.posix.socklen_t = @intCast(@offsetOf(std.posix.sockaddr.un, "path") + path_len + 1);
+
+            // TODO: should we set any socket options?
+            std.posix.connect(sock, @as(*std.posix.sockaddr, @ptrCast(&sockaddr)), addr_len) catch |err| if (zig_atleast_15) switch (err) {
+                error.PermissionDenied => return error.AccessDenied,
+                error.AccessDenied,
+                error.AddressInUse,
+                error.SystemResources,
+                error.ConnectionRefused,
+                error.ConnectionTimedOut,
+                error.FileNotFound,
+                => |e| return e,
+                error.Unexpected => @panic("unexpected errno from connect"),
+                error.AddressNotAvailable, // doesn't apply to unix sockets
+                error.NetworkUnreachable, // doesn't apply to unix sockets (I think)
+                error.ConnectionResetByPeer, // doesn't applyt to unix sockets
+                error.WouldBlock, // shouldn't happen to a blocking socket
+                error.ConnectionPending, // shouldn't happen to a blocking socket
+                error.AddressFamilyNotSupported,
+                => unreachable,
+            } else switch (err) {
+                error.PermissionDenied,
+                error.AddressInUse,
+                error.SystemResources,
+                error.ConnectionRefused,
+                error.ConnectionTimedOut,
+                error.FileNotFound,
+                => |e| return e,
+                error.Unexpected => @panic("unexpected errno from connect"),
+                error.AddressNotAvailable, // doesn't apply to unix sockets
+                error.NetworkUnreachable, // doesn't apply to unix sockets (I think)
+                error.ConnectionResetByPeer, // doesn't applyt to unix sockets
+                error.WouldBlock, // shouldn't happen to a blocking socket
+                error.ConnectionPending, // shouldn't happen to a blocking socket
+                error.AddressFamilyNotSupported,
+                => unreachable,
+            };
+            return .{ .handle = sock };
+        },
+    }
+}
+
 pub const MessageType = enum(u8) {
     method_call = 1,
     method_return = 2,
     error_reply = 3,
     signal = 4,
+};
+pub const MessageFlags = packed struct(u8) {
+    no_reply: bool,
+    no_auto_start: bool,
+    reserved1: bool,
+    allow_interactive_auth: bool,
+    reserved2: u4,
 };
 
 const native_endian = builtin.cpu.arch.endian();
@@ -42,24 +172,6 @@ const endian_header_value = switch (native_endian) {
     .little => 'l',
 };
 
-pub fn writeIntNative(comptime T: type, buf: [*]u8, value: T) void {
-    @as(*align(1) T, @ptrCast(buf)).* = value;
-}
-
-pub fn readInt(comptime T: type, endian: std.builtin.Endian, comptime buf_align: u29, buf: [*]align(buf_align) const u8) T {
-    const value = @as(*align(buf_align) const T, @ptrCast(buf)).*;
-    return if (native_endian == endian) value else @byteSwap(value);
-}
-
-pub fn strSlice(comptime Len: type, comptime s: []const u8) Slice(Len, [*]const u8) {
-    return Slice(Len, [*]const u8){
-        .ptr = s.ptr,
-        .len = @as(Len, @intCast(s.len)),
-    };
-}
-pub fn sliceLen(ptr: anytype, len: anytype) Slice(@TypeOf(len), @TypeOf(ptr)) {
-    return Slice(@TypeOf(len), @TypeOf(ptr)){ .ptr = ptr, .len = len };
-}
 pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
     return struct {
         const Self = @This();
@@ -80,21 +192,25 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
         ptr: Ptr,
         len: LenType,
 
+        pub fn initStatic(comptime ct_slice: NativeSlice) @This() {
+            return .{ .ptr = ct_slice.ptr, .len = @intCast(ct_slice.len) };
+        }
+
         pub fn nativeSlice(self: @This()) NativeSlice {
             return self.ptr[0..self.len];
         }
 
-        pub fn initComptime(comptime ct_slice: NativeSlice) @This() {
-            return .{ .ptr = ct_slice.ptr, .len = @as(LenType, @intCast(ct_slice.len)) };
-        }
-
         pub fn lenCast(self: @This(), comptime NewLenType: type) Slice(NewLenType, Ptr) {
-            return .{ .ptr = self.ptr, .len = @as(NewLenType, @intCast(self.len)) };
+            return .{ .ptr = self.ptr, .len = @intCast(self.len) };
         }
 
-        pub usingnamespace switch (@typeInfo(Ptr).pointer.child) {
-            u8 => struct {
-                pub fn format(
+        pub const format = switch (@typeInfo(Ptr).pointer.child) {
+            u8 => (struct {
+                pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+                fn formatNew(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+                    try writer.writeAll(self.ptr[0..self.len]);
+                }
+                fn formatLegacy(
                     self: Self,
                     comptime fmt: []const u8,
                     options: std.fmt.FormatOptions,
@@ -104,69 +220,28 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
                     _ = options;
                     try writer.writeAll(self.ptr[0..self.len]);
                 }
-            },
-            else => struct {},
+            }).format,
+            else => @compileError("can't format non-u8 slice"),
         };
     };
 }
 
-const header_fixed_part_len =
-    4 // endian/type/flags/version
-    + 4 // body_length
-    + 4 // serial
-;
-fn stringEncodeLen(string_len: u32, align_to: u29) u32 {
-    return @as(u32, @intCast(4 + std.mem.alignForward(u32, string_len + 1, align_to)));
-}
-
-fn serializeString(buf: [*]u8, str: Slice(u32, [*]const u8), align_to: u29) usize {
-    writeIntNative(u32, buf, str.len);
-    @memcpy(buf[4..][0..str.len], str);
-    const pad_offset = 4 + str.len;
-    const final_len = std.mem.alignForward(u32, pad_offset + 1, align_to);
-    @memset(buf[pad_offset..final_len], 0);
-    return final_len;
-}
-
-const DbusDataType = enum {
-    byte,
-    boolean,
-    int16,
-    uint16,
-    int32,
-    uint32,
-    int64,
-    uint64,
-    double,
+const HeaderFieldSignature = enum {
     string,
-    //object_path, // same as string
+    object_path,
     signature,
-    array,
-    @"struct",
-    variant,
-    //dict_entry, // same as struct
-    //unix_fd, // same as uint32
+    u32,
+    // unix_fd,
+    pub fn char(sig: HeaderFieldSignature) u8 {
+        return switch (sig) {
+            .string => 's',
+            .object_path => 'o',
+            .signature => 'g',
+            .u32 => 'u',
+            // .unix_fd => 'h',
+        };
+    }
 };
-
-const string_align = 4; // 4 for the uint32 length
-const struct_align = 4; // 4 for the uint32 length
-fn alignment(data_type: DbusDataType) u4 {
-    return switch (data_type) {
-        .byte => 1,
-        .boolean => 4,
-        .int16 => 2,
-        .uint16 => 2,
-        .int32 => 4,
-        .uint32 => 4,
-        .int64 => 8,
-        .uint64 => 8,
-        .string => string_align,
-        .signature => 1,
-        .array => 4, // for the length
-        .@"struct" => struct_align, // each field is on an 8-byte boundary
-        .variant => 1, // alignment of signature
-    };
-}
 
 const HeaderFieldStringKind = enum(u8) {
     path = 1,
@@ -175,15 +250,16 @@ const HeaderFieldStringKind = enum(u8) {
     error_name = 4,
     destination = 6,
     sender = 7,
-    pub fn typeSig(kind: HeaderFieldStringKind) u8 {
+
+    pub fn signature(kind: HeaderFieldStringKind) HeaderFieldSignature {
         return switch (kind) {
-            .path => 'o',
+            .path => .object_path,
             .interface,
             .member,
             .error_name,
             .destination,
             .sender,
-            => 's',
+            => .string,
         };
     }
 };
@@ -191,24 +267,70 @@ const HeaderFieldUint32Kind = enum(u8) {
     reply_serial = 5,
     unix_fds = 9,
 };
-const HeaderFieldKind = enum(u8) {
-    path = @intFromEnum(HeaderFieldStringKind.path),
-    interface = @intFromEnum(HeaderFieldStringKind.interface),
-    member = @intFromEnum(HeaderFieldStringKind.member),
-    error_name = @intFromEnum(HeaderFieldStringKind.error_name),
-    reply_serial = @intFromEnum(HeaderFieldUint32Kind.reply_serial),
-    destination = @intFromEnum(HeaderFieldStringKind.destination),
-    sender = @intFromEnum(HeaderFieldStringKind.sender),
-    signature = 8,
-    unix_fds = @intFromEnum(HeaderFieldUint32Kind.unix_fds),
-};
 
-fn toAlign(len: usize) u4 {
-    return @as(u4, @intCast(((len - 1) & 0x7) + 1));
-}
-fn alignAdd(in_align: u4, addend: usize) u4 {
-    return toAlign(@as(usize, @intCast(in_align)) + addend);
-}
+const HeaderFieldKind = enum {
+    path,
+    interface,
+    member,
+    error_name,
+    reply_serial,
+    destination,
+    sender,
+    signature,
+    unix_fds,
+
+    pub fn init(value: u8) ?HeaderFieldKind {
+        return switch (value) {
+            1 => .path,
+            2 => .interface,
+            3 => .member,
+            4 => .error_name,
+            5 => .reply_serial,
+            6 => .destination,
+            7 => .sender,
+            8 => .signature,
+            9 => .unix_fds,
+            // NOTE: according the the spec we must ignore
+            // unknown header codes
+            else => null,
+        };
+    }
+
+    pub fn sig(kind: HeaderFieldKind) HeaderFieldSignature {
+        return switch (kind) {
+            .path => .object_path,
+            .interface => .string,
+            .member => .string,
+            .error_name => .string,
+            .reply_serial => .u32,
+            .destination => .string,
+            .sender => .string,
+            .signature => .signature,
+            // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            // Is this not supposed to be the unix_fd type 'h' ?
+            .unix_fds => .u32,
+        };
+    }
+
+    pub fn getField(kind: HeaderFieldKind, headers: *DynamicHeaders(null)) union(enum) {
+        path: struct { ref: *?String, kind: HeaderStringKind },
+        u32: *?u32,
+        name: *?Bounded(255),
+        sig: *?Bounded(255),
+    } {
+        return switch (kind) {
+            .path => .{ .path = .{ .ref = &headers.path, .kind = .path } },
+            .interface => .{ .name = &headers.interface },
+            .member => .{ .name = &headers.member },
+            .error_name => .{ .name = &headers.error_name },
+            .reply_serial => .{ .u32 = &headers.reply_serial },
+            .destination => .{ .name = &headers.destination },
+            .sender => .{ .name = &headers.sender },
+            .signature => .{ .sig = &headers.signature },
+            .unix_fds => @panic("todo"),
+        };
+    }
+};
 
 fn Pad(comptime align_to: comptime_int) type {
     return switch (align_to) {
@@ -256,40 +378,6 @@ test pad8Len {
     }
 }
 
-const header_field_string = struct {
-    fn getLen(string_len: u32) u27 {
-        return @as(u27, @intCast(4 + // 1 for kind, 3 for type sig
-            4 + // string length uint32 (already aligned to 4)
-            string_len + 1 // add 1 for null-terminator
-        ));
-    }
-    fn serialize(msg: [*]u8, kind: HeaderFieldStringKind, str: Slice(u32, [*]const u8)) u27 {
-        msg[0] = @intFromEnum(kind);
-        msg[1] = 1; // type-sig length
-        msg[2] = kind.typeSig();
-        msg[3] = 0; // null-terminator
-        const str_off = 4;
-        // no padding
-        comptime std.debug.assert(0 == pad.getLen(str_off, string_align));
-        writeIntNative(u32, msg + str_off, str.len);
-        @memcpy(msg[str_off + 4 ..][0..str.len], str.ptr);
-        const end = str_off + 4 + str.len;
-        msg[end] = 0;
-        std.debug.assert(getLen(str.len) == end + 1);
-        return @as(u27, @intCast(end + 1));
-    }
-};
-const pad = struct {
-    pub fn getLen(in_align: u4, out_align: u4) u4 {
-        return @as(u4, @intCast(std.mem.alignForward(u4, in_align, out_align) - in_align));
-    }
-    pub fn serialize(msg: [*]u8, in_align: u4, out_align: u4) u4 {
-        const len = getLen(in_align, out_align);
-        @memset(msg[0..len], 0);
-        return len;
-    }
-};
-
 // NOTE: strings may not contain the codepoint 0
 //       strings are ALWAYS null-terminated
 //       they also must not contain OVERLONG sequences or exceed the value 0x10ffff
@@ -327,20 +415,6 @@ pub const Type = enum {
             .unix_fd => std.posix.fd_t,
         };
     }
-    // pub fn sig(self: FixedType) u8 {
-    //     return switch (self) {
-    //         .u8 => 'y',
-    //         .bool => 'b',
-    //         .i16 => 'n',
-    //         .u16 => 'q',
-    //         .i32 => 'i',
-    //         .u32 => 'u',
-    //         .i64 => 'x',
-    //         .u64 => 't',
-    //         .f64 => 'd',
-    //         .unix_fd => 'h',
-    //     };
-    // }
     fn getLen(comptime sig_type: Type, body_align: u3, value: *const sig_type.Native()) u32 {
         switch (sig_type) {
             .string, .object_path => {
@@ -387,20 +461,68 @@ fn calcBodyLen(comptime signature: []const Type, body: *const Body(signature)) e
     return total_len;
 }
 
-const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-
-const Iovlen = if (!zig_atleast_15 and builtin.cpu.arch == .x86_64)
-    u32
-else
-    @FieldType(std.posix.msghdr_const, "iovlen");
-
-const socketwriter = @import("socketwriter.zig");
-pub const SocketWriter = socketwriter.SocketWriter;
-pub fn socketWriter(sock: std.posix.socket_t, buffer: []u8) SocketWriter {
-    if (zig_atleast_15) return (std.net.Stream{ .handle = sock }).writer(buffer);
-    return .init(.{ .handle = sock }, buffer);
+pub fn flushAuth(writer: *Writer) Writer.Error!void {
+    var auth_buf: [100]u8 = undefined;
+    const auth_len = serializeAuth(&auth_buf, std.posix.system.getuid());
+    const auth = auth_buf[0..auth_len];
+    // if (zig_atleast_15)
+    //     std.log.info("sending '{f}'", .{std.zig.fmtString(auth)})
+    // else
+    //     std.log.info("sending '{}'", .{std.zig.fmtEscapes(auth)});
+    try writer.writeAll(auth);
+    try writer.flush();
 }
-pub const Writer = @import("writer.zig").Writer;
+
+fn serializeAuth(out_buf: *[100]u8, uid: std.posix.uid_t) usize {
+    const prefix = "\x00AUTH EXTERNAL ";
+    @memcpy(out_buf[0..prefix.len], prefix);
+
+    var uid_str_buf: [40]u8 = undefined;
+    const uid_str = std.fmt.bufPrint(&uid_str_buf, "{}", .{uid}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
+    const uid_hex = if (zig_atleast_15) std.fmt.bufPrint(out_buf[prefix.len..], "{x}", .{uid_str}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    } else std.fmt.bufPrint(out_buf[prefix.len..], "{}", .{std.fmt.fmtSliceHexLower(uid_str)}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
+    @memcpy(out_buf[prefix.len + uid_hex.len ..][0..2], "\r\n");
+    return prefix.len + uid_hex.len + 2;
+}
+
+// big enough to read 1 full 255-char signature
+pub const min_read_buf = 256;
+
+pub fn readAuth(reader: *Reader) (error{ DbusProtocol, DbusAuthRejected } || Reader.Error)!void {
+    std.debug.assert(reader.buffer.len >= min_read_buf);
+
+    const reply = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        error.ReadFailed => return error.ReadFailed,
+        error.EndOfStream => return error.EndOfStream,
+        error.StreamTooLong => {
+            log_dbus.err("DBUS Protocol: AUTH reply exceeded {} bytes", .{reader.buffer.len});
+            return error.DbusProtocol;
+        },
+    };
+    // 0.15.2 doesn't toss the delimiter
+    if (zig_atleast_15_2) reader.toss(1);
+
+    if (zig_atleast_15)
+        std.log.info("AUTH reply: '{f}'", .{std.zig.fmtString(reply)})
+    else
+        std.log.info("AUTH reply: '{}'", .{std.zig.fmtEscapes(reply)});
+    if (std.mem.startsWith(u8, reply, "OK ")) {
+        // should include a guid, maybe we don't need it though?
+        return;
+    }
+    if (std.mem.startsWith(u8, reply, "REJECTED ")) {
+        // TODO: maybe fallback to other auth mechanisms?
+        return error.DbusAuthRejected;
+    }
+
+    std.log.info("DBUS Protocol: unhandled reply from server '{s}'", .{reply});
+    return error.DbusProtocol;
+}
 
 fn calcHeaderStringLen(header_align: *u3, str: Slice(u32, [*]const u8)) u32 {
     const pad_len = pad8Len(header_align.*);
@@ -418,7 +540,7 @@ fn writeHeaderString(
     var buf: [8]u8 = undefined;
     buf[0] = @intFromEnum(kind);
     buf[1] = 1; // type-sig length
-    buf[2] = kind.typeSig();
+    buf[2] = kind.signature().char();
     buf[3] = 0; // type-sig null terminator
     std.mem.writeInt(u32, buf[4..8], str.len, native_endian);
     const pad_buf = [1]u8{0} ** 8;
@@ -466,8 +588,6 @@ pub fn writeMethodCall(
         const pad_buf = [_]u8{0} ** 8;
         try writer.writeAll(pad_buf[0..pad8Len(header_align)]);
     }
-
-    try writer.flush();
 }
 
 pub const MethodCall = struct {
@@ -486,439 +606,594 @@ pub const MethodCall = struct {
     }
 };
 
-//pub const signal_msg = struct {
-//    pub const Args = struct {
-//        serial: u32,
-//        path: Slice(u32, [*]const u8),
-//        interface: Slice(u32, [*]const u8),
-//        member: Slice(u32, [*]const u8),
-//    };
-//    pub fn getHeaderLen(args: Args) u32 {
-//        const len =
-//            header_fixed_part_len
-//            + stringEncodeLen(args.path.len, 4)
-//            + stringEncodeLen(args.interface.len, 4)
-//            + stringEncodeLen(args.member.len, 4)
-//        ;
-//        return @intCast(u32, std.mem.alignForward(len, 8));
-//    }
-//    pub fn serialize(msg: [*]u8, args: Args) void {
-//        msg[0] = endian_header_value;
-//        msg[1] = @enumToInt(MessageType.signal);
-//        msg[2] = 0; // flags
-//        msg[3] = 1; // protocol version
-//        const body_length = 0;
-//        writeIntNative(u32, msg + 4, body_length);
-//        writeIntNative(u32, msg + 8, args.serial);
-//
-//        if (true) @panic("TODO: serialize the optional header field array length");
-//
-//        var offset: usize = 12;
-//        offset += serializeString(msg + offset, args.path, 4);
-//        offset += serializeString(msg + offset, args.interface, 4);
-//        offset += serializeString(msg + offset, args.member, 4);
-//        std.debug.assert(std.mem.alignForward(offset, 8) == getHeaderLen(args));
-//    }
-//};
-//
+fn Bounded(comptime max: comptime_int) type {
+    return struct {
+        buffer: [max:0]u8,
+        len: std.math.IntFittingRange(0, max),
 
-fn getEndian(first_msg_byte: u8) ?std.builtin.Endian {
-    return switch (first_msg_byte) {
-        'l' => std.builtin.Endian.little,
-        'B' => std.builtin.Endian.big,
-        else => null,
-    };
-}
+        const Self = @This();
+        pub fn slice(self: *Self) []u8 {
+            return self.buffer[0..self.len];
+        }
+        pub fn sliceConst(self: *const Self) []const u8 {
+            return self.buffer[0..self.len];
+        }
 
-pub const GetMsgLenError = error{ InvalidEndianValue, TooBig };
-/// Returned len is guaranteed to be 8-byte aligned
-pub fn getMsgLen(msg: []align(8) const u8) GetMsgLenError!?u27 {
-    if (msg.len < 16) return null;
-    return try getMsgLenAssumeAtLeast16(msg);
-}
-/// Returned len is guaranteed to be 8-byte aligned
-pub fn getMsgLenAssumeAtLeast16(msg: []align(8) const u8) GetMsgLenError!u27 {
-    const endian = getEndian(msg[0]) orelse return error.InvalidEndianValue;
-    const body_len = readInt(u32, endian, comptime toAlign(4), msg.ptr + 4);
-    const header_array_len = readInt(u32, endian, comptime toAlign(12), msg.ptr + 12);
-    const header_end = 16 + std.mem.alignForward(u32, header_array_len, 8);
-    return std.math.cast(u27, header_end + body_len) orelse error.TooBig;
-}
-
-pub fn parseMsgType(msg_ptr: [*]align(8) const u8) ?MessageType {
-    return switch (msg_ptr[1]) {
-        @intFromEnum(MessageType.method_call) => MessageType.method_call,
-        @intFromEnum(MessageType.method_return) => MessageType.method_return,
-        @intFromEnum(MessageType.error_reply) => MessageType.error_reply,
-        @intFromEnum(MessageType.signal) => MessageType.signal,
-        else => null,
-    };
-}
-pub const ParsedMsg = struct {
-    endian: std.builtin.Endian,
-    header_end: u27,
-    unknown_header_count: u32,
-    headers: Headers,
-    pub const Headers = union(enum) {
-        method_return: struct {
-            reply_serial: u32,
-            // TODO: are all these really option for method_return?
-            destination: ?[]const u8,
-            sender: ?[]const u8,
-            signature: ?[]const u8,
-            unix_fds: ?u32,
-        },
-        signal: struct {
-            path: []const u8,
-            interface: []const u8,
-            member: []const u8,
-            // TODO: are all these really option for signal?
-            destination: ?[]const u8,
-            sender: ?[]const u8,
-            signature: ?[]const u8,
-            unix_fds: ?u32,
-        },
-        err: struct {
-            reply_serial: u32,
-            name: []const u8,
-            path: ?[]const u8,
-            interface: ?[]const u8,
-            member: ?[]const u8,
-            destination: ?[]const u8,
-            sender: ?[]const u8,
-            signature: ?[]const u8,
-            unix_fds: ?u32,
-        },
-    };
-
-    pub fn serial(self: ParsedMsg, msg_ptr: [*]align(8) const u8) u32 {
-        return readInt(u32, self.endian, 8, msg_ptr + 8);
-    }
-
-    pub const HeaderField = union(enum) {
-        unknown: struct {
-            id: u8,
-        },
-        string: struct {
-            kind: HeaderFieldStringKind,
-            str: [:0]align(4) const u8,
-        },
-        uint32: struct {
-            kind: HeaderFieldUint32Kind,
-            val: u32,
-        },
-        sig: [:0]const u8,
-    };
-    pub const HeaderArrayIterator = struct {
-        endian: std.builtin.Endian,
-        header_end: u27,
-        offset: u27 = 16,
-
-        pub const NextError = error{
-            FieldTooBig,
-            UnexpectedTypeSig,
-            NoNullTerm,
-        };
-        pub fn next(self: *HeaderArrayIterator, msg_ptr: [*]align(8) const u8) NextError!?HeaderField {
-            const start = self.offset;
-            if (start == self.header_end) return null;
-            const parse_type: union(enum) {
-                string: HeaderFieldStringKind,
-                uint32: HeaderFieldUint32Kind,
-                signature: void,
-                unknown: u8,
-            } = switch (msg_ptr[start]) {
-                @intFromEnum(HeaderFieldKind.path) => .{ .string = .path },
-                @intFromEnum(HeaderFieldKind.interface) => .{ .string = .interface },
-                @intFromEnum(HeaderFieldKind.member) => .{ .string = .member },
-                @intFromEnum(HeaderFieldKind.error_name) => .{ .string = .error_name },
-                @intFromEnum(HeaderFieldKind.reply_serial) => .{ .uint32 = .reply_serial },
-                @intFromEnum(HeaderFieldKind.destination) => .{ .string = .destination },
-                @intFromEnum(HeaderFieldKind.sender) => .{ .string = .sender },
-                @intFromEnum(HeaderFieldKind.signature) => .signature,
-                @intFromEnum(HeaderFieldKind.unix_fds) => .{ .uint32 = .unix_fds },
-                else => |id| .{ .unknown = id },
-            };
-            switch (parse_type) {
-                .string => |kind| {
-                    const string_start = start + 8;
-                    if (string_start > self.header_end) return error.FieldTooBig;
-                    if (msg_ptr[start + 1] != 1) return error.UnexpectedTypeSig;
-                    if (msg_ptr[start + 2] != kind.typeSig()) return error.UnexpectedTypeSig;
-                    if (msg_ptr[start + 3] != 0) return error.UnexpectedTypeSig;
-                    const string_len = readInt(u32, self.endian, 4, @as([*]align(4) const u8, @alignCast(msg_ptr + start + 4)));
-                    // string_len + 1 for null terminator
-                    const field_end = string_start + std.mem.alignForward(u32, string_len + 1, 8);
-                    if (field_end > self.header_end) return error.FieldTooBig;
-                    const str = msg_ptr[string_start .. string_start + string_len];
-                    if (str.ptr[string_len] != 0) return error.NoNullTerm;
-                    self.offset = @as(u27, @intCast(field_end));
-                    return HeaderField{ .string = .{
-                        .kind = kind,
-                        .str = @ptrCast(@alignCast(str)),
-                    } };
-                },
-                .uint32 => |kind| {
-                    const field_end = start + 8;
-                    if (field_end > self.header_end) return error.FieldTooBig;
-                    if (msg_ptr[start + 1] != 1) return error.UnexpectedTypeSig;
-                    if (msg_ptr[start + 2] != 'u') return error.UnexpectedTypeSig;
-                    const val = readInt(u32, self.endian, 4, @as([*]align(4) const u8, @alignCast(msg_ptr + start + 4)));
-                    self.offset = @as(u27, @intCast(field_end));
-                    return HeaderField{ .uint32 = .{ .kind = kind, .val = val } };
-                },
-                .signature => {
-                    const sig_content_start = start + 5;
-                    if (sig_content_start > self.header_end) return error.FieldTooBig;
-                    if (msg_ptr[start + 1] != 1) return error.UnexpectedTypeSig;
-                    if (msg_ptr[start + 2] != 'g') return error.UnexpectedTypeSig;
-                    if (msg_ptr[start + 3] != 0) return error.UnexpectedTypeSig;
-                    const sig_len = msg_ptr[start + 4];
-                    // sign_len + 1 for null terminator
-                    const field_end = std.mem.alignForward(u32, sig_content_start + sig_len + 1, 8);
-                    if (field_end > self.header_end) return error.FieldTooBig;
-                    const sig = msg_ptr[sig_content_start .. sig_content_start + sig_len];
-                    if (sig.ptr[sig_len] != 0) return error.NoNullTerm;
-                    self.offset = @as(u27, @intCast(field_end));
-                    return HeaderField{ .sig = @ptrCast(sig) };
-                },
-                .unknown => |id| {
-                    std.log.warn("TODO: got unknown header field id '{}', use the type signature to skip it", .{id});
-                    self.offset = self.header_end;
-                    return HeaderField{ .unknown = .{ .id = id } };
-                },
-            }
+        pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+        pub fn formatNew(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{s}", .{self.sliceConst()});
+        }
+        pub fn formatLegacy(
+            self: @This(),
+            comptime fmt: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = fmt;
+            _ = options;
+            try writer.print("{s}", .{self.sliceConst()});
         }
     };
-    pub fn headerArrayIterator(self: ParsedMsg) HeaderArrayIterator {
-        return .{ .endian = self.endian, .header_end = self.header_end };
+}
+
+const DbusProtocolError = error{
+    DbusProtocol,
+};
+
+pub const HeaderStringKind = enum {
+    path,
+};
+
+const HeaderFieldKindNe = enum(u8) {
+    path = 1,
+    interface = 2,
+    member = 3,
+    error_name = 4,
+    reply_serial = 5,
+    destination = 6,
+    sender = 7,
+    signature = 8,
+    unix_fds = 9,
+    _,
+    pub fn init(value: u8) DbusProtocolError!HeaderFieldKindNe {
+        if (value == 0) {
+            log_dbus.err("DBUS Protocol: 0 header field code", .{});
+            return error.DbusProtocol;
+        }
+        return @enumFromInt(value);
+    }
+    pub fn expectedSignature(self: HeaderFieldKindNe) ?HeaderFieldSignature {
+        return switch (self) {
+            .path => .object_path,
+            .interface => .string,
+            .member => .string,
+            .error_name => .string,
+            .reply_serial => .u32,
+            .destination => .string,
+            .sender => .string,
+            .signature => .signature,
+            .unix_fds => .u32,
+            _ => null,
+        };
+    }
+};
+const BoundedString = enum {
+    interface,
+    member,
+    error_name,
+    destination,
+    sender,
+    signature,
+};
+
+const TypeNe = enum(u8) {
+    string = 's',
+    // path = 1,
+    // interface = 2,
+    // member = 3,
+    // error_name = 4,
+    // reply_serial = 5,
+    // destination = 6,
+    // sender = 7,
+    // signature = 8,
+    // unix_fds = 9,
+    _,
+    pub fn expectedSignature(self: HeaderFieldKindNe) ?HeaderFieldSignature {
+        return switch (self) {
+            .path => .object_path,
+            .interface => .string,
+            .member => .string,
+            .error_name => .string,
+            .reply_serial => .u32,
+            .destination => .string,
+            .sender => .string,
+            .signature => .signature,
+            .unix_fds => .u32,
+            _ => null,
+        };
     }
 };
 
-pub fn parseMsg(msg: []align(8) const u8) ParsedMsgError!ParsedMsg {
-    const msg_len = getMsgLenAssumeAtLeast16(msg) catch unreachable;
-    std.debug.assert(msg.len == msg_len);
-    return parseMsgAssumeGetMsgLen(.{ .ptr = msg.ptr, .len = msg_len });
-}
+pub const HeaderFieldIterator = struct {
+    pub const Field = union(enum) {
+        path: struct { len: u32 },
+        interface: Bounded(255),
+        member: Bounded(255),
+        error_name: Bounded(255),
+        reply_serial: u32,
+        destination: Bounded(255),
+        sender: Bounded(255),
+        signature: Bounded(255),
+    };
 
-pub const ParsedMsgError = error{
-    InvalidMsgType,
-    DuplicateHeader,
-} || ParsedMsg.HeaderArrayIterator.NextError || HeaderParser.ToParsedHeadersError;
+    endian: std.builtin.Endian,
+    header_array_len: u32,
+    bytes_read: u32 = 0,
 
-/// parse a complete message (msg is exactly 1 complete message)
-pub fn parseMsgAssumeGetMsgLen(msg: Slice(u27, [*]align(8) const u8)) ParsedMsgError!ParsedMsg {
-    std.debug.assert((getMsgLenAssumeAtLeast16(msg.nativeSlice()) catch unreachable) == msg.len);
-    // an invalid endian value should be impossible because this would have been caught in getMsgLen
-    const endian = getEndian(msg.ptr[0]) orelse unreachable;
-    const header_array_len = readInt(u32, endian, comptime toAlign(4), msg.ptr + 12);
-    const header_end = @as(u27, @intCast(16 + std.mem.alignForward(u32, header_array_len, 8)));
-    const msg_type = parseMsgType(msg.ptr) orelse return error.InvalidMsgType;
-    var header_parser = HeaderParser{};
-    {
-        var it = ParsedMsg.HeaderArrayIterator{
-            .endian = endian,
-            .header_end = header_end,
+    pending_path: ?u32 = null,
+
+    path_found: bool = false,
+    interface_found: bool = false,
+    member_found: bool = false,
+    error_name_found: bool = false,
+    reply_serial_found: bool = false,
+    destination_found: bool = false,
+    sender_found: bool = false,
+    signature_found: bool = false,
+    unix_fds_found: bool = false,
+
+    fn getFoundRef(it: *HeaderFieldIterator, kind: HeaderFieldKindNe) ?*bool {
+        return switch (kind) {
+            .path => &it.path_found,
+            .interface => &it.interface_found,
+            .member => &it.member_found,
+            .error_name => &it.error_name_found,
+            .reply_serial => &it.reply_serial_found,
+            .destination => &it.destination_found,
+            .sender => &it.sender_found,
+            .signature => &it.signature_found,
+            .unix_fds => &it.unix_fds_found,
+            _ => null,
         };
-        while (try it.next(msg.ptr)) |header_field| {
-            switch (header_field) {
-                .unknown => header_parser.unknown_header_count += 1,
-                .string => |str| {
-                    const str_ptr = header_parser.getStringHeaderPtr(str.kind);
-                    if (str_ptr.*) |_| return error.DuplicateHeader;
-                    str_ptr.* = str.str;
-                },
-                .uint32 => |u| {
-                    const uint_ptr = header_parser.getUint32HeaderPtr(u.kind);
-                    if (uint_ptr.*) |_| return error.DuplicateHeader;
-                    uint_ptr.* = u.val;
-                },
-                .sig => |s| {
-                    if (header_parser.signature) |_| return error.DuplicateHeader;
-                    header_parser.signature = s;
-                },
+    }
+
+    pub fn notifyPathConsumed(it: *HeaderFieldIterator) void {
+        it.bytes_read += it.pending_path.?;
+        it.pending_path = null;
+    }
+
+    pub fn next(it: *HeaderFieldIterator, reader: *Reader) (DbusProtocolError || Reader.Error)!?Field {
+        if (it.pending_path != null) {
+            @panic("notifyPathConsumed was not called");
+        }
+
+        if (it.bytes_read >= it.header_array_len) {
+            const pad_len = pad8Len(@truncate(it.header_array_len));
+            // std.log.info("discarding {} bytes of header padding...", .{pad_len});
+            try reader.discardAll(pad_len);
+            return null;
+        }
+
+        // every header field is aligned to 8 bytes
+        {
+            const pad_len = pad8Len(@truncate(it.bytes_read));
+            // std.log.info("discarding {} bytes of field padding...", .{pad_len});
+            try reader.discardAll(pad_len);
+            it.bytes_read += pad_len;
+        }
+
+        const kind: HeaderFieldKindNe = try .init(try reader.takeByte());
+        if (it.getFoundRef(kind)) |found_ref| {
+            if (found_ref.*) {
+                log_dbus.err("multiple '{s}' headers", .{@tagName(kind)});
+                return error.DbusProtocol;
+            }
+            found_ref.* = true;
+        }
+        var sig_buf: [std.math.maxInt(u8)]u8 = undefined;
+        const sig_len: u8 = try reader.takeByte();
+        const sig = sig_buf[0..sig_len];
+        it.bytes_read += 2;
+
+        {
+            const src = try reader.take(sig.len);
+            it.bytes_read += @intCast(sig.len);
+            @memcpy(sig, src);
+            const sentinel = try reader.takeByte();
+            it.bytes_read += 1;
+            if (sentinel != 0) {
+                // todo: include the header kind
+                log_dbus.err("DBUS protocol violation: header signature missing 0-terminator", .{});
+                return error.DbusProtocol;
             }
         }
-    }
 
-    return ParsedMsg{
-        .endian = endian,
-        .header_end = header_end,
-        .unknown_header_count = header_parser.unknown_header_count,
-        .headers = try header_parser.toParsedHeaders(msg_type),
-    };
-}
+        if (kind.expectedSignature()) |expected_sig| {
+            if (sig.len != 1 or sig[0] != expected_sig.char()) {
+                log_dbus.err("DBUS protocol: expected header {s} to have signature '{c}' but got '{s}'", .{ @tagName(kind), expected_sig.char(), sig });
+                return error.DbusProtocol;
+            }
+        }
 
-const HeaderParser = struct {
-    unknown_header_count: u32 = 0,
-    path: ?[:0]const u8 = null,
-    interface: ?[:0]const u8 = null,
-    member: ?[:0]const u8 = null,
-    error_name: ?[:0]const u8 = null,
-    reply_serial: ?u32 = null,
-    destination: ?[:0]const u8 = null,
-    sender: ?[:0]const u8 = null,
-    signature: ?[:0]const u8 = null,
-    unix_fds: ?u32 = null,
-    pub fn getStringHeaderPtr(
-        self: *HeaderParser,
-        kind: HeaderFieldStringKind,
-    ) *?[:0]const u8 {
-        return switch (kind) {
-            .path => &self.path,
-            .interface => &self.interface,
-            .member => &self.member,
-            .error_name => &self.error_name,
-            .destination => &self.destination,
-            .sender => &self.sender,
-        };
-    }
-    pub fn getUint32HeaderPtr(
-        self: *HeaderParser,
-        kind: HeaderFieldUint32Kind,
-    ) *?u32 {
-        return switch (kind) {
-            .reply_serial => &self.reply_serial,
-            .unix_fds => &self.unix_fds,
-        };
-    }
-    pub const ToParsedHeadersError = error{
-        MissingPathHeader,
-        MissingInterfaceHeader,
-        MissingMemberHeader,
-        MissingSerialHeader,
-        MissingErrorName,
-        UnexpectedPathHeader,
-        UnexpectedInterfaceHeader,
-        UnexpectedMemberHeader,
-        UnexpectedErrorHeader,
-        UnexpectedSerialHeader,
-    };
-    pub fn toParsedHeaders(
-        self: HeaderParser,
-        msg_type: MessageType,
-    ) ToParsedHeadersError!ParsedMsg.Headers {
-        switch (msg_type) {
-            .method_call => {
-                const path = self.path orelse return error.MissingPathHeader;
-                _ = path;
+        switch (@as(union(enum) {
+            path,
+            bounded_string: BoundedString,
+            reply_serial,
+            unix_fds,
+            unknown,
+        }, switch (kind) {
+            .path => .path,
+            .interface => .{ .bounded_string = .interface },
+            .member => .{ .bounded_string = .member },
+            .error_name => .{ .bounded_string = .error_name },
+            .reply_serial => .reply_serial,
+            .destination => .{ .bounded_string = .destination },
+            .sender => .{ .bounded_string = .sender },
+            .signature => .{ .bounded_string = .signature },
+            .unix_fds => .unix_fds,
+            _ => .unknown,
+        })) {
+            .path => {
+                // we should already be aligned on a 4-byte boundary
+                std.debug.assert(pad4Len(@truncate(it.bytes_read)) == 0);
+                const len = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                std.debug.assert(it.pending_path == null);
+                it.pending_path = len;
+                return .{ .path = .{ .len = len } };
+            },
+            .bounded_string => |bounded_kind| {
+                const string_len = blk: {
+                    switch (bounded_kind) {
+                        .interface,
+                        .member,
+                        .error_name,
+                        .destination,
+                        .sender,
+                        => {
+                            // we should already be aligned on a 4-byte boundary
+                            std.debug.assert(pad4Len(@truncate(it.bytes_read)) == 0);
+                            const string_len = try reader.takeInt(u32, it.endian);
+                            it.bytes_read += 4;
+                            break :blk string_len;
+                        },
+                        .signature => {
+                            const string_len = try reader.takeByte();
+                            it.bytes_read += 1;
+                            break :blk string_len;
+                        },
+                    }
+                };
+
+                // all known header fields except path have a max length of 255
+                const string_len_u8 = std.math.cast(u8, string_len) orelse {
+                    log_dbus.err("DBUS protocol: field '{s}' is {}-bytes but max is 255", .{ @tagName(bounded_kind), string_len });
+                    return error.DbusProtocol;
+                };
+                var bounded: Bounded(255) = .{ .buffer = undefined, .len = string_len_u8 };
+                {
+                    const slice = try reader.take(string_len);
+                    it.bytes_read += string_len;
+                    // name_ref.* = .{ .buffer = undefined, .len = @intCast(string_len) };
+                    @memcpy(bounded.buffer[0..string_len], slice);
+                    bounded.buffer[string_len] = 0;
+                }
+                const nullterm = try reader.takeByte();
+                it.bytes_read += 1;
+                if (nullterm != 0) {
+                    log_dbus.err("{s} name missing null-terminator", .{@tagName(kind)});
+                    return error.DbusProtocol;
+                }
+                return switch (bounded_kind) {
+                    .interface => .{ .interface = bounded },
+                    .member => .{ .member = bounded },
+                    .error_name => .{ .error_name = bounded },
+                    .destination => .{ .destination = bounded },
+                    .sender => .{ .sender = bounded },
+                    .signature => .{ .signature = bounded },
+                };
+            },
+            .reply_serial => {
+                // we should already be aligned on a 4-byte boundary
+                std.debug.assert(pad4Len(@truncate(it.bytes_read)) == 0);
+                const value = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                return .{ .reply_serial = value };
+            },
+            .unix_fds => {
                 @panic("todo");
             },
-            .method_return => {
-                if (self.path) |_| return error.UnexpectedPathHeader;
-                if (self.interface) |_| return error.UnexpectedInterfaceHeader;
-                if (self.member) |_| return error.UnexpectedMemberHeader;
-                if (self.error_name) |_| return error.UnexpectedErrorHeader;
-                return ParsedMsg.Headers{
-                    .method_return = .{
-                        .reply_serial = self.reply_serial orelse return error.MissingSerialHeader,
-                        .destination = self.destination,
-                        .sender = self.sender,
-                        .signature = self.signature,
-                        .unix_fds = self.unix_fds,
-                    },
-                };
-            },
-            .error_reply => {
-                return ParsedMsg.Headers{ .err = .{
-                    .reply_serial = self.reply_serial orelse return error.MissingSerialHeader,
-                    .name = self.error_name orelse return error.MissingErrorName,
-                    .path = self.path,
-                    .interface = self.interface,
-                    .member = self.member,
-                    .destination = self.destination,
-                    .sender = self.sender,
-                    .signature = self.signature,
-                    .unix_fds = self.unix_fds,
-                } };
-            },
-            .signal => {
-                if (self.error_name) |_| return error.UnexpectedErrorHeader;
-                if (self.reply_serial) |_| return error.UnexpectedSerialHeader;
-                return ParsedMsg.Headers{
-                    .signal = .{
-                        .path = self.path orelse return error.MissingPathHeader,
-                        .interface = self.interface orelse return error.MissingInterfaceHeader,
-                        .member = self.member orelse return error.MissingMemberHeader,
-                        .destination = self.destination,
-                        .sender = self.sender,
-                        .signature = self.signature,
-                        .unix_fds = self.unix_fds,
-                    },
-                };
+            .unknown => {
+                @panic("todo");
             },
         }
     }
 };
 
-// TODO: not sure if this is the right function and/or place for this
-pub fn parseString(endian: std.builtin.Endian, buf: []const u8, offset: usize) ?struct {
-    string: [:0]const u8,
-    end: usize,
-} {
-    if (offset + 4 > buf.len) return null;
-    const len = std.mem.readInt(u32, buf[offset..][0..4], endian);
-    const null_index = offset + 4 + len;
-    if (null_index >= buf.len) return null;
-    if (buf[null_index] != 0) return null;
-    return .{ .string = buf[offset + 4 .. null_index :0], .end = null_index + 1 };
-}
-
-fn readFull(reader: anytype, buf: []u8) (@TypeOf(reader).Error || error{EndOfStream})!void {
-    std.debug.assert(buf.len > 0);
-    var total_received: usize = 0;
-    while (true) {
-        const last_received = try reader.read(buf[total_received..]);
-        if (last_received == 0)
-            return error.EndOfStream;
-        total_received += last_received;
-        if (total_received == buf.len)
-            break;
+pub fn consumeStringNullTerm(reader: *Reader) (DbusProtocolError || Reader.Error)!void {
+    const nullterm = try reader.takeByte();
+    if (nullterm != 0) {
+        log_dbus.err("string missing 0-terminator", .{});
+        return error.DbusProtocol;
     }
 }
 
-pub const ReadOneMsg = union(enum) {
-    partial: u27,
-    complete: u27,
+pub const BodyIterator = struct {
+    endian: std.builtin.Endian,
+    body_len: u32,
+    signature: []const u8,
+
+    bytes_read: u32 = 0,
+    sig_offset: u32 = 0,
+
+    pending_string: ?u32 = null,
+
+    pub const Value = union(enum) {
+        string: struct { len: u32 },
+    };
+
+    pub fn notifyStringConsumed(it: *BodyIterator) void {
+        it.bytes_read += it.pending_string.? + 1;
+        it.pending_string = null;
+    }
+
+    pub fn next(it: *BodyIterator, reader: *Reader) (DbusProtocolError || Reader.Error)!?Value {
+        if (it.pending_string != null) {
+            @panic("notifyStringConsumed was not called");
+        }
+
+        if (it.bytes_read >= it.body_len) {
+            std.debug.assert(it.bytes_read == it.body_len);
+            if (it.sig_offset != it.signature.len) {
+                log_dbus.err("body truncated to {} but still expecting the following types '{s}'", .{ it.body_len, it.signature[it.sig_offset..] });
+                return error.DbusProtocol;
+            }
+            return null;
+        }
+
+        if (it.sig_offset >= it.signature.len) {
+            log_dbus.err("body has {} bytes left but signature has no types left", .{it.body_len - it.bytes_read});
+            return error.DbusProtocol;
+        }
+        const sig_type: TypeNe = @enumFromInt(it.signature[it.sig_offset]);
+        switch (sig_type) {
+            .string => {
+                const pad_len = pad4Len(@truncate(it.bytes_read));
+                if (it.bytes_read + pad_len + 4 > it.body_len) {
+                    log_dbus.err("body truncated", .{});
+                    return error.DbusProtocol;
+                }
+                try reader.discardAll(pad_len);
+                it.bytes_read += pad_len;
+                const string_len = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                std.debug.assert(it.pending_string == null);
+                if (it.bytes_read + string_len > it.body_len) {
+                    log_dbus.err("body truncated", .{});
+                    return error.DbusProtocol;
+                }
+                it.pending_string = string_len;
+                it.sig_offset += 1;
+                return .{ .string = .{ .len = string_len } };
+            },
+            _ => std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{@intFromEnum(sig_type)}),
+        }
+    }
 };
-/// The caller must check whether the length returned is larger than the provided `buf`.
-/// If it is, then only the first 16-bytes have been read.  The caller can allocate a new
-/// buffer large enough to accomodate and finish reading the message by copying the first
-/// 16 bytes to the new buffer then calling `readOneMsgFinish`.
-pub fn readOneMsg(reader: anytype, buf: []align(8) u8) !ReadOneMsg {
-    std.debug.assert(buf.len >= 16);
-    try readFull(reader, buf[0..16]);
-    const msg_len = getMsgLenAssumeAtLeast16(buf) catch |err| switch (err) {
-        error.InvalidEndianValue => return error.DbusMsgInvalidEndianValue,
-        error.TooBig => return error.DbusMsgTooBig,
-    };
-    if (msg_len > buf.len) return ReadOneMsg{ .partial = msg_len };
 
-    try readOneMsgFinish(reader, buf[0..msg_len]);
-    return ReadOneMsg{ .complete = msg_len };
-}
+/// The first fixed part of every message
+pub const Fixed = struct {
+    endian: std.builtin.Endian,
+    type: MessageType,
+    flags: MessageFlags,
+    body_len: u32,
+    serial: u32,
+    header_array_len: u32,
 
-pub fn readOneMsgFinish(reader: anytype, buf: []align(8) u8) !void {
-    if (builtin.mode == .Debug) {
-        const msg_len = getMsgLenAssumeAtLeast16(buf) catch unreachable;
-        std.debug.assert(buf.len == msg_len);
+    pub fn discard(fixed: *const Fixed, reader: *Reader) Reader.Error!void {
+        _ = fixed;
+        _ = reader;
+        @panic("todo");
     }
-    try readFull(reader, buf[16..]);
+
+    pub fn readMethodReturnHeaders(
+        fixed: *const Fixed,
+        reader: *Reader,
+        path_buf: []u8,
+    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(.method_return) {
+        std.debug.assert(fixed.type == .method_return);
+        const headers = try fixed.readHeaders(reader, path_buf);
+        return .{
+            .unknown_header_count = headers.unknown_header_count,
+            .path = headers.path,
+            .interface = headers.interface,
+            .member = headers.member,
+            .error_name = headers.error_name,
+            .reply_serial = headers.reply_serial orelse {
+                log_dbus.err("method return missing reply_serial", .{});
+                return error.DbusProtocol;
+            },
+            .destination = headers.destination,
+            .sender = headers.sender,
+            .signature = headers.signature,
+            .unix_fds = headers.unix_fds,
+        };
+    }
+
+    pub fn readSignalHeaders(
+        fixed: *const Fixed,
+        reader: *Reader,
+        path_buf: []u8,
+    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(.signal) {
+        std.debug.assert(fixed.type == .signal);
+        const headers = try fixed.readHeaders(reader, path_buf);
+        return .{
+            .unknown_header_count = headers.unknown_header_count,
+            .path = headers.path orelse {
+                log_dbus.err("signal missing path", .{});
+                return error.DbusProtocol;
+            },
+            .interface = headers.interface orelse {
+                log_dbus.err("signal missing interface", .{});
+                return error.DbusProtocol;
+            },
+            .member = headers.member orelse {
+                log_dbus.err("signal missing member", .{});
+                return error.DbusProtocol;
+            },
+            .error_name = headers.error_name,
+            .reply_serial = headers.reply_serial,
+            .destination = headers.destination,
+            .sender = headers.sender,
+            .signature = headers.signature,
+            .unix_fds = headers.unix_fds,
+        };
+    }
+
+    pub fn readHeaders(
+        fixed: *const Fixed,
+        reader: *Reader,
+        path_buf: []u8,
+    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(null) {
+        var headers: DynamicHeaders(null) = .{
+            .path = null,
+            .interface = null,
+            .member = null,
+            .error_name = null,
+            .reply_serial = null,
+        };
+
+        var it: HeaderFieldIterator = .{
+            .endian = fixed.endian,
+            .header_array_len = fixed.header_array_len,
+        };
+        while (try it.next(reader)) |field| switch (field) {
+            .path => |path| {
+                std.debug.assert(headers.path == null);
+                headers.path = .{ .len = path.len };
+                const read_len = @min(path_buf.len, path.len);
+                try reader.readSliceAll(path_buf[0..read_len]);
+                try reader.discardAll(path.len - read_len);
+                it.notifyPathConsumed();
+            },
+            .interface => |str| {
+                std.debug.assert(headers.interface == null);
+                headers.interface = str;
+            },
+            .member => |str| {
+                std.debug.assert(headers.member == null);
+                headers.member = str;
+            },
+            .error_name => |str| {
+                std.debug.assert(headers.error_name == null);
+                headers.error_name = str;
+            },
+            .reply_serial => |serial| {
+                std.debug.assert(headers.reply_serial == null);
+                headers.reply_serial = serial;
+            },
+            .destination => |str| {
+                std.debug.assert(headers.destination == null);
+                headers.destination = str;
+            },
+            .sender => |str| {
+                std.debug.assert(headers.sender == null);
+                headers.sender = str;
+            },
+            .signature => |str| {
+                std.debug.assert(headers.signature == null);
+                headers.signature = str;
+            },
+        };
+
+        return headers;
+    }
+};
+
+pub fn readFixed(reader: *Reader) (DbusProtocolError || Reader.Error)!Fixed {
+    const bytes = try reader.takeArray(16);
+    const endian: std.builtin.Endian = switch (bytes[0]) {
+        'l' => .little,
+        'B' => .big,
+        else => {
+            if (zig_atleast_15)
+                log_dbus.err("expected endian 'l' or 'B' but got '{f}'", .{std.zig.fmtString(bytes[0..1])})
+            else
+                log_dbus.err("expected endian 'l' or 'B' but got '{}'", .{std.zig.fmtEscapes(bytes[0..1])});
+            return error.DbusProtocol;
+        },
+    };
+
+    if (bytes[3] != 1) {
+        log_dbus.err("unsupported protocol version {}", .{bytes[3]});
+        return error.DbusProtocol;
+    }
+    return Fixed{
+        .endian = endian,
+        .type = switch (bytes[1]) {
+            @intFromEnum(MessageType.method_call) => .method_call,
+            @intFromEnum(MessageType.method_return) => .method_return,
+            @intFromEnum(MessageType.error_reply) => .error_reply,
+            @intFromEnum(MessageType.signal) => .signal,
+            else => |t| {
+                log_dbus.err("unknown message type {}", .{t});
+                return error.DbusProtocol;
+            },
+        },
+        .flags = @bitCast(bytes[2]),
+        .body_len = std.mem.readInt(u32, bytes[4..8], endian),
+        .serial = std.mem.readInt(u32, bytes[8..12], endian),
+        .header_array_len = std.mem.readInt(u32, bytes[12..16], endian),
+    };
 }
 
-pub fn readOneMsgArrayList(reader: anytype, al: *std.ArrayListAligned(u8, 8)) !void {
-    std.debug.assert(std.mem.isAligned(al.items.len, 8));
+const MaybeMessageType = enum {
+    none,
+    method_call,
+    method_return,
+    error_reply,
+    signal,
+    pub fn opt(message_type: ?MessageType) MaybeMessageType {
+        return switch (message_type orelse return .none) {
+            .method_call => .method_call,
+            .method_return => .method_return,
+            .error_reply => .error_reply,
+            .signal => .signal,
+        };
+    }
+};
 
-    try al.ensureUnusedCapacity(16);
-    const header: []align(8) u8 = @alignCast(al.unusedCapacitySlice()[0..16]);
-    try readFull(reader, header);
-    al.items.len += 16;
-    const msg_len = getMsgLenAssumeAtLeast16(header) catch |err| switch (err) {
-        error.InvalidEndianValue => return error.DbusMsgInvalidEndianValue,
-        error.TooBig => return error.DbusMsgTooBig,
+const String = struct {
+    len: u32,
+};
+
+fn DynamicHeaders(comptime message_type: ?MessageType) type {
+    const maybe_message_type: MaybeMessageType = .opt(message_type);
+    return struct {
+        unknown_header_count: u32 = 0,
+        path: switch (maybe_message_type) {
+            .method_call, .signal => String,
+            else => ?String,
+        },
+        interface: switch (maybe_message_type) {
+            .signal => Bounded(max_name),
+            else => ?Bounded(max_name),
+        },
+        member: switch (maybe_message_type) {
+            .method_call, .signal => Bounded(max_name),
+            else => ?Bounded(max_name),
+        },
+        error_name: switch (maybe_message_type) {
+            .error_reply => Bounded(max_name),
+            else => ?Bounded(max_name),
+        },
+        reply_serial: switch (maybe_message_type) {
+            .error_reply, .method_return => u32,
+            else => ?u32,
+        },
+        destination: ?Bounded(max_name) = null,
+        sender: ?Bounded(max_name) = null,
+        signature: ?Bounded(max_sig) = null,
+        unix_fds: ?u32 = null,
     };
-    const remaining = msg_len - 16;
-    try al.ensureUnusedCapacity(remaining);
-    try readFull(reader, al.unusedCapacitySlice()[0..remaining]);
-    al.items.len += remaining;
 }
