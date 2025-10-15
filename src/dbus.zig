@@ -583,11 +583,7 @@ pub fn writeMethodCall(
     if (args.member) |arg| {
         try writeHeaderString(writer, &header_align, .member, arg);
     }
-
-    {
-        const pad_buf = [_]u8{0} ** 8;
-        try writer.writeAll(pad_buf[0..pad8Len(header_align)]);
-    }
+    try writer.splatByteAll(0, pad8Len(header_align));
 }
 
 pub const MethodCall = struct {
