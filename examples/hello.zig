@@ -88,6 +88,64 @@ pub fn main() !u8 {
     };
 
     std.log.info("our name is '{s}'", .{name});
+
+    try dbus.writeMethodCall(
+        writer,
+        &[_]dbus.Type{}, // No arguments
+        .{
+            .serial = 2,
+            .path = .initStatic("/org/freedesktop/portal/desktop"),
+            .destination = .initStatic("org.freedesktop.portal.Desktop"),
+            .interface = .initStatic("org.freedesktop.DBus.Introspectable"),
+            .member = .initStatic("Introspect"),
+        },
+        .{}, // No body
+    );
+    try writer.flush();
+    {
+        const fixed = blk_fixed: {
+            while (true) {
+                const fixed = try dbus.readFixed(reader);
+                switch (fixed.type) {
+                    .method_call => return error.UnexpectedDbusMethodCall,
+                    .method_return => break :blk_fixed fixed,
+                    .error_reply => {
+                        @panic("todo: handle error reply");
+                    },
+                    .signal => {
+                        std.log.info("ignoring signal", .{});
+                        try fixed.readAndLog(reader);
+                    },
+                }
+            }
+        };
+
+        const headers = try fixed.readMethodReturnHeaders(reader, &.{});
+        if (headers.reply_serial != 2) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+        var it: dbus.BodyIterator = .{
+            .endian = fixed.endian,
+            .body_len = fixed.body_len,
+            .signature = headers.signatureSlice(),
+        };
+
+        switch (try it.next(reader) orelse @panic("Introspect reply is missing string name")) {
+            .string => |string| {
+                std.log.info("--- Introspect reply:", .{});
+                var remaining: u32 = string.len;
+                while (remaining > 0) {
+                    const take_len = @min(reader.buffer.len, remaining);
+                    const slice = try reader.take(take_len);
+                    std.debug.print("{s}", .{slice});
+                    remaining -= @intCast(slice.len);
+                }
+                try dbus.consumeStringNullTerm(reader);
+                it.notifyStringConsumed();
+            },
+        }
+        std.log.info("---- end of Introspect reply", .{});
+        if (try it.next(reader) != null) @panic("Introspect reply body contains more than expected");
+    }
+
     return 0;
 }
 

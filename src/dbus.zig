@@ -998,6 +998,12 @@ pub const Fixed = struct {
     }
 
     pub fn readAndLog(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!void {
+        const headers = try fixed.readAndLogHeaders(reader);
+        std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
+        try fixed.readAndLogBody(reader, headers.signatureSlice());
+    }
+
+    pub fn readAndLogHeaders(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!DynamicHeaders(null) {
         var path_buf: [1000]u8 = undefined;
         const headers = try fixed.readHeaders(reader, &path_buf);
         std.log.info("DBUS {s}:", .{@tagName(fixed.type)});
@@ -1045,11 +1051,13 @@ pub const Fixed = struct {
         } else {
             std.log.info("  signature (none)", .{});
         }
-        std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
+        return headers;
+    }
+    pub fn readAndLogBody(fixed: *const Fixed, reader: *Reader, signature: []const u8) (DbusProtocolError || Reader.Error)!void {
         var it: BodyIterator = .{
             .endian = fixed.endian,
             .body_len = fixed.body_len,
-            .signature = if (headers.signature) |s| s.sliceConst() else "",
+            .signature = signature,
         };
         while (try it.next(reader)) |value| switch (value) {
             .string => |string| {
@@ -1301,9 +1309,8 @@ fn fmtHexAscii(data: []const u8, options: FmtHexAsciiOptions) struct {
         _ = fmt_options;
         try self.formatCommon(writer);
     }
-    fn formatCommon(self: *const Self, writer: *Writer) !void {
+    fn formatCommon(self: *const Self, writer: anytype) !void {
         const max_line = 200;
-
         var offset: usize = 0;
         while (true) {
             const next = offset + self.options.width;
