@@ -50,36 +50,43 @@ pub fn main() !u8 {
 
     var name_buf: [dbus.max_name:0]u8 = undefined;
 
-    const name = blk: {
-        while (true) {
-            const fixed = try dbus.readFixed(reader);
-            switch (fixed.type) {
-                .method_call => return error.UnexpectedDbusMethodCall,
-                .method_return => {
-                    const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-                    if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
-                    const signature: ?[]const u8 = if (headers.signature) |*s| s.sliceConst() else null;
-                    if (!std.mem.eql(u8, "s", if (signature) |s| s else "")) std.debug.panic("unexpected signature '{?s}'", .{signature});
-                    const string_len = try reader.takeInt(u32, fixed.endian);
-                    if (string_len > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string_len});
-                    const name_slice = try reader.take(string_len);
-                    @memcpy(name_buf[0..string_len], name_slice);
-                    const nullterm = try reader.takeByte();
-                    if (nullterm != 0) {
-                        std.log.err("Hello reply name missing null-terminator", .{});
-                        return error.DbusProtocol;
-                    }
-                    break :blk name_buf[0..string_len];
-                },
-                .error_reply => {
-                    @panic("todo");
-                },
-                .signal => {
-                    std.log.info("ignoring signal", .{});
-                    try fixed.discard(reader);
+    const name = blk_name: {
+        const fixed = blk_fixed: {
+            while (true) {
+                const fixed = try dbus.readFixed(reader);
+                switch (fixed.type) {
+                    .method_call => return error.UnexpectedDbusMethodCall,
+                    .method_return => break :blk_fixed fixed,
+                    .error_reply => {
+                        @panic("todo: handle error_reply");
+                    },
+                    .signal => {
+                        std.log.info("ignoring signal", .{});
+                        try fixed.discard(reader);
+                    },
+                }
+            }
+        };
+        const headers = try fixed.readMethodReturnHeaders(reader, &.{});
+        if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+        var it: dbus.BodyIterator = .{
+            .endian = fixed.endian,
+            .body_len = fixed.body_len,
+            .signature = headers.signatureSlice(),
+        };
+        const string_len = blk: {
+            switch (try it.next(reader) orelse @panic("Hello reply is missing string name")) {
+                .string => |string| {
+                    if (string.len > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string.len});
+                    try reader.readSliceAll(name_buf[0..string.len]);
+                    try dbus.consumeStringNullTerm(reader);
+                    it.notifyStringConsumed();
+                    break :blk string.len;
                 },
             }
-        }
+        };
+        if (try it.next(reader) != null) @panic("Hello reply body contains more than expected");
+        break :blk_name name_buf[0..string_len];
     };
 
     std.log.info("our name is '{s}'", .{name});

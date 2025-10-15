@@ -1195,5 +1195,10 @@ fn DynamicHeaders(comptime message_type: ?MessageType) type {
         sender: ?Bounded(max_name) = null,
         signature: ?Bounded(max_sig) = null,
         unix_fds: ?u32 = null,
+
+        const Self = @This();
+        pub fn signatureSlice(self: *const Self) []const u8 {
+            return if (self.signature) |*s| s.sliceConst() else "";
+        }
     };
 }
