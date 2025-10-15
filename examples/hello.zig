@@ -1,6 +1,5 @@
 const std = @import("std");
 const dbus = @import("dbus");
-const hexdump = @import("hexdump.zig").hexdump;
 
 pub fn main() !u8 {
     const session_addr_str = dbus.getSessionBusAddressString();
@@ -61,7 +60,7 @@ pub fn main() !u8 {
                     },
                     .signal => {
                         std.log.info("ignoring signal", .{});
-                        try fixed.discard(reader);
+                        try fixed.readAndLog(reader);
                     },
                 }
             }
@@ -90,10 +89,6 @@ pub fn main() !u8 {
 
     std.log.info("our name is '{s}'", .{name});
     return 0;
-}
-
-fn hexdumpLine(line: []const u8) void {
-    std.log.debug("{s}", .{line});
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {

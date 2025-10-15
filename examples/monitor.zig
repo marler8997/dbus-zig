@@ -1,6 +1,5 @@
 const std = @import("std");
 const dbus = @import("dbus");
-const hexdump = @import("hexdump.zig").hexdump;
 
 pub fn main() !u8 {
     const session_addr_str = dbus.getSessionBusAddressString();
@@ -62,7 +61,7 @@ pub fn main() !u8 {
                     },
                     .signal => {
                         std.log.info("ignoring signal", .{});
-                        try fixed.discard(reader);
+                        try fixed.readAndLog(reader);
                     },
                 }
             }
@@ -93,78 +92,16 @@ pub fn main() !u8 {
 
     while (true) {
         const fixed = try dbus.readFixed(reader);
+        try fixed.readAndLog(reader);
         switch (fixed.type) {
             .method_call => return error.UnexpectedDbusMethodCall,
-            .method_return => return error.UnexpectedDbugsMethodReturn,
-            .error_reply => {
-                @panic("todo: deserialize error reply");
-            },
-            .signal => {
-                var path_buf: [100]u8 = undefined;
-                const headers = try fixed.readSignalHeaders(reader, &path_buf);
-                std.log.info("signal:", .{});
-                if (headers.path.len > path_buf.len) {
-                    std.log.info("  path '{s}' (truncated from {} bytes to {})", .{ path_buf[0..headers.path.len], headers.path.len, path_buf.len });
-                } else {
-                    std.log.info("  path '{s}'", .{path_buf[0..headers.path.len]});
-                }
-                std.log.info("  interface '{f}'", .{headers.interface});
-                std.log.info("  member '{f}'", .{headers.member});
-                if (headers.error_name) |error_name| {
-                    std.log.info("  error_name '{f}'", .{error_name});
-                } else {
-                    std.log.info("  error_name (none)", .{});
-                }
-                if (headers.reply_serial) |reply_serial| {
-                    std.log.info("  reply_serial '{d}'", .{reply_serial});
-                } else {
-                    std.log.info("  reply_serial (none)", .{});
-                }
-                if (headers.destination) |destination| {
-                    std.log.info("  destination '{f}'", .{destination});
-                } else {
-                    std.log.info("  destination (none)", .{});
-                }
-                if (headers.sender) |sender| {
-                    std.log.info("  sender '{f}'", .{sender});
-                } else {
-                    std.log.info("  sender (none)", .{});
-                }
-                if (headers.signature) |signature| {
-                    std.log.info("  signature '{f}'", .{signature});
-                } else {
-                    std.log.info("  signature (none)", .{});
-                }
-                std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
-                var it: dbus.BodyIterator = .{
-                    .endian = fixed.endian,
-                    .body_len = fixed.body_len,
-                    .signature = if (headers.signature) |s| s.sliceConst() else "",
-                };
-                while (try it.next(reader)) |value| switch (value) {
-                    .string => |string| {
-                        std.log.info("  string ({} bytes)", .{string.len});
-                        var string_buf: [16]u8 = undefined;
-                        var remaining: u32 = string.len;
-                        while (remaining > 0) {
-                            const consume_len = @min(string_buf.len, remaining);
-                            try reader.readSliceAll(string_buf[0..consume_len]);
-                            hexdump(hexdumpLine, string_buf[0..consume_len], .{});
-                            remaining -= consume_len;
-                        }
-                        try dbus.consumeStringNullTerm(reader);
-                        it.notifyStringConsumed();
-                    },
-                };
-            },
+            .method_return => return error.UnexpectedDbusMethodReturn,
+            .error_reply => return error.UnexpectedDbusErrorReply,
+            .signal => {},
         }
     }
 
     return 0;
-}
-
-fn hexdumpLine(line: []const u8) void {
-    std.log.debug("{s}", .{line});
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {

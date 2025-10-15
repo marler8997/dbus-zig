@@ -990,10 +990,85 @@ pub const Fixed = struct {
     serial: u32,
     header_array_len: u32,
 
-    pub fn discard(fixed: *const Fixed, reader: *Reader) Reader.Error!void {
-        _ = fixed;
-        _ = reader;
-        @panic("todo");
+    pub fn discardHeaders(fixed: *const Fixed, reader: *Reader) Reader.Error!void {
+        try reader.discardAll(fixed.header_array_len + pad8Len(@truncate(fixed.header_array_len)));
+    }
+    pub fn discardBody(fixed: *const Fixed, reader: *Reader) Reader.Error!void {
+        try reader.discardAll(fixed.body_len);
+    }
+
+    pub fn readAndLog(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!void {
+        var path_buf: [1000]u8 = undefined;
+        const headers = try fixed.readHeaders(reader, &path_buf);
+        std.log.info("DBUS {s}:", .{@tagName(fixed.type)});
+        if (headers.path) |*path| {
+            if (path.len > path_buf.len) {
+                std.log.info("  path '{s}' (truncated from {} bytes to {})", .{ path_buf[0..path.len], path.len, path_buf.len });
+            } else {
+                std.log.info("  path '{s}'", .{path_buf[0..path.len]});
+            }
+        } else {
+            std.log.info("  path (none)", .{});
+        }
+        if (headers.interface) |interface| {
+            std.log.info("  interface '{f}'", .{interface});
+        } else {
+            std.log.info("  interface (none)", .{});
+        }
+        if (headers.member) |member| {
+            std.log.info("  member '{f}'", .{member});
+        } else {
+            std.log.info("  member (none)", .{});
+        }
+        if (headers.error_name) |error_name| {
+            std.log.info("  error_name '{f}'", .{error_name});
+        } else {
+            std.log.info("  error_name (none)", .{});
+        }
+        if (headers.reply_serial) |reply_serial| {
+            std.log.info("  reply_serial '{d}'", .{reply_serial});
+        } else {
+            std.log.info("  reply_serial (none)", .{});
+        }
+        if (headers.destination) |destination| {
+            std.log.info("  destination '{f}'", .{destination});
+        } else {
+            std.log.info("  destination (none)", .{});
+        }
+        if (headers.sender) |sender| {
+            std.log.info("  sender '{f}'", .{sender});
+        } else {
+            std.log.info("  sender (none)", .{});
+        }
+        if (headers.signature) |signature| {
+            std.log.info("  signature '{f}'", .{signature});
+        } else {
+            std.log.info("  signature (none)", .{});
+        }
+        std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
+        var it: BodyIterator = .{
+            .endian = fixed.endian,
+            .body_len = fixed.body_len,
+            .signature = if (headers.signature) |s| s.sliceConst() else "",
+        };
+        while (try it.next(reader)) |value| switch (value) {
+            .string => |string| {
+                std.log.info("  string ({} bytes)", .{string.len});
+                const hex_ascii_width = 16;
+                var string_buf: [hex_ascii_width]u8 = undefined;
+                var remaining: u32 = string.len;
+                while (remaining > 0) {
+                    const consume_len = @min(string_buf.len, remaining);
+                    try reader.readSliceAll(string_buf[0..consume_len]);
+                    std.log.info("  {f}", .{fmtHexAscii(string_buf[0..consume_len], .{
+                        .width = hex_ascii_width,
+                    })});
+                    remaining -= consume_len;
+                }
+                try consumeStringNullTerm(reader);
+                it.notifyStringConsumed();
+            },
+        };
     }
 
     pub fn readMethodReturnHeaders(
@@ -1201,4 +1276,71 @@ fn DynamicHeaders(comptime message_type: ?MessageType) type {
             return if (self.signature) |*s| s.sliceConst() else "";
         }
     };
+}
+
+const FmtHexAsciiOptions = struct {
+    width: usize = 16,
+};
+fn fmtHexAscii(data: []const u8, options: FmtHexAsciiOptions) struct {
+    data: []const u8,
+    options: FmtHexAsciiOptions,
+
+    const Self = @This();
+
+    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+    fn formatNew(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.formatCommon(writer);
+    }
+    fn formatLegacy(
+        self: Self,
+        comptime fmt: []const u8,
+        fmt_options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = fmt_options;
+        try self.formatCommon(writer);
+    }
+    fn formatCommon(self: *const Self, writer: *Writer) !void {
+        const max_line = 200;
+
+        var offset: usize = 0;
+        while (true) {
+            const next = offset + self.options.width;
+            if (next > self.data.len) break;
+
+            var buf: [max_line]u8 = undefined;
+            const len = formatLine(&buf, self.data[offset..next], self.options);
+            try writer.writeAll(buf[0..len]);
+            try writer.writeByte('\n');
+            offset = next;
+        }
+        if (offset < self.data.len) {
+            var buf: [max_line]u8 = undefined;
+            const len = formatLine(&buf, self.data[offset..], self.options);
+            try writer.writeAll(buf[0..len]);
+            try writer.writeByte('\n');
+        }
+    }
+} {
+    return .{ .data = data, .options = options };
+}
+
+fn formatLine(out_buf: []u8, line: []const u8, options: FmtHexAsciiOptions) usize {
+    std.debug.assert(line.len <= options.width);
+    _ = if (zig_atleast_15) std.fmt.bufPrint(out_buf, "{x}", .{line}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    } else std.fmt.bufPrint(out_buf, "{}", .{std.fmt.fmtSliceHexLower(line)}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
+    const hex_end = 2 * options.width;
+    @memset(out_buf[2 * (line.len) .. hex_end], ' ');
+
+    out_buf[hex_end + 0] = ' ';
+    out_buf[hex_end + 1] = '|';
+    for (line, 0..) |c, i| {
+        out_buf[hex_end + 2 + i] = if (std.ascii.isPrint(c)) c else ' ';
+    }
+    out_buf[hex_end + 2 + line.len] = '|';
+    return hex_end + 2 + line.len + 1;
 }
