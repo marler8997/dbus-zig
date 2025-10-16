@@ -82,6 +82,7 @@ pub fn main() !u8 {
                     it.notifyStringConsumed();
                     break :blk string.len;
                 },
+                else => |v| std.debug.panic("Hello unexpected type {s}", .{@tagName(v)}),
             }
         };
         if (try it.next(reader) != null) @panic("Hello reply body contains more than expected");

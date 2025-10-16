@@ -985,7 +985,14 @@ pub const BodyIterator = struct {
                 const bool_value = try reader.takeInt(u32, it.endian);
                 it.bytes_read += 4;
                 it.sig_offset += 1;
-                return .{ .boolean = bool_value != 0 };
+                return .{ .boolean = switch (bool_value) {
+                    0 => false,
+                    1 => true,
+                    else => |value| {
+                        log_dbus.err("invalid bool value '{d}'", .{value});
+                        return error.DbusProtocol;
+                    },
+                } };
             },
             _ => std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{@intFromEnum(sig_type)}),
         }

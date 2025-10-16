@@ -81,6 +81,7 @@ pub fn main() !u8 {
                     it.notifyStringConsumed();
                     break :blk string.len;
                 },
+                else => |v| std.debug.panic("Hello unexpected type {s}", .{@tagName(v)}),
             }
         };
         if (try it.next(reader) != null) @panic("Hello reply body contains more than expected");
@@ -141,6 +142,7 @@ pub fn main() !u8 {
                 try dbus.consumeStringNullTerm(reader);
                 it.notifyStringConsumed();
             },
+            else => |v| std.debug.panic("Introspect unexpected type {s}", .{@tagName(v)}),
         }
         std.log.info("---- end of Introspect reply", .{});
         if (try it.next(reader) != null) @panic("Introspect reply body contains more than expected");
