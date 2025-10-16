@@ -684,6 +684,7 @@ const BoundedString = enum {
 
 const TypeNe = enum(u8) {
     string = 's',
+    boolean = 'b',
     // path = 1,
     // interface = 2,
     // member = 3,
@@ -926,6 +927,7 @@ pub const BodyIterator = struct {
 
     pub const Value = union(enum) {
         string: struct { len: u32 },
+        boolean: bool,
     };
 
     pub fn notifyStringConsumed(it: *BodyIterator) void {
@@ -971,6 +973,19 @@ pub const BodyIterator = struct {
                 it.pending_string = string_len;
                 it.sig_offset += 1;
                 return .{ .string = .{ .len = string_len } };
+            },
+            .boolean => {
+                const pad_len = pad4Len(@truncate(it.bytes_read));
+                if (it.bytes_read + pad_len + 4 > it.body_len) {
+                    log_dbus.err("body truncated", .{});
+                    return error.DbusProtocol;
+                }
+                try reader.discardAll(pad_len);
+                it.bytes_read += pad_len;
+                const bool_value = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                it.sig_offset += 1;
+                return .{ .boolean = bool_value != 0 };
             },
             _ => std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{@intFromEnum(sig_type)}),
         }
@@ -1071,6 +1086,9 @@ pub const Fixed = struct {
                 }
                 try consumeStringNullTerm(reader);
                 it.notifyStringConsumed();
+            },
+            .boolean => |b| {
+                std.log.info("  boolean {}", .{b});
             },
         };
     }
