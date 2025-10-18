@@ -685,6 +685,9 @@ const BoundedString = enum {
 const TypeNe = enum(u8) {
     string = 's',
     boolean = 'b',
+    array = 'a',
+    struct_start = '(',
+    struct_end = ')',
     // path = 1,
     // interface = 2,
     // member = 3,
@@ -916,6 +919,7 @@ pub fn consumeStringNullTerm(reader: *Reader) (DbusProtocolError || Reader.Error
 }
 
 pub const BodyIterator = struct {
+    allocator: std.mem.Allocator,
     endian: std.builtin.Endian,
     body_len: u32,
     signature: []const u8,
@@ -923,61 +927,114 @@ pub const BodyIterator = struct {
     bytes_read: u32 = 0,
     sig_offset: u32 = 0,
 
-    pending_string: ?u32 = null,
+    pending_state: ?union(enum) {
+        string: u32,
+        array_iter: *BodyIterator,
+    } = null,
 
     pub const Value = union(enum) {
         string: struct { len: u32 },
         boolean: bool,
+        array: *BodyIterator,
+        struct_start,
+        struct_end,
     };
 
     pub fn notifyStringConsumed(it: *BodyIterator) void {
-        it.bytes_read += it.pending_string.? + 1;
-        it.pending_string = null;
+        std.debug.assert(it.pending_state != null);
+        std.debug.assert(it.pending_state.? == .string);
+        it.bytes_read += it.pending_state.?.string + 1;
+        it.pending_state = null;
     }
 
-    pub fn next(it: *BodyIterator, reader: *Reader) (DbusProtocolError || Reader.Error)!?Value {
-        if (it.pending_string != null) {
-            @panic("notifyStringConsumed was not called");
+    pub fn notifyArrayItemConsumed(it: *BodyIterator) void {
+        it.sig_offset = 0;
+    }
+
+    pub fn notifyArrayConsumed(it: *BodyIterator) void {
+        std.debug.assert(it.pending_state != null);
+        std.debug.assert(it.pending_state.? == .array_iter);
+        const array_iter = it.pending_state.?.array_iter;
+        it.bytes_read = array_iter.bytes_read; // Child gets the parent's bytes read (for alignment), so we have to REPLACE
+        it.sig_offset += array_iter.sig_offset; // but the Child gets the sig from its start with index 0, so does not access the previous parts, so we have to ADD it
+
+        it.allocator.destroy(array_iter);
+        it.pending_state = null;
+    }
+
+    fn getPadding(sig_type: TypeNe, len: u32) u32 {
+        return switch (sig_type) {
+            .string => pad4Len(@truncate(len)),
+            .boolean => pad4Len(@truncate(len)),
+            .array => pad4Len(@truncate(len)),
+            .struct_start => pad8Len(@truncate(len)),
+            .struct_end => 0,
+            _ => unreachable,
+        };
+    }
+
+    pub fn isBodyConsumed(it: *BodyIterator) bool {
+        return it.bytes_read >= it.body_len;
+    }
+
+    pub fn next(it: *BodyIterator, reader: *Reader) (DbusProtocolError || Reader.Error || error{OutOfMemory})!?Value {
+        if (it.pending_state != null) {
+            switch (it.pending_state.?) {
+                .string => {
+                    @panic("notifyStringConsumed was not called");
+                },
+                .array_iter => {
+                    @panic("notifyArrayConsumed was not called");
+                },
+            }
         }
 
-        if (it.bytes_read >= it.body_len) {
-            std.debug.assert(it.bytes_read == it.body_len);
-            if (it.sig_offset != it.signature.len) {
-                log_dbus.err("body truncated to {} but still expecting the following types '{s}'", .{ it.body_len, it.signature[it.sig_offset..] });
-                return error.DbusProtocol;
-            }
+        const signatureConsumed = it.sig_offset >= it.signature.len;
+        const bodyConsumed = it.bytes_read >= it.body_len;
+
+        if (signatureConsumed and bodyConsumed) {
             return null;
         }
 
-        if (it.sig_offset >= it.signature.len) {
+        if (signatureConsumed and !bodyConsumed) {
             log_dbus.err("body has {} bytes left but signature has no types left", .{it.body_len - it.bytes_read});
             return error.DbusProtocol;
         }
         const sig_type: TypeNe = @enumFromInt(it.signature[it.sig_offset]);
+
+        // NOTE: struct_end has no body content
+        if (bodyConsumed and sig_type != .struct_end) {
+            std.debug.assert(it.bytes_read == it.body_len);
+            log_dbus.err("body truncated to {} but still expecting the following types '{s}' (bytes read: {d})", .{ it.body_len, it.signature[it.sig_offset..], it.bytes_read });
+            return error.DbusProtocol;
+        }
+
         switch (sig_type) {
             .string => {
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
-                    log_dbus.err("body truncated", .{});
+                    log_dbus.err("body truncated (at string), body len: {d}, bytes read: {d}, pad_len: {d}", .{ it.body_len, it.bytes_read, pad_len });
                     return error.DbusProtocol;
                 }
                 try reader.discardAll(pad_len);
                 it.bytes_read += pad_len;
+
                 const string_len = try reader.takeInt(u32, it.endian);
                 it.bytes_read += 4;
-                std.debug.assert(it.pending_string == null);
                 if (it.bytes_read + string_len > it.body_len) {
-                    log_dbus.err("body truncated", .{});
+                    log_dbus.err("body truncated (at string content), body len: {d}, bytes read: {d}, pad_len: {d}", .{ it.body_len, it.bytes_read, pad_len });
                     return error.DbusProtocol;
                 }
-                it.pending_string = string_len;
+
+                it.pending_state = .{ .string = string_len };
                 it.sig_offset += 1;
+
                 return .{ .string = .{ .len = string_len } };
             },
             .boolean => {
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
-                    log_dbus.err("body truncated", .{});
+                    log_dbus.err("body truncated (at boolean) {d}", .{pad_len});
                     return error.DbusProtocol;
                 }
                 try reader.discardAll(pad_len);
@@ -994,7 +1051,57 @@ pub const BodyIterator = struct {
                     },
                 } };
             },
-            _ => std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{@intFromEnum(sig_type)}),
+            .array => {
+                // const pad_len = pad4Len(@truncate(it.bytes_read));
+                // if (it.bytes_read + pad_len + 4 > it.body_len) {
+                //     log_dbus.err("body truncated", .{});
+                //     return error.DbusProtocol;
+                // }
+                // try reader.discardAll(pad_len);
+                // it.bytes_read += pad_len;
+                const array_length = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                it.sig_offset += 1;
+
+                if (it.signature.len <= it.sig_offset) {
+                    log_dbus.err("array type missing element type in signature", .{});
+                    return error.DbusProtocol;
+                }
+
+                const content_sig: TypeNe = @enumFromInt(it.signature[it.sig_offset]);
+                const padding_array_start = getPadding(content_sig, @truncate(it.bytes_read));
+                try reader.discardAll(padding_array_start);
+                it.bytes_read += padding_array_start;
+
+                const array_iter = try it.allocator.create(BodyIterator);
+                array_iter.* = BodyIterator{
+                    .allocator = it.allocator,
+                    .endian = it.endian,
+                    .body_len = it.bytes_read + array_length,
+                    .bytes_read = it.bytes_read,
+                    .signature = it.signature[it.sig_offset..],
+                };
+                it.pending_state = .{ .array_iter = array_iter };
+
+                return .{ .array = array_iter };
+            },
+            .struct_start => {
+                const pad_len = pad8Len(@truncate(it.bytes_read));
+                if (it.bytes_read + pad_len + 8 > it.body_len) {
+                    log_dbus.err("body truncated (struct start), {d}", .{pad_len});
+                    return error.DbusProtocol;
+                }
+                try reader.discardAll(pad_len);
+                it.bytes_read += pad_len;
+                it.sig_offset += 1;
+
+                return .{ .struct_start = {} };
+            },
+            .struct_end => {
+                it.sig_offset += 1;
+                return .{ .struct_end = {} };
+            },
+            _ => std.debug.panic("todo: unknown or unsupported type sig '{c}' {x} {b}", .{ @intFromEnum(sig_type), @intFromEnum(sig_type), @intFromEnum(sig_type) }),
         }
     }
 };
@@ -1015,10 +1122,10 @@ pub const Fixed = struct {
         try reader.discardAll(fixed.body_len);
     }
 
-    pub fn readAndLog(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!void {
+    pub fn readAndLog(fixed: *const Fixed, allocator: std.mem.Allocator, reader: *Reader) (DbusProtocolError || Reader.Error || error{OutOfMemory})!void {
         const headers = try fixed.readAndLogHeaders(reader);
         std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
-        try fixed.readAndLogBody(reader, headers.signatureSlice());
+        try fixed.readAndLogBody(allocator, reader, headers.signatureSlice());
     }
 
     pub fn readAndLogHeaders(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!DynamicHeaders(null) {
@@ -1071,12 +1178,18 @@ pub const Fixed = struct {
         }
         return headers;
     }
-    pub fn readAndLogBody(fixed: *const Fixed, reader: *Reader, signature: []const u8) (DbusProtocolError || Reader.Error)!void {
+    pub fn readAndLogBody(fixed: *const Fixed, allocator: std.mem.Allocator, reader: *Reader, signature: []const u8) (DbusProtocolError || Reader.Error || error{OutOfMemory})!void {
         var it: BodyIterator = .{
+            .allocator = allocator,
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = signature,
         };
+
+        return processBodyIterator(&it, reader);
+    }
+
+    fn processBodyIterator(it: *BodyIterator, reader: *Reader) (DbusProtocolError || Reader.Error || error{OutOfMemory})!void {
         while (try it.next(reader)) |value| switch (value) {
             .string => |string| {
                 std.log.info("  string ({} bytes)", .{string.len});
@@ -1096,6 +1209,16 @@ pub const Fixed = struct {
             },
             .boolean => |b| {
                 std.log.info("  boolean {}", .{b});
+            },
+            .array => |a| {
+                std.log.info("  array with body length {}", .{a.body_len - a.bytes_read});
+                try processBodyIterator(a, reader);
+            },
+            .struct_start => {
+                std.log.info("  struct start", .{});
+            },
+            .struct_end => {
+                std.log.info("  struct end", .{});
             },
         };
     }
