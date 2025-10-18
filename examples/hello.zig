@@ -2,6 +2,9 @@ const std = @import("std");
 const dbus = @import("dbus");
 
 pub fn main() !u8 {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    const allocator = gpa.allocator();
+
     const session_addr_str = dbus.getSessionBusAddressString();
     const addr = dbus.Address.fromString(session_addr_str.str) catch |err| {
         switch (session_addr_str.origin) {
@@ -60,7 +63,7 @@ pub fn main() !u8 {
                     },
                     .signal => {
                         std.log.info("ignoring signal", .{});
-                        try fixed.readAndLog(reader);
+                        try fixed.readAndLog(allocator, reader);
                     },
                 }
             }
@@ -68,6 +71,7 @@ pub fn main() !u8 {
         const headers = try fixed.readMethodReturnHeaders(reader, &.{});
         if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
         var it: dbus.BodyIterator = .{
+            .allocator = allocator,
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = headers.signatureSlice(),
@@ -115,7 +119,7 @@ pub fn main() !u8 {
                     },
                     .signal => {
                         std.log.info("ignoring signal", .{});
-                        try fixed.readAndLog(reader);
+                        try fixed.readAndLog(allocator, reader);
                     },
                 }
             }
@@ -124,6 +128,7 @@ pub fn main() !u8 {
         const headers = try fixed.readMethodReturnHeaders(reader, &.{});
         if (headers.reply_serial != 2) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
         var it: dbus.BodyIterator = .{
+            .allocator = allocator,
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = headers.signatureSlice(),
