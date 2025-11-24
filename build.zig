@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardOptimizeOption(.{});
@@ -7,6 +9,11 @@ pub fn build(b: *std.Build) void {
     const dbus_module = b.addModule("dbus", .{
         .root_source_file = b.path("src/dbus.zig"),
     });
+    if (!zig_atleast_15) {
+        if (b.lazyDependency("iobackport", .{})) |iobackport_dep| {
+            dbus_module.addImport("std15", iobackport_dep.module("std15"));
+        }
+    }
 
     const examples = b.step("examples", "build/install all the examples");
 

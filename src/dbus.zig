@@ -6,20 +6,21 @@ pub const Address = address.Address;
 
 const log_dbus = std.log.scoped(.dbus);
 
-const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
 const zig_atleast_15_2 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 2 }) != .lt;
 
-pub const Writer = if (zig_atleast_15) std.Io.Writer else @import("0.14/Writer.zig");
-pub const Reader = if (zig_atleast_15) std.Io.Reader else @import("0.14/Reader.zig");
+const std15 = if (zig_atleast_15) std else @import("std15");
+pub const Stream15 = if (zig_atleast_15) std.net.Stream else std15.net.Stream15;
+pub const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;
 
-pub const SocketWriter = @import("socketwriter.zig").SocketWriter;
-pub const SocketReader = @import("socketreader.zig").Reader;
+pub const Writer = std15.Io.Writer;
+pub const Reader = std15.Io.Reader;
 
-pub fn socketWriter(stream: std.net.Stream, buffer: []u8) SocketWriter {
+pub fn socketWriter(stream: std.net.Stream, buffer: []u8) Stream15.Writer {
     if (zig_atleast_15) return stream.writer(buffer);
     return .init(stream, buffer);
 }
-pub fn socketReader(stream: std.net.Stream, buffer: []u8) SocketReader {
+pub fn socketReader(stream: std.net.Stream, buffer: []u8) Stream15.Reader {
     if (zig_atleast_15) return stream.reader(buffer);
     return .init(stream, buffer);
 }

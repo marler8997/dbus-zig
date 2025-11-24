@@ -3,6 +3,9 @@ const os = std.os;
 
 const dbus = @import("dbus");
 
+pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+const align8 = if (zig_atleast_15) .@"8" else 8;
+
 pub fn main() !u8 {
     const path = "/tmp/dbus-test";
 
@@ -160,7 +163,7 @@ const DataSockHandler = struct {
     base: EpollHandler = .{ .handle = handle },
     allocator: std.mem.Allocator,
     sock: std.posix.socket_t,
-    partial: std.ArrayListAlignedUnmanaged(u8, 8) = .{},
+    partial: std.ArrayListAlignedUnmanaged(u8, align8) = .{},
     state: union(enum) {
         start: void,
         auth: AuthState,
