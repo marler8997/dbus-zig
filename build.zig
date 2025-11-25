@@ -57,15 +57,65 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        b.installArtifact(exe);
+        const install = b.addInstallArtifact(exe, .{});
 
         const run_cmd = b.addRunArtifact(exe);
-        run_cmd.step.dependOn(b.getInstallStep());
+        run_cmd.step.dependOn(&install.step);
         if (b.args) |args| {
             run_cmd.addArgs(args);
         }
 
         const run_step = b.step("daemon", "Run the app");
         run_step.dependOn(&run_cmd.step);
+    }
+
+    const dbusc = blk: {
+        const exe = b.addExecutable(.{
+            .name = "dbusc",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/dbusc.zig"),
+                .target = target,
+                .optimize = mode,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "dbus", .module = dbus_module },
+                },
+            }),
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        b.step("install-dbusc", "").dependOn(&install.step);
+
+        const run_cmd = b.addRunArtifact(exe);
+        run_cmd.step.dependOn(&install.step);
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+
+        const run_step = b.step("dbusc", "Run the cli tool");
+        run_step.dependOn(&run_cmd.step);
+        break :blk exe;
+    };
+
+    const test_step = b.step("test", "");
+
+    {
+        const run = b.addRunArtifact(dbusc);
+        run.addArg("call");
+        run.addArg("org.freedesktop.DBus");
+        run.addArg("/org/freedesktop/DBus");
+        run.addArg("org.freedesktop.DBus.ListNames");
+        run.addArg("");
+        b.step("test-list-names", "").dependOn(&run.step);
+        test_step.dependOn(&run.step);
+    }
+    {
+        const run = b.addRunArtifact(dbusc);
+        run.addArg("call");
+        run.addArg("org.freedesktop.DBus");
+        run.addArg("/org/freedesktop/DBus");
+        run.addArg("org.freedesktop.DBus.Debug.Stats.GetStats");
+        run.addArg("");
+        b.step("test-get-stats", "").dependOn(&run.step);
+        test_step.dependOn(&run.step);
     }
 }

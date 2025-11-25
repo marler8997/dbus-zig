@@ -169,8 +169,8 @@ pub const MessageFlags = packed struct(u8) {
     reserved2: u4,
 };
 
-const native_endian = builtin.cpu.arch.endian();
-const endian_header_value = switch (native_endian) {
+pub const native_endian = builtin.cpu.arch.endian();
+pub const endian_header_value = switch (native_endian) {
     .big => 'B',
     .little => 'l',
 };
@@ -195,6 +195,13 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
         ptr: Ptr,
         len: LenType,
 
+        pub fn init(slice: NativeSlice) ?@This() {
+            return .{
+                .ptr = slice.ptr,
+                .len = std.math.cast(LenType, slice.len) orelse return null,
+            };
+        }
+
         pub fn initStatic(comptime ct_slice: NativeSlice) @This() {
             return .{ .ptr = ct_slice.ptr, .len = @intCast(ct_slice.len) };
         }
@@ -210,7 +217,7 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
         pub const format = switch (@typeInfo(Ptr).pointer.child) {
             u8 => (struct {
                 pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-                fn formatNew(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+                fn formatNew(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
                     try writer.writeAll(self.ptr[0..self.len]);
                 }
                 fn formatLegacy(
@@ -253,6 +260,7 @@ const HeaderFieldStringKind = enum(u8) {
     error_name = 4,
     destination = 6,
     sender = 7,
+    sig = 8,
 
     pub fn signature(kind: HeaderFieldStringKind) HeaderFieldSignature {
         return switch (kind) {
@@ -263,6 +271,7 @@ const HeaderFieldStringKind = enum(u8) {
             .destination,
             .sender,
             => .string,
+            .sig => .signature,
         };
     }
 };
@@ -343,19 +352,19 @@ fn Pad(comptime align_to: comptime_int) type {
     };
 }
 /// Returns the padding needed to align the given len.
-fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
+pub fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
     return (0 -% len) & (align_to - 1);
 }
 
 // Returns the padding needed to align the given content len to 4-bytes.
 // Note that it returns 0 for values already 4-byte aligned.
-fn pad4Len(len: u2) u2 {
+pub fn pad4Len(len: u2) u2 {
     return padLen(4, len);
 }
 
 // Returns the padding needed to align the given content len to 8-bytes.
 // Note that it returns 0 for values already 8-byte aligned.
-fn pad8Len(len: u3) u3 {
+pub fn pad8Len(len: u3) u3 {
     return padLen(8, len);
 }
 test pad8Len {
@@ -466,7 +475,7 @@ fn calcBodyLen(comptime signature: []const Type, body: *const Body(signature)) e
     return total_len;
 }
 
-pub fn flushAuth(writer: *Writer) Writer.Error!void {
+pub fn flushAuth(writer: *Writer) error{WriteFailed}!void {
     var auth_buf: [100]u8 = undefined;
     const auth_len = serializeAuth(&auth_buf, if (zig_atleast_15)
         std.posix.system.getuid()
@@ -538,12 +547,12 @@ fn calcHeaderStringLen(header_align: *u3, str: Slice(u32, [*]const u8)) u32 {
     header_align.* +%= @truncate(string_len);
     return string_len;
 }
-fn writeHeaderString(
+pub fn writeHeaderString(
     writer: *Writer,
     header_align: *u3,
     kind: HeaderFieldStringKind,
     str: Slice(u32, [*]const u8),
-) Writer.Error!void {
+) error{WriteFailed}!void {
     const pad_len = pad8Len(header_align.*);
     var buf: [8]u8 = undefined;
     buf[0] = @intFromEnum(kind);
@@ -563,12 +572,42 @@ fn writeHeaderString(
     header_align.* +%= @truncate(string_len);
 }
 
+fn calcHeaderSigLen(header_align: *u3, sig: Slice(u8, [*]const u8)) u32 {
+    const pad_len = pad8Len(header_align.*);
+    const sig_len: u32 = @as(u32, pad_len) + 5 + @as(u32, sig.len) + 1;
+    header_align.* +%= @truncate(sig_len);
+    return sig_len;
+}
+pub fn writeHeaderSig(
+    writer: *Writer,
+    header_align: *u3,
+    sig: Slice(u8, [*]const u8),
+) error{WriteFailed}!void {
+    const pad_len = pad8Len(header_align.*);
+    const pad_buf = [1]u8{0} ** 8;
+    var data = [_][]const u8{
+        pad_buf[0..pad_len],
+        &.{
+            @intFromEnum(HeaderFieldStringKind.sig),
+            1, // type-sig length
+            'g', // signature type
+            0, // type-sig null terminator
+            sig.len,
+        },
+        sig.nativeSlice(),
+        &[_]u8{0},
+    };
+    try writer.writeVecAll(&data);
+    const total_len: u32 = @as(u32, pad_len) + 5 + @as(u32, sig.len) + 1;
+    header_align.* +%= @truncate(total_len);
+}
+
 pub fn writeMethodCall(
     writer: *Writer,
     comptime signature: []const Type,
     args: MethodCall,
     body: Body(signature),
-) (error{BodyTooBig} || Writer.Error)!void {
+) (error{BodyTooBig} || error{WriteFailed})!void {
     const body_len = try calcBodyLen(signature, &body);
     const array_data_len = args.calcHeaderArrayLen();
     try writer.writeAll(&[_]u8{
@@ -600,13 +639,15 @@ pub const MethodCall = struct {
     destination: ?Slice(u32, [*]const u8) = null,
     interface: ?Slice(u32, [*]const u8) = null,
     member: ?Slice(u32, [*]const u8) = null,
+    signature: ?Slice(u8, [*]const u8),
     pub fn calcHeaderArrayLen(self: *const MethodCall) u32 {
         var header_align: u3 = 0;
         const path_len = calcHeaderStringLen(&header_align, self.path);
         const dest_len = if (self.destination) |s| calcHeaderStringLen(&header_align, s) else 0;
         const iface_len = if (self.interface) |s| calcHeaderStringLen(&header_align, s) else 0;
         const member_len = if (self.member) |s| calcHeaderStringLen(&header_align, s) else 0;
-        return path_len + dest_len + iface_len + member_len;
+        const sig_len = if (self.signature) |s| calcHeaderSigLen(&header_align, s) else 0;
+        return path_len + dest_len + iface_len + member_len + sig_len;
     }
 };
 
@@ -624,7 +665,7 @@ fn Bounded(comptime max: comptime_int) type {
         }
 
         pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-        pub fn formatNew(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        pub fn formatNew(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
             try writer.print("{s}", .{self.sliceConst()});
         }
         pub fn formatLegacy(
@@ -688,35 +729,6 @@ const BoundedString = enum {
     destination,
     sender,
     signature,
-};
-
-const TypeNe = enum(u8) {
-    string = 's',
-    boolean = 'b',
-    // path = 1,
-    // interface = 2,
-    // member = 3,
-    // error_name = 4,
-    // reply_serial = 5,
-    // destination = 6,
-    // sender = 7,
-    // signature = 8,
-    // unix_fds = 9,
-    _,
-    pub fn expectedSignature(self: HeaderFieldKindNe) ?HeaderFieldSignature {
-        return switch (self) {
-            .path => .object_path,
-            .interface => .string,
-            .member => .string,
-            .error_name => .string,
-            .reply_serial => .u32,
-            .destination => .string,
-            .sender => .string,
-            .signature => .signature,
-            .unix_fds => .u32,
-            _ => null,
-        };
-    }
 };
 
 pub const HeaderFieldIterator = struct {
@@ -931,21 +943,30 @@ pub const BodyIterator = struct {
     bytes_read: u32 = 0,
     sig_offset: u32 = 0,
 
-    pending_string: ?u32 = null,
+    pending: ?Pending = null,
+    // pending_string: ?u32 = null,
+    const Pending = union(enum) {
+        string: u32,
+        array: u32,
+    };
 
     pub const Value = union(enum) {
         string: struct { len: u32 },
+        array: struct { size: u32 },
         boolean: bool,
     };
 
-    pub fn notifyStringConsumed(it: *BodyIterator) void {
-        it.bytes_read += it.pending_string.? + 1;
-        it.pending_string = null;
+    pub fn notifyConsumed(it: *BodyIterator, kind: enum { string, array }) void {
+        it.bytes_read += switch (kind) {
+            .string => it.pending.?.string + 1,
+            .array => @panic("todo"),
+        };
+        it.pending = null;
     }
 
     pub fn next(it: *BodyIterator, reader: *Reader) (DbusProtocolError || Reader.Error)!?Value {
-        if (it.pending_string != null) {
-            @panic("notifyStringConsumed was not called");
+        if (it.pending != null) {
+            @panic("notifyConsumed was not called");
         }
 
         if (it.bytes_read >= it.body_len) {
@@ -961,9 +982,27 @@ pub const BodyIterator = struct {
             log_dbus.err("body has {} bytes left but signature has no types left", .{it.body_len - it.bytes_read});
             return error.DbusProtocol;
         }
-        const sig_type: TypeNe = @enumFromInt(it.signature[it.sig_offset]);
-        switch (sig_type) {
-            .string => {
+        switch (it.signature[it.sig_offset]) {
+            'a' => { // array
+                const pad_len = pad4Len(@truncate(it.bytes_read));
+                if (it.bytes_read + pad_len + 4 > it.body_len) {
+                    log_dbus.err("body truncated", .{});
+                    return error.DbusProtocol;
+                }
+                try reader.discardAll(pad_len);
+                it.bytes_read += pad_len;
+                const array_size = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                std.debug.assert(it.pending == null);
+                if (it.bytes_read + array_size > it.body_len) {
+                    log_dbus.err("body truncated", .{});
+                    return error.DbusProtocol;
+                }
+                it.pending = .{ .array = array_size };
+                it.sig_offset += 1;
+                return .{ .array = .{ .size = array_size } };
+            },
+            's' => { // string
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
                     log_dbus.err("body truncated", .{});
@@ -973,16 +1012,16 @@ pub const BodyIterator = struct {
                 it.bytes_read += pad_len;
                 const string_len = try reader.takeInt(u32, it.endian);
                 it.bytes_read += 4;
-                std.debug.assert(it.pending_string == null);
+                std.debug.assert(it.pending == null);
                 if (it.bytes_read + string_len > it.body_len) {
                     log_dbus.err("body truncated", .{});
                     return error.DbusProtocol;
                 }
-                it.pending_string = string_len;
+                it.pending = .{ .string = string_len };
                 it.sig_offset += 1;
                 return .{ .string = .{ .len = string_len } };
             },
-            .boolean => {
+            'b' => { // bool
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
                     log_dbus.err("body truncated", .{});
@@ -1002,7 +1041,7 @@ pub const BodyIterator = struct {
                     },
                 } };
             },
-            _ => std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{@intFromEnum(sig_type)}),
+            else => |ch| std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{ch}),
         }
     }
 };
@@ -1023,89 +1062,61 @@ pub const Fixed = struct {
         try reader.discardAll(fixed.body_len);
     }
 
-    pub fn readAndLog(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!void {
-        const headers = try fixed.readAndLogHeaders(reader);
+    pub fn stream(fixed: *const Fixed, reader: *Reader, writer: *Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
+        const headers = try fixed.streamHeaders(reader, writer);
         std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
-        try fixed.readAndLogBody(reader, headers.signatureSlice());
+        try streamBody(reader, writer, fixed.endian, headers.signatureSlice(), fixed.body_len);
     }
 
-    pub fn readAndLogHeaders(fixed: *const Fixed, reader: *Reader) (DbusProtocolError || Reader.Error)!DynamicHeaders(null) {
+    pub fn streamHeaders(fixed: *const Fixed, reader: *Reader, writer: *Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!DynamicHeaders(null) {
         var path_buf: [1000]u8 = undefined;
         const headers = try fixed.readHeaders(reader, &path_buf);
-        std.log.info("DBUS {s}:", .{@tagName(fixed.type)});
+        try writer.print("DBUS {s}:\n", .{@tagName(fixed.type)});
         if (headers.path) |*path| {
             if (path.len > path_buf.len) {
-                std.log.info("  path '{s}' (truncated from {} bytes to {})", .{ path_buf[0..path.len], path.len, path_buf.len });
+                try writer.print("  path '{s}' (truncated from {} bytes to {})\n", .{ path_buf[0..path.len], path.len, path_buf.len });
             } else {
-                std.log.info("  path '{s}'", .{path_buf[0..path.len]});
+                try writer.print("  path '{s}'\n", .{path_buf[0..path.len]});
             }
         } else {
-            std.log.info("  path (none)", .{});
+            try writer.writeAll("  path (none)\n");
         }
         if (headers.interface) |interface| {
-            std.log.info("  interface '{f}'", .{interface});
+            try writer.print("  interface '{f}'\n", .{interface});
         } else {
-            std.log.info("  interface (none)", .{});
+            try writer.writeAll("  interface (none)\n");
         }
         if (headers.member) |member| {
-            std.log.info("  member '{f}'", .{member});
+            try writer.print("  member '{f}'\n", .{member});
         } else {
-            std.log.info("  member (none)", .{});
+            try writer.writeAll("  member (none)\n");
         }
         if (headers.error_name) |error_name| {
-            std.log.info("  error_name '{f}'", .{error_name});
+            try writer.print("  error_name '{f}'\n", .{error_name});
         } else {
-            std.log.info("  error_name (none)", .{});
+            try writer.writeAll("  error_name (none)\n");
         }
         if (headers.reply_serial) |reply_serial| {
-            std.log.info("  reply_serial '{d}'", .{reply_serial});
+            try writer.print("  reply_serial '{d}'\n", .{reply_serial});
         } else {
-            std.log.info("  reply_serial (none)", .{});
+            try writer.writeAll("  reply_serial (none)\n");
         }
         if (headers.destination) |destination| {
-            std.log.info("  destination '{f}'", .{destination});
+            try writer.print("  destination '{f}'\n", .{destination});
         } else {
-            std.log.info("  destination (none)", .{});
+            try writer.writeAll("  destination (none)\n");
         }
         if (headers.sender) |sender| {
-            std.log.info("  sender '{f}'", .{sender});
+            try writer.print("  sender '{f}'\n", .{sender});
         } else {
-            std.log.info("  sender (none)", .{});
+            try writer.writeAll("  sender (none)\n");
         }
         if (headers.signature) |signature| {
-            std.log.info("  signature '{f}'", .{signature});
+            try writer.print("  signature '{f}'\n", .{signature});
         } else {
-            std.log.info("  signature (none)", .{});
+            try writer.writeAll("  signature (none)\n");
         }
         return headers;
-    }
-    pub fn readAndLogBody(fixed: *const Fixed, reader: *Reader, signature: []const u8) (DbusProtocolError || Reader.Error)!void {
-        var it: BodyIterator = .{
-            .endian = fixed.endian,
-            .body_len = fixed.body_len,
-            .signature = signature,
-        };
-        while (try it.next(reader)) |value| switch (value) {
-            .string => |string| {
-                std.log.info("  string ({} bytes)", .{string.len});
-                const hex_ascii_width = 16;
-                var string_buf: [hex_ascii_width]u8 = undefined;
-                var remaining: u32 = string.len;
-                while (remaining > 0) {
-                    const consume_len = @min(string_buf.len, remaining);
-                    try reader.readSliceAll(string_buf[0..consume_len]);
-                    std.log.info("  {f}", .{fmtHexAscii(string_buf[0..consume_len], .{
-                        .width = hex_ascii_width,
-                    })});
-                    remaining -= consume_len;
-                }
-                try consumeStringNullTerm(reader);
-                it.notifyStringConsumed();
-            },
-            .boolean => |b| {
-                std.log.info("  boolean {}", .{b});
-            },
-        };
     }
 
     pub fn readMethodReturnHeaders(
@@ -1123,6 +1134,33 @@ pub const Fixed = struct {
             .error_name = headers.error_name,
             .reply_serial = headers.reply_serial orelse {
                 log_dbus.err("method return missing reply_serial", .{});
+                return error.DbusProtocol;
+            },
+            .destination = headers.destination,
+            .sender = headers.sender,
+            .signature = headers.signature,
+            .unix_fds = headers.unix_fds,
+        };
+    }
+
+    pub fn readErrorHeaders(
+        fixed: *const Fixed,
+        reader: *Reader,
+        path_buf: []u8,
+    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(.error_reply) {
+        std.debug.assert(fixed.type == .error_reply);
+        const headers = try fixed.readHeaders(reader, path_buf);
+        return .{
+            .unknown_header_count = headers.unknown_header_count,
+            .path = headers.path,
+            .interface = headers.interface,
+            .member = headers.member,
+            .error_name = headers.error_name orelse {
+                log_dbus.err("error reply missing error_name", .{});
+                return error.DbusProtocol;
+            },
+            .reply_serial = headers.reply_serial orelse {
+                log_dbus.err("error reply missing reply_serial", .{});
                 return error.DbusProtocol;
             },
             .destination = headers.destination,
@@ -1259,6 +1297,225 @@ pub fn readFixed(reader: *Reader) (DbusProtocolError || Reader.Error)!Fixed {
     };
 }
 
+fn sum(comptime T: type, values: []const T) T {
+    var total: T = 0;
+    for (values) |value| {
+        total += @as(T, value);
+    }
+    return total;
+}
+
+/// Returns the end index of a single type starting at `offset`.
+/// A complete type is one of:
+/// - A basic type: y, b, n, q, i, u, x, t, d, s, o, g, h
+/// - A variant: v
+/// - An array: a followed by a single complete type or dict entry
+///      - a dict entry {kv} where k is a basic type and v is a complete type (only valid as an array element)
+/// - A struct: (...) containing zero or more complete types
+fn scanType(sig: []const u8, offset: usize) ?usize {
+    if (offset >= sig.len) return null;
+    return switch (sig[offset]) {
+        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => offset + 1,
+        'a' => { // array
+            if (offset + 1 >= sig.len) return null;
+            if (sig[offset + 1] == '{') {
+                if (offset + 2 >= sig.len) return null;
+                // key must be a basic type (not container nor variant)
+                switch (sig[offset + 2]) {
+                    'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h' => {},
+                    else => return null,
+                }
+                const after_value = scanType(sig, offset + 3) orelse return null;
+                if (after_value >= sig.len) return null;
+                if (sig[after_value] != '}') return null;
+                return after_value + 1;
+            }
+            return scanType(sig, offset + 1);
+        },
+        '(' => { // struct
+            var pos = offset + 1;
+            if (pos >= sig.len or sig[pos] == ')') return null;
+            while (pos < sig.len and sig[pos] != ')') {
+                pos = scanType(sig, pos) orelse return null;
+            }
+            if (pos >= sig.len or sig[pos] != ')') return null;
+            return pos + 1;
+        },
+        else => null,
+    };
+}
+
+pub fn streamBody(
+    reader: *Reader,
+    writer: *Writer,
+    endian: std.builtin.Endian,
+    signature: []const u8,
+    body_size: u32,
+) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
+    const len = try streamBody2(reader, writer, endian, signature, body_size, 0);
+    std.debug.assert(len <= body_size);
+    if (len != body_size) return error.DbusProtocol;
+}
+pub fn streamBody2(
+    reader: *Reader,
+    writer: *Writer,
+    endian: std.builtin.Endian,
+    signature: []const u8,
+    limit: u32,
+    start: u32,
+) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!u32 {
+    var offset = start;
+    var sig_index: usize = 0;
+    while (true) {
+        if (sig_index >= signature.len) {
+            std.debug.assert(sig_index == signature.len);
+            return offset;
+        }
+        const type_end = scanType(signature, sig_index) orelse return error.DbusProtocol;
+        std.debug.assert(type_end > sig_index);
+        std.debug.assert(type_end <= signature.len);
+        const type_sig = signature[sig_index..type_end];
+        sig_index = type_end;
+
+        switch (type_sig[0]) {
+            'u' => {
+                const pad_len = pad4Len(@truncate(offset));
+                if (sum(u64, &.{ offset, pad_len, 4 }) > limit)
+                    return error.DbusProtocol;
+                try reader.discardAll(pad_len);
+                offset += pad_len;
+                const value = try reader.takeInt(u32, endian);
+                offset += 4;
+                try writer.print("<u32>{d}</u32>", .{value});
+            },
+            's' => {
+                const pad_len = pad4Len(@truncate(offset));
+                if (sum(u64, &.{ offset, pad_len, 4 }) > limit)
+                    return error.DbusProtocol;
+                try reader.discardAll(pad_len);
+                offset += pad_len;
+                const string_len = try reader.takeInt(u32, endian);
+                offset += 4;
+                if (sum(u64, &.{ offset, string_len }) > limit)
+                    return error.DbusProtocol;
+                try writer.print("<string size=\"{}\">", .{string_len});
+                try reader.streamExact(writer, string_len);
+                offset += string_len;
+                try reader.discardAll(1);
+                offset += 1;
+                try writer.writeAll("</string>");
+            },
+            'a' => {
+                const pad_len = pad4Len(@truncate(offset));
+                if (sum(u64, &.{ offset, pad_len, 4 }) > limit)
+                    return error.DbusProtocol;
+                try reader.discardAll(pad_len);
+                offset += pad_len;
+                const array_size = try reader.takeInt(u32, endian);
+                offset += 4;
+                const initial_pad_len = switch (type_sig[1]) {
+                    'x', 't', 'd', '(', '{' => pad8Len(@truncate(offset)),
+                    else => 0,
+                };
+                const array_limit_u64 = sum(u64, &.{ offset, initial_pad_len, array_size });
+                if (array_limit_u64 > limit) return error.DbusProtocol;
+                const array_limit: u32 = @intCast(array_limit_u64);
+                try writer.print("<array size=\"{}\">", .{array_size});
+                while (offset < array_limit) {
+                    offset = try streamBodyArrayElement(
+                        reader,
+                        writer,
+                        endian,
+                        type_sig[1..],
+                        array_limit,
+                        offset,
+                    );
+                }
+                std.debug.assert(offset == array_limit);
+                try writer.writeAll("</array>");
+            },
+            'v' => {
+                if (offset + 1 > limit) return error.DbusProtocol;
+                const variant_sig_len = try reader.takeByte();
+                offset += 1;
+                if (sum(u64, &.{ offset, variant_sig_len, 1 }) > limit)
+                    return error.DbusProtocol;
+                var variant_sig_buf: [255]u8 = undefined;
+                const variant_sig = variant_sig_buf[0..variant_sig_len];
+                try reader.readSliceAll(variant_sig);
+                offset += variant_sig_len;
+                const nullterm = try reader.takeByte();
+                offset += 1;
+                if (nullterm != 0) return error.DbusProtocol;
+
+                if (scanType(variant_sig, 0)) |end| {
+                    if (end != variant_sig.len) {
+                        std.log.err("invalid variant type sig '{s}', it contains more than 1 type", .{variant_sig});
+                        return error.DbusProtocol;
+                    }
+                } else {
+                    std.log.err("variant type sig '{s}' is invalid", .{variant_sig});
+                    return error.DbusProtocol;
+                }
+
+                try writer.print("<variant sig=\"{s}\">", .{variant_sig});
+                offset = try streamBody2(reader, writer, endian, variant_sig, limit, offset);
+                try writer.writeAll("</variant>");
+            },
+            '{' => {
+                std.log.err("invalid signature, a dictionary may only appear as an array element type", .{});
+                return error.DbusProtocol;
+            },
+            else => |ch| {
+                std.log.err("unsupported or unknown type sig char '{c}' in streamBody", .{ch});
+                return error.DbusProtocol;
+            },
+        }
+    }
+}
+
+fn streamBodyArrayElement(
+    reader: *Reader,
+    writer: *Writer,
+    endian: std.builtin.Endian,
+    signature: []const u8,
+    limit: u32,
+    start: u32,
+) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!u32 {
+    if (signature.len == 0) return error.DbusProtocol;
+    if (signature[0] != '{') return streamBody2(reader, writer, endian, signature, limit, start);
+
+    if (signature.len < 4) return error.DbusProtocol;
+    const sig_key_end = scanType(signature, 1) orelse return error.DbusProtocol;
+    if (sig_key_end == signature.len) return error.DbusProtocol;
+    const sig_value_end = scanType(signature, sig_key_end) orelse return error.DbusProtocol;
+    if (sig_value_end == signature.len) return error.DbusProtocol;
+    if (signature[sig_value_end] != '}') return error.DbusProtocol;
+
+    const pad_len = pad8Len(@truncate(start));
+    try reader.discardAll(pad_len);
+    try writer.writeAll("<key>");
+    const after_key = try streamBody2(
+        reader,
+        writer,
+        endian,
+        signature[1..sig_key_end],
+        limit,
+        pad_len + start,
+    );
+    try writer.writeAll("</key><value>");
+    const after_value = try streamBody2(
+        reader,
+        writer,
+        endian,
+        signature[sig_key_end..sig_value_end],
+        limit,
+        after_key,
+    );
+    try writer.writeAll("</value>");
+    return after_value;
+}
+
 const MaybeMessageType = enum {
     none,
     method_call,
@@ -1325,7 +1582,7 @@ fn fmtHexAscii(data: []const u8, options: FmtHexAsciiOptions) struct {
     const Self = @This();
 
     pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-    fn formatNew(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn formatNew(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
         try self.formatCommon(writer);
     }
     fn formatLegacy(
