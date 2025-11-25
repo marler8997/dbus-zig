@@ -40,12 +40,14 @@ pub const BusAddressString = struct {
     str: []const u8,
 };
 
+pub const DBUS_SESSION_BUS_ADDRESS = "DBUS_SESSION_BUS_ADDRESS";
+
 pub fn getSystemBusAddress() Address {
     @panic("todo");
     //return std.os.getenv("DBUS_SYSTEM_BUS_ADDRESS") orelse default_system_bus_address;
 }
 pub fn getSessionBusAddressString() BusAddressString {
-    if (std.posix.getenv("DBUS_SESSION_BUS_ADDRESS")) |s|
+    if (std.posix.getenv(DBUS_SESSION_BUS_ADDRESS)) |s|
         return BusAddressString{ .origin = .environment_variable, .str = s };
     return BusAddressString{ .origin = .hardcoded_default, .str = default_system_bus_address_str };
 }
@@ -384,7 +386,7 @@ test pad8Len {
 //       they also must not contain OVERLONG sequences or exceed the value 0x10ffff
 pub const max_codepoint = 0x10ffff;
 
-pub const Type = enum {
+pub const Type = union(enum) {
     u8, // 'y'
     bool, // 'b'
     i16, // 'n'
@@ -398,6 +400,8 @@ pub const Type = enum {
     string,
     object_path, // a string that is also a "syntactically valid object path"
     signature, // zero or more "single complete types"
+    // @"struct",
+    array: *const Type, // 'a<TYPE>'
 
     pub fn Native(self: Type) type {
         return switch (self) {
@@ -464,7 +468,10 @@ fn calcBodyLen(comptime signature: []const Type, body: *const Body(signature)) e
 
 pub fn flushAuth(writer: *Writer) Writer.Error!void {
     var auth_buf: [100]u8 = undefined;
-    const auth_len = serializeAuth(&auth_buf, std.posix.system.getuid());
+    const auth_len = serializeAuth(&auth_buf, if (zig_atleast_15)
+        std.posix.system.getuid()
+    else
+        std.os.linux.getuid());
     const auth = auth_buf[0..auth_len];
     // if (zig_atleast_15)
     //     std.log.info("sending '{f}'", .{std.zig.fmtString(auth)})
