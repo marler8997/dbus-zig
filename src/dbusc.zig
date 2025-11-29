@@ -57,14 +57,13 @@ fn connect() !std.net.Stream {
     try writer.writeAll("BEGIN\r\n");
     try dbus.writeMethodCall(
         writer,
-        &[0]dbus.Type{},
+        "", // signature
         .{
             .serial = 1,
             .destination = .initStatic("org.freedesktop.DBus"),
             .path = .initStatic("/org/freedesktop/DBus"),
             .interface = .initStatic("org.freedesktop.DBus"),
             .member = .initStatic("Hello"),
-            .signature = null,
         },
         .{},
     );
@@ -161,9 +160,9 @@ fn call(call_args: []const Arg) !u8 {
         .path = dbus.Slice(u32, [*]const u8).init(path) orelse errExit("path too long", .{}),
         .interface = dbus.Slice(u32, [*]const u8).init(iface) orelse errExit("interface too long", .{}),
         .member = dbus.Slice(u32, [*]const u8).init(method) orelse errExit("method too long", .{}),
-        .signature = if (sig.len > 0) dbus.Slice(u8, [*]const u8).init(sig) orelse errExit("signature too long", .{}) else null,
     };
-    const array_data_len = method_call.calcHeaderArrayLen();
+    const sig_typed: ?dbus.Slice(u8, [*]const u8) = if (sig.len > 0) dbus.Slice(u8, [*]const u8).init(sig) orelse errExit("signature too long", .{}) else null;
+    const array_data_len = method_call.calcHeaderArrayLen(sig_typed);
     try writer.writeAll(&[_]u8{
         dbus.endian_header_value,
         @intFromEnum(dbus.MessageType.method_call), // 1
@@ -185,7 +184,7 @@ fn call(call_args: []const Arg) !u8 {
         try dbus.writeHeaderString(writer, &header_align, .member, m);
     }
     if (sig.len > 0) {
-        try dbus.writeHeaderSig(writer, &header_align, method_call.signature.?);
+        try dbus.writeHeaderSig(writer, &header_align, sig_typed.?);
     }
     try writer.splatByteAll(0, dbus.pad8Len(header_align));
 

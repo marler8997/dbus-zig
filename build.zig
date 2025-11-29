@@ -118,4 +118,25 @@ pub fn build(b: *std.Build) void {
         b.step("test-get-stats", "").dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
+
+    {
+        const exe = b.addExecutable(.{
+            .name = "dbustest",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/dbustest.zig"),
+                .target = target,
+                .optimize = mode,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "dbus", .module = dbus_module },
+                },
+            }),
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        b.step("install-dbustest", "").dependOn(&install.step);
+
+        const run = b.addRunArtifact(exe);
+        test_step.dependOn(&run.step);
+        b.step("dbustest", "").dependOn(&run.step);
+    }
 }

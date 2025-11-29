@@ -33,12 +33,11 @@ pub fn main() !u8 {
     try writer.writeAll("BEGIN\r\n");
     try dbus.writeMethodCall(
         writer,
-        &[0]dbus.Type{},
+        "",
         .{
             .serial = 1,
-            .path = .initStatic("/org/freedesktop/DBus"),
-            // TODO: do we need a destination?
             .destination = .initStatic("org.freedesktop.DBus"),
+            .path = .initStatic("/org/freedesktop/DBus"),
             .interface = .initStatic("org.freedesktop.DBus"),
             .member = .initStatic("Hello"),
         },
@@ -60,7 +59,10 @@ pub fn main() !u8 {
                     },
                     .signal => {
                         std.log.info("ignoring signal", .{});
-                        try fixed.readAndLog(reader);
+                        var stderr_buf: [1000]u8 = undefined;
+                        var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+                        try fixed.stream(reader, &stderr_file.interface);
+                        try stderr_file.interface.flush();
                     },
                 }
             }
@@ -78,7 +80,7 @@ pub fn main() !u8 {
                     if (string.len > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string.len});
                     try reader.readSliceAll(name_buf[0..string.len]);
                     try dbus.consumeStringNullTerm(reader);
-                    it.notifyStringConsumed();
+                    it.notifyConsumed(.string);
                     break :blk string.len;
                 },
                 else => |v| std.debug.panic("Hello unexpected type {s}", .{@tagName(v)}),
@@ -92,7 +94,7 @@ pub fn main() !u8 {
 
     try dbus.writeMethodCall(
         writer,
-        &[_]dbus.Type{}, // No arguments
+        "", // signature
         .{
             .serial = 2,
             .path = .initStatic("/org/freedesktop/portal/desktop"),
@@ -115,7 +117,10 @@ pub fn main() !u8 {
                     },
                     .signal => {
                         std.log.info("ignoring signal", .{});
-                        try fixed.readAndLog(reader);
+                        var stderr_buf: [1000]u8 = undefined;
+                        var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+                        try fixed.stream(reader, &stderr_file.interface);
+                        try stderr_file.interface.flush();
                     },
                 }
             }
@@ -140,7 +145,7 @@ pub fn main() !u8 {
                     remaining -= @intCast(slice.len);
                 }
                 try dbus.consumeStringNullTerm(reader);
-                it.notifyStringConsumed();
+                it.notifyConsumed(.string);
             },
             else => |v| std.debug.panic("Introspect unexpected type {s}", .{@tagName(v)}),
         }
