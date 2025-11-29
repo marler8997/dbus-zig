@@ -32,8 +32,12 @@ pub const default_system_bus_address_str = "unix:path=" ++ default_system_bus_pa
 //};
 
 // This maximum length applies to bus names, interfaces and members
-pub const max_name = 255;
+pub const max_name = std.math.maxInt(u8);
 pub const max_sig = 255;
+
+pub fn castNameLen(len: u32) ?u8 {
+    return std.math.cast(u8, len);
+}
 
 pub const BusAddressString = struct {
     origin: enum { hardcoded_default, environment_variable },
@@ -200,6 +204,10 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
                 .ptr = slice.ptr,
                 .len = std.math.cast(LenType, slice.len) orelse return null,
             };
+        }
+
+        pub fn initAssume(slice: NativeSlice) @This() {
+            return .{ .ptr = slice.ptr, .len = @intCast(slice.len) };
         }
 
         pub fn initStatic(comptime ct_slice: NativeSlice) @This() {
@@ -1063,67 +1071,19 @@ pub const Fixed = struct {
     }
 
     pub fn stream(fixed: *const Fixed, reader: *Reader, writer: *Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
-        const headers = try fixed.streamHeaders(reader, writer);
-        std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
-        try streamBody(reader, writer, fixed.endian, headers.signatureSlice(), fixed.body_len);
-    }
-
-    pub fn streamHeaders(fixed: *const Fixed, reader: *Reader, writer: *Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!DynamicHeaders(null) {
+        try writer.print("DBUS {s}:\n", .{@tagName(fixed.type)});
         var path_buf: [1000]u8 = undefined;
         const headers = try fixed.readHeaders(reader, &path_buf);
-        try writer.print("DBUS {s}:\n", .{@tagName(fixed.type)});
-        if (headers.path) |*path| {
-            if (path.len > path_buf.len) {
-                try writer.print("  path '{s}' (truncated from {} bytes to {})\n", .{ path_buf[0..path.len], path.len, path_buf.len });
-            } else {
-                try writer.print("  path '{s}'\n", .{path_buf[0..path.len]});
-            }
-        } else {
-            try writer.writeAll("  path (none)\n");
-        }
-        if (headers.interface) |interface| {
-            try writer.print("  interface '{f}'\n", .{interface});
-        } else {
-            try writer.writeAll("  interface (none)\n");
-        }
-        if (headers.member) |member| {
-            try writer.print("  member '{f}'\n", .{member});
-        } else {
-            try writer.writeAll("  member (none)\n");
-        }
-        if (headers.error_name) |error_name| {
-            try writer.print("  error_name '{f}'\n", .{error_name});
-        } else {
-            try writer.writeAll("  error_name (none)\n");
-        }
-        if (headers.reply_serial) |reply_serial| {
-            try writer.print("  reply_serial '{d}'\n", .{reply_serial});
-        } else {
-            try writer.writeAll("  reply_serial (none)\n");
-        }
-        if (headers.destination) |destination| {
-            try writer.print("  destination '{f}'\n", .{destination});
-        } else {
-            try writer.writeAll("  destination (none)\n");
-        }
-        if (headers.sender) |sender| {
-            try writer.print("  sender '{f}'\n", .{sender});
-        } else {
-            try writer.writeAll("  sender (none)\n");
-        }
-        if (headers.signature) |signature| {
-            try writer.print("  signature '{f}'\n", .{signature});
-        } else {
-            try writer.writeAll("  signature (none)\n");
-        }
-        return headers;
+        try writeHeaders(writer, &path_buf, headers);
+        std.log.info("  --- body ({} bytes) ---", .{fixed.body_len});
+        try streamBody(reader, writer, fixed.endian, headers.signatureSlice(), fixed.body_len);
     }
 
     pub fn readMethodReturnHeaders(
         fixed: *const Fixed,
         reader: *Reader,
         path_buf: []u8,
-    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(.method_return) {
+    ) error{ DbusProtocol, ReadFailed, EndOfStream }!DynamicHeaders(.method_return) {
         std.debug.assert(fixed.type == .method_return);
         const headers = try fixed.readHeaders(reader, path_buf);
         return .{
@@ -1143,11 +1103,38 @@ pub const Fixed = struct {
         };
     }
 
+    pub fn readMethodCallHeaders(
+        fixed: *const Fixed,
+        reader: *Reader,
+        path_buf: []u8,
+    ) error{ DbusProtocol, ReadFailed, EndOfStream }!DynamicHeaders(.method_call) {
+        std.debug.assert(fixed.type == .method_call);
+        const headers = try fixed.readHeaders(reader, path_buf);
+        return .{
+            .unknown_header_count = headers.unknown_header_count,
+            .path = headers.path orelse {
+                log_dbus.err("method call missing path", .{});
+                return error.DbusProtocol;
+            },
+            .interface = headers.interface,
+            .member = headers.member orelse {
+                log_dbus.err("method call missing member", .{});
+                return error.DbusProtocol;
+            },
+            .error_name = headers.error_name,
+            .reply_serial = headers.reply_serial,
+            .destination = headers.destination,
+            .sender = headers.sender,
+            .signature = headers.signature,
+            .unix_fds = headers.unix_fds,
+        };
+    }
+
     pub fn readErrorHeaders(
         fixed: *const Fixed,
         reader: *Reader,
         path_buf: []u8,
-    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(.error_reply) {
+    ) error{ DbusProtocol, ReadFailed, EndOfStream }!DynamicHeaders(.error_reply) {
         std.debug.assert(fixed.type == .error_reply);
         const headers = try fixed.readHeaders(reader, path_buf);
         return .{
@@ -1174,7 +1161,7 @@ pub const Fixed = struct {
         fixed: *const Fixed,
         reader: *Reader,
         path_buf: []u8,
-    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(.signal) {
+    ) error{ DbusProtocol, ReadFailed, EndOfStream }!DynamicHeaders(.signal) {
         std.debug.assert(fixed.type == .signal);
         const headers = try fixed.readHeaders(reader, path_buf);
         return .{
@@ -1204,7 +1191,7 @@ pub const Fixed = struct {
         fixed: *const Fixed,
         reader: *Reader,
         path_buf: []u8,
-    ) (DbusProtocolError || Reader.Error)!DynamicHeaders(null) {
+    ) error{ DbusProtocol, ReadFailed, EndOfStream }!DynamicHeaders(null) {
         var headers: DynamicHeaders(null) = .{
             .path = null,
             .interface = null,
@@ -1259,6 +1246,57 @@ pub const Fixed = struct {
         return headers;
     }
 };
+
+pub fn writeHeaders(
+    writer: *Writer,
+    path_buf: []const u8,
+    headers: DynamicHeaders(null),
+) error{WriteFailed}!void {
+    if (headers.path) |*path| {
+        if (path.len > path_buf.len) {
+            try writer.print("  path '{s}' (truncated from {} bytes to {})\n", .{ path_buf[0..path.len], path.len, path_buf.len });
+        } else {
+            try writer.print("  path '{s}'\n", .{path_buf[0..path.len]});
+        }
+    } else {
+        try writer.writeAll("  path (none)\n");
+    }
+    if (headers.interface) |interface| {
+        try writer.print("  interface '{f}'\n", .{interface});
+    } else {
+        try writer.writeAll("  interface (none)\n");
+    }
+    if (headers.member) |member| {
+        try writer.print("  member '{f}'\n", .{member});
+    } else {
+        try writer.writeAll("  member (none)\n");
+    }
+    if (headers.error_name) |error_name| {
+        try writer.print("  error_name '{f}'\n", .{error_name});
+    } else {
+        try writer.writeAll("  error_name (none)\n");
+    }
+    if (headers.reply_serial) |reply_serial| {
+        try writer.print("  reply_serial '{d}'\n", .{reply_serial});
+    } else {
+        try writer.writeAll("  reply_serial (none)\n");
+    }
+    if (headers.destination) |destination| {
+        try writer.print("  destination '{f}'\n", .{destination});
+    } else {
+        try writer.writeAll("  destination (none)\n");
+    }
+    if (headers.sender) |sender| {
+        try writer.print("  sender '{f}'\n", .{sender});
+    } else {
+        try writer.writeAll("  sender (none)\n");
+    }
+    if (headers.signature) |signature| {
+        try writer.print("  signature '{f}'\n", .{signature});
+    } else {
+        try writer.writeAll("  signature (none)\n");
+    }
+}
 
 pub fn readFixed(reader: *Reader) (DbusProtocolError || Reader.Error)!Fixed {
     const bytes = try reader.takeArray(16);
@@ -1568,6 +1606,21 @@ fn DynamicHeaders(comptime message_type: ?MessageType) type {
         const Self = @This();
         pub fn signatureSlice(self: *const Self) []const u8 {
             return if (self.signature) |*s| s.sliceConst() else "";
+        }
+
+        pub fn asGeneric(self: *const Self) DynamicHeaders(null) {
+            return .{
+                .unknown_header_count = self.unknown_header_count,
+                .path = self.path,
+                .interface = self.interface,
+                .member = self.member,
+                .error_name = self.error_name,
+                .reply_serial = self.reply_serial,
+                .destination = self.destination,
+                .sender = self.sender,
+                .signature = self.signature,
+                .unix_fds = self.unix_fds,
+            };
         }
     };
 }
