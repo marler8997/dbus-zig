@@ -1,11 +1,14 @@
 const State = struct {
-    next_service_serial: u32,
+    service_name: dbus.Slice(u32, [*]const u8),
+    client_serial: u32,
+    service_serial: u32,
     client: ClientState,
 };
 
 const ClientState = enum {
     sent_echo,
-    got_echo,
+    sent_echou32,
+    done,
 };
 
 pub fn main() !void {
@@ -25,31 +28,23 @@ pub fn main() !void {
     const client_name = client_name_buf[0..client_name_len];
     std.log.info("ClientName '{s}'", .{client_name});
 
-    {
-        var write_buf: [1000]u8 = undefined;
-        var socket_writer = dbus.socketWriter(client_stream, &write_buf);
-        try dbus.writeMethodCall(
-            &socket_writer.interface,
-            "", // signature
-            .{
-                .serial = 2,
-                .destination = .{ .ptr = &service_name_buf, .len = service_name_len },
-                .path = .initStatic("/"),
-                .member = .initStatic("Echo"),
-            },
-            .{},
-        );
-        try socket_writer.interface.flush();
-    }
-
     var state: State = .{
-        .next_service_serial = 2,
+        .service_name = .{ .ptr = &service_name_buf, .len = service_name_len },
+        .client_serial = 2,
+        .service_serial = 2,
         .client = .sent_echo,
     };
 
+    try writeMethodCall(
+        client_stream,
+        .{ .ptr = &service_name_buf, .len = service_name_len },
+        .Echo,
+        &state.client_serial,
+    );
+
     while (switch (state.client) {
-        .sent_echo => true,
-        .got_echo => false,
+        .sent_echo, .sent_echou32 => true,
+        .done => false,
     }) {
         try handleEvent(&state, service_stream, client_stream);
     }
@@ -192,7 +187,7 @@ fn handleServiceMessage(state: *State, stream: std.net.Stream) !void {
     var socket_reader = dbus.socketReader(stream, &read_buf);
     const reader = socket_reader.interface();
     const fixed = try dbus.readFixed(reader);
-    const sender, const method = blk: switch (fixed.type) {
+    const sender, const method, const signature = blk: switch (fixed.type) {
         .method_call => {
             std.log.info("Service received method call {}", .{fixed});
             var path_buf: [1000]u8 = undefined;
@@ -208,7 +203,7 @@ fn handleServiceMessage(state: *State, stream: std.net.Stream) !void {
             var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
             try dbus.writeHeaders(&stderr_writer.interface, &path_buf, headers.asGeneric());
             try stderr_writer.interface.flush();
-            break :blk .{ headers.sender.?, headers.member };
+            break :blk .{ headers.sender.?, headers.member, headers.signature };
         },
         .method_return => @panic("service received unexpected method return"),
         .error_reply => {
@@ -223,16 +218,16 @@ fn handleServiceMessage(state: *State, stream: std.net.Stream) !void {
         },
     };
 
-    std.debug.assert(reader.seek == reader.end);
-
     if (std.mem.eql(u8, method.sliceConst(), "Echo")) {
+        std.debug.assert(signature == null);
+        std.debug.assert(reader.seek == reader.end);
         var write_buf: [1000]u8 = undefined;
         var socket_writer = dbus.socketWriter(stream, &write_buf);
         try dbus.writeMethodReturn(
             &socket_writer.interface,
             "",
             .{
-                .serial = state.next_service_serial,
+                .serial = state.service_serial,
                 .reply_serial = fixed.serial,
                 .destination = .{ .ptr = &sender.buffer, .len = sender.len },
             },
@@ -240,7 +235,28 @@ fn handleServiceMessage(state: *State, stream: std.net.Stream) !void {
         );
         try socket_writer.interface.flush();
         std.log.info("service sent echo return", .{});
-        state.next_service_serial += 1;
+        state.service_serial += 1;
+    } else if (std.mem.eql(u8, method.sliceConst(), "EchoU32")) {
+        std.debug.assert(std.mem.eql(u8, signature.?.sliceConst(), "u"));
+        std.debug.assert(fixed.body_len == 4);
+        const value = try reader.takeInt(u32, dbus.native_endian);
+        std.debug.assert(reader.seek == reader.end);
+
+        var write_buf: [1000]u8 = undefined;
+        var socket_writer = dbus.socketWriter(stream, &write_buf);
+        try dbus.writeMethodReturn(
+            &socket_writer.interface,
+            "u",
+            .{
+                .serial = state.service_serial,
+                .reply_serial = fixed.serial,
+                .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+            },
+            .{value},
+        );
+        try socket_writer.interface.flush();
+        std.log.info("service sent EchoU32 return", .{});
+        state.service_serial += 1;
     } else {
         std.debug.panic("unsupported method '{s}'", .{method.sliceConst()});
     }
@@ -263,14 +279,24 @@ fn handleClientMessage(state: *State, stream: std.net.Stream) !void {
             std.debug.assert(headers.interface == null);
             std.debug.assert(headers.member == null);
             std.debug.assert(headers.error_name == null);
+            std.debug.assert(headers.reply_serial == state.client_serial - 1);
 
-            if (headers.reply_serial == 2) {
-                std.debug.assert(headers.signature == null);
-                std.debug.assert(state.client == .sent_echo);
-                std.log.info("TODO: send the next method", .{});
-                state.client = .got_echo;
-            } else {
-                std.debug.panic("unhandled serial {}", .{headers.reply_serial});
+            switch (state.client) {
+                .sent_echo => {
+                    std.debug.assert(headers.signature == null);
+                    std.debug.assert(reader.seek == reader.end);
+                    try writeMethodCall(stream, state.service_name, .{ .EchoU32 = 0x12345678 }, &state.client_serial);
+                    state.client = .sent_echou32;
+                },
+                .sent_echou32 => {
+                    std.debug.assert(std.mem.eql(u8, headers.signature.?.sliceConst(), "u"));
+                    std.debug.assert(fixed.body_len == 4);
+                    const value = try reader.takeInt(u32, dbus.native_endian);
+                    std.debug.assert(value == 0x12345678);
+                    std.debug.assert(reader.seek == reader.end);
+                    state.client = .done;
+                },
+                .done => @panic("impossible?"),
             }
         },
         .error_reply => {
@@ -283,6 +309,34 @@ fn handleClientMessage(state: *State, stream: std.net.Stream) !void {
             try reader.discardAll(fixed.body_len);
         },
     }
+}
+
+const Method = union(enum) {
+    Echo,
+    EchoU32: u32,
+};
+
+fn writeMethodCall(
+    stream: std.net.Stream,
+    service_name: dbus.Slice(u32, [*]const u8),
+    method: Method,
+    client_serial_ref: *u32,
+) !void {
+    var write_buf: [1000]u8 = undefined;
+    var socket_writer = dbus.socketWriter(stream, &write_buf);
+    const call: dbus.MethodCall = .{
+        .serial = client_serial_ref.*,
+        .destination = service_name,
+        .path = .initStatic("/"),
+        .member = .initAssume(@tagName(method)),
+    };
+    switch (method) {
+        .Echo => try dbus.writeMethodCall(&socket_writer.interface, "", call, .{}),
+        .EchoU32 => |value| try dbus.writeMethodCall(&socket_writer.interface, "u", call, .{value}),
+    }
+
+    try socket_writer.interface.flush();
+    client_serial_ref.* += 1;
 }
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {

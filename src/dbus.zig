@@ -439,6 +439,11 @@ pub const Type = union(enum) {
     }
     fn getLen(comptime sig_type: Type, body_align: u3, value: *const sig_type.Native()) u32 {
         switch (sig_type) {
+            .u8 => return 1,
+            .u32 => {
+                const pad_len: u32 = pad4Len(@truncate(body_align));
+                return pad_len + 4;
+            },
             .string, .object_path => {
                 const pad_len: u32 = pad4Len(@truncate(body_align));
                 return pad_len + 4 + value.len + 1;
@@ -447,41 +452,6 @@ pub const Type = union(enum) {
         }
     }
 };
-pub fn Body(comptime signature: []const u8) type {
-    var fields: [signature.len]std.builtin.Type.StructField = undefined;
-    inline for (signature, &fields, 0..) |signature_type, *field, i| {
-        const name = std.fmt.comptimePrint("{d}", .{i});
-        const FieldType = signature_type.Native();
-        field.* = .{
-            .name = name,
-            .type = FieldType,
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(FieldType),
-        };
-    }
-    return @Type(std.builtin.Type{
-        .@"struct" = .{
-            .layout = .auto,
-            .fields = &fields,
-            .decls = &.{},
-            .is_tuple = true,
-        },
-    });
-}
-
-fn calcBodyLen(comptime signature: []const u8, body: *const Body(signature)) error{BodyTooBig}!u32 {
-    var total_len: u32 = 0;
-    var body_align: u3 = 0;
-    inline for (signature, 0..) |sig_type, i| {
-        const name = std.fmt.comptimePrint("{d}", .{i});
-        const field_len = sig_type.getLen(body_align, &@field(body, name));
-        total_len, const overflow = @addWithOverflow(total_len, field_len);
-        if (overflow == 1) return error.BodyTooBig;
-        body_align +%= @truncate(field_len);
-    }
-    return total_len;
-}
 
 pub fn flushAuth(writer: *Writer) error{WriteFailed}!void {
     var auth_buf: [100]u8 = undefined;
@@ -677,6 +647,20 @@ pub fn WriteData(comptime signature: []const u8) type {
         },
     });
 }
+fn calcLen(comptime signature: []const u8, data: WriteData(signature)) error{BodyTooBig}!u32 {
+    const types = comptime typesFromSig(signature);
+    var total_len: u32 = 0;
+    var body_align: u3 = 0;
+    inline for (types, 0..) |field_type, i| {
+        const name = std.fmt.comptimePrint("{d}", .{i});
+        const field_len = field_type.getLen(body_align, &@field(data, name));
+        total_len, const overflow = @addWithOverflow(total_len, field_len);
+        if (overflow == 1) return error.BodyTooBig;
+        body_align +%= @truncate(field_len);
+    }
+    return total_len;
+}
+
 pub fn write(
     writer: *Writer,
     start: u32,
@@ -701,17 +685,18 @@ pub fn write(
             else => @compileError(std.fmt.comptimePrint("todo: write field type {}", .{field_type})),
         }
     }
+    std.debug.assert(calcLen(signature, data) catch unreachable == index - start);
     return index;
 }
 
 pub fn writeMethodCall(
     writer: *Writer,
-    comptime signature: []const u8,
+    comptime body_sig: []const u8,
     call: MethodCall,
-    body: Body(signature),
+    body_data: WriteData(body_sig),
 ) (error{BodyTooBig} || error{WriteFailed})!void {
-    const body_len = try calcBodyLen(signature, &body);
-    const array_data_len = call.calcHeaderArrayLen(if (signature.len > 0) .initStatic(signature) else null);
+    const body_len = try calcLen(body_sig, body_data);
+    const array_data_len = call.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
     // NOTE: full header signature "yyyyuua(yv)"
     const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
@@ -735,7 +720,15 @@ pub fn writeMethodCall(
     if (call.member) |arg| {
         try writeHeaderString(writer, &header_align, .member, arg);
     }
+    if (body_sig.len > 0) {
+        try writeHeaderSig(writer, &header_align, .initAssume(body_sig));
+    }
     try writer.splatByteAll(0, pad8Len(header_align));
+
+    if (body_sig.len > 0) {
+        const body_written = try write(writer, 0, body_sig, body_data);
+        std.debug.assert(body_written == body_len);
+    }
 }
 
 pub const MethodReturn = struct {
@@ -754,30 +747,36 @@ pub const MethodReturn = struct {
 
 pub fn writeMethodReturn(
     writer: *Writer,
-    comptime signature: []const u8,
+    comptime body_sig: []const u8,
     args: MethodReturn,
-    body: Body(signature),
-) (error{BodyTooBig} || error{WriteFailed})!void {
-    const body_len = try calcBodyLen(signature, &body);
-    const array_data_len = args.calcHeaderArrayLen(if (signature.len > 0) .initStatic(signature) else null);
-    try writer.writeAll(&[_]u8{
+    body_data: WriteData(body_sig),
+) error{ BodyTooBig, WriteFailed }!void {
+    const body_len = try calcLen(body_sig, body_data);
+    const array_data_len = args.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
+    const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
         @intFromEnum(MessageType.method_return), // 2
         0, // flags,
         1, // protocol version
+        body_len,
+        args.serial,
     });
-    try writer.writeInt(u32, body_len, native_endian);
-    try writer.writeInt(u32, args.serial, native_endian);
+    _ = after_serial;
     try writer.writeInt(u32, array_data_len, native_endian);
     var header_align: u3 = 0;
     try writeHeaderU32(writer, &header_align, .reply_serial, args.reply_serial);
     if (args.destination) |arg| {
         try writeHeaderString(writer, &header_align, .destination, arg);
     }
-    if (signature.len > 0) {
-        try writeHeaderSig(writer, &header_align, .initStatic(signature));
+    if (body_sig.len > 0) {
+        try writeHeaderSig(writer, &header_align, .initStatic(body_sig));
     }
     try writer.splatByteAll(0, pad8Len(header_align));
+
+    if (body_sig.len > 0) {
+        const body_written = try write(writer, 0, body_sig, body_data);
+        std.debug.assert(body_written == body_len);
+    }
 }
 
 fn Bounded(comptime max: comptime_int) type {
