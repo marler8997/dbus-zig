@@ -445,62 +445,39 @@ pub const Type = union(enum) {
             .variant => Variant,
         };
     }
-    fn getLen(comptime sig_type: Type, body_align: u3, value: *const sig_type.Native()) u32 {
+
+    fn advance(comptime sig_type: Type, start: u32, value: *const sig_type.Native()) error{Overflow}!u32 {
         switch (sig_type) {
-            .u8 => return 1,
-            .u32 => {
-                const pad_len: u32 = pad4Len(@truncate(body_align));
-                return pad_len + 4;
+            .u8 => return writeSum(&.{ start, 1 }),
+            .i32, .u32 => {
+                const pad_len: u32 = pad4Len(@truncate(start));
+                return writeSum(&.{ start, pad_len + 4 });
             },
             .string, .object_path => {
-                const pad_len: u32 = pad4Len(@truncate(body_align));
-                return pad_len + 4 + value.len + 1;
+                const pad_len: u32 = pad4Len(@truncate(start));
+                return writeSum(&.{ start, pad_len + 4 + 1, value.len });
             },
             .dict => |d| {
-                const array_align_pad: u32 = pad4Len(@truncate(body_align));
-                var total_len: u32 = array_align_pad + 4;
-                total_len += pad8Len(@truncate(body_align +% array_align_pad +% 4));
-                var current_align: u3 = 0;
+                const array_align_pad: u32 = pad4Len(@truncate(start));
+                var offset: u32 = try writeSum(&.{ start, array_align_pad + 4 });
+                offset = try writeSum(&.{ offset, pad8Len(@truncate(offset)) });
                 for (value.*) |*elem| {
                     // each dict entry is 8-byte aligned (struct alignment)
-                    const entry_pad: u32 = pad8Len(current_align);
-                    total_len += entry_pad;
-                    current_align +%= @truncate(entry_pad);
-
-                    const key_len = d.key.getLen(current_align, &elem.key);
-                    total_len += key_len;
-                    current_align +%= @truncate(key_len);
-
-                    const val_len = d.value.getLen(current_align, &elem.value);
-                    total_len += val_len;
-                    current_align +%= @truncate(val_len);
+                    offset = try writeSum(&.{ offset, pad8Len(@truncate(offset)) });
+                    offset = try d.key.advance(offset, &elem.key);
+                    offset = try d.value.advance(offset, &elem.value);
                 }
-
-                return total_len;
+                return offset;
             },
             .variant => {
-                // Variant layout:
-                // - 1 byte: signature length
-                // - N bytes: signature string
-                // - 1 byte: null terminator
-                // - padding to value alignment
-                // - value bytes
-                switch (value.*) {
-                    .i32 => {
-                        // sig len (1) + sig "i" (1) + null (1) = 3 bytes
-                        const sig_total: u32 = 3;
-                        const after_sig_align: u3 = @truncate(body_align +% sig_total);
-                        const value_pad: u32 = pad4Len(@truncate(after_sig_align));
-                        return sig_total + value_pad + 4;
-                    },
-                    .u32 => {
-                        // sig len (1) + sig "u" (1) + null (1) = 3 bytes
-                        const sig_total: u32 = 3;
-                        const after_sig_align: u3 = @truncate(body_align +% sig_total);
-                        const value_pad: u32 = pad4Len(@truncate(after_sig_align));
-                        return sig_total + value_pad + 4;
-                    },
-                }
+                const sig_len: u32 = switch (value.*) {
+                    .i32, .u32 => 3,
+                };
+                const offset = try writeSum(&.{ start, sig_len });
+                return try writeSum(&.{ offset, switch (value.*) {
+                    .i32 => |*v| try Type.advance(.i32, offset, v),
+                    .u32 => |*v| try Type.advance(.u32, offset, v),
+                } });
             },
             else => @compileError("todo: support type: " ++ @tagName(sig_type)),
         }
@@ -709,20 +686,20 @@ pub fn WriteData(comptime signature: []const u8) type {
         },
     });
 }
-fn calcLen(comptime signature: []const u8, data: WriteData(signature)) error{BodyTooBig}!u32 {
+
+fn calcLen(comptime signature: []const u8, data: WriteData(signature)) error{Overflow}!u32 {
     const types = comptime typesFromSig(signature);
     var total_len: u32 = 0;
-    var body_align: u3 = 0;
     inline for (types, 0..) |field_type, i| {
         const name = std.fmt.comptimePrint("{d}", .{i});
-        const field_len = field_type.getLen(body_align, &@field(data, name));
-        total_len, const overflow = @addWithOverflow(total_len, field_len);
-        if (overflow == 1) return error.BodyTooBig;
-        body_align +%= @truncate(field_len);
+        total_len = try field_type.advance(total_len, &@field(data, name));
     }
     return total_len;
 }
 
+/// This function assumes that the total size of the data can fit within a u32. This should always
+/// be the case if used to write a message body because the body size must be pre-calculated so it can
+/// be written in the message header as a u32.
 pub fn write(
     writer: *Writer,
     start: u32,
@@ -760,8 +737,8 @@ pub fn writeMethodCall(
     comptime body_sig: []const u8,
     call: MethodCall,
     body_data: WriteData(body_sig),
-) (error{BodyTooBig} || error{WriteFailed})!void {
-    const body_len = try calcLen(body_sig, body_data);
+) error{ BodyTooBig, WriteFailed }!void {
+    const body_len = calcLen(body_sig, body_data) catch return error.BodyTooBig;
     const array_data_len = call.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
     // NOTE: full header signature "yyyyuua(yv)"
     const after_serial = try write(writer, 0, "yyyyuu", .{
@@ -817,7 +794,7 @@ pub fn writeMethodReturn(
     args: MethodReturn,
     body_data: WriteData(body_sig),
 ) error{ BodyTooBig, WriteFailed }!void {
-    const body_len = try calcLen(body_sig, body_data);
+    const body_len = calcLen(body_sig, body_data) catch return error.BodyTooBig;
     const array_data_len = args.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
     const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
@@ -1521,10 +1498,19 @@ pub fn readFixed(reader: *Reader) (DbusProtocolError || Reader.Error)!Fixed {
     };
 }
 
-fn sum(comptime T: type, values: []const T) T {
-    var total: T = 0;
+fn writeSum(values: []const u32) error{Overflow}!u32 {
+    var total: u32 = 0;
     for (values) |value| {
-        total += @as(T, value);
+        total, const overflow = @addWithOverflow(total, value);
+        if (overflow == 1) return error.Overflow;
+    }
+    return total;
+}
+fn readSum(values: []const u32) error{DbusProtocol}!u32 {
+    var total: u32 = 0;
+    for (values) |value| {
+        total, const overflow = @addWithOverflow(total, value);
+        if (overflow == 1) return error.DbusProtocol;
     }
     return total;
 }
@@ -1685,8 +1671,8 @@ pub fn streamBody2(
 
         switch (type_sig[0]) {
             'u' => {
-                const pad_len = pad4Len(@truncate(offset));
-                if (sum(u64, &.{ offset, pad_len, 4 }) > limit)
+                const pad_len: u32 = pad4Len(@truncate(offset));
+                if (try readSum(&.{ offset, pad_len + 4 }) > limit)
                     return error.DbusProtocol;
                 try reader.discardAll(pad_len);
                 offset += pad_len;
@@ -1695,14 +1681,14 @@ pub fn streamBody2(
                 try writer.print("<u32>{d}</u32>", .{value});
             },
             's' => {
-                const pad_len = pad4Len(@truncate(offset));
-                if (sum(u64, &.{ offset, pad_len, 4 }) > limit)
+                const pad_len: u32 = pad4Len(@truncate(offset));
+                if (try readSum(&.{ offset, pad_len + 4 }) > limit)
                     return error.DbusProtocol;
                 try reader.discardAll(pad_len);
                 offset += pad_len;
                 const string_len = try reader.takeInt(u32, endian);
                 offset += 4;
-                if (sum(u64, &.{ offset, string_len }) > limit)
+                if (try readSum(&.{ offset, string_len }) > limit)
                     return error.DbusProtocol;
                 try writer.print("<string size=\"{}\">", .{string_len});
                 try reader.streamExact(writer, string_len);
@@ -1712,8 +1698,8 @@ pub fn streamBody2(
                 try writer.writeAll("</string>");
             },
             'a' => {
-                const pad_len = pad4Len(@truncate(offset));
-                if (sum(u64, &.{ offset, pad_len, 4 }) > limit)
+                const pad_len: u32 = pad4Len(@truncate(offset));
+                if (try readSum(&.{ offset, pad_len + 4 }) > limit)
                     return error.DbusProtocol;
                 try reader.discardAll(pad_len);
                 offset += pad_len;
@@ -1723,9 +1709,8 @@ pub fn streamBody2(
                     'x', 't', 'd', '(', '{' => pad8Len(@truncate(offset)),
                     else => 0,
                 };
-                const array_limit_u64 = sum(u64, &.{ offset, initial_pad_len, array_size });
-                if (array_limit_u64 > limit) return error.DbusProtocol;
-                const array_limit: u32 = @intCast(array_limit_u64);
+                const array_limit = try readSum(&.{ offset, initial_pad_len, array_size });
+                if (array_limit > limit) return error.DbusProtocol;
                 try writer.print("<array size=\"{}\">", .{array_size});
                 while (offset < array_limit) {
                     offset = try streamBodyArrayElement(
@@ -1742,9 +1727,9 @@ pub fn streamBody2(
             },
             'v' => {
                 if (offset + 1 > limit) return error.DbusProtocol;
-                const variant_sig_len = try reader.takeByte();
+                const variant_sig_len: u32 = try reader.takeByte();
                 offset += 1;
-                if (sum(u64, &.{ offset, variant_sig_len, 1 }) > limit)
+                if (try readSum(&.{ offset, variant_sig_len + 1 }) > limit)
                     return error.DbusProtocol;
                 var variant_sig_buf: [255]u8 = undefined;
                 const variant_sig = variant_sig_buf[0..variant_sig_len];
