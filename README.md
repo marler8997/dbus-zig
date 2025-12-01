@@ -2,7 +2,7 @@
 
 A dbus library for Zig.
 
-See [example.zig](example.zig)
+See [examples/hello.zig](examples/hello.zig)
 
 
 # Notes on DBUS
