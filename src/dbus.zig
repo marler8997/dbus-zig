@@ -215,7 +215,11 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
         }
 
         pub fn nativeSlice(self: @This()) NativeSlice {
-            return self.ptr[0..self.len];
+            if (ptr_info.sentinel_ptr) |sentinel_ptr| {
+                return self.ptr[0..self.len :@as(*const ptr_info.child, @ptrCast(sentinel_ptr)).*];
+            } else {
+                return self.ptr[0..self.len];
+            }
         }
 
         pub const format = switch (@typeInfo(Ptr).pointer.child) {
@@ -424,6 +428,32 @@ pub const Type = union(enum) {
     },
     variant, // 'v'
 
+    pub fn getSignature(self: Type) Slice(u8, [*:0]const u8) {
+        return switch (self) {
+            .u8 => .initStatic("y"),
+            // bool, // 'b'
+            // i16, // 'n'
+            // u16, // 'q'
+            // i32, // 'i'
+            // u32, // 'u'
+            // i64, // 'x'
+            // u64, // 't'
+            // f64, // 'd'
+            // unix_fd, // 'h'
+            .string => .initStatic("s"),
+            // object_path, // a string that is also a "syntactically valid object path"
+            // signature, // zero or more "single complete types"
+            // // @"struct",
+            // array: *const Type, // 'a<TYPE>'
+            // dict: struct {
+            //     key: *const Type,
+            //     value: *const Type,
+            // },
+            .variant => .initStatic("v"),
+            else => @compileError("todo: get signature for " ++ @tagName(self)),
+        };
+    }
+
     // TODO: might need NativeConst and NativeMut?
     pub fn Native(self: Type) type {
         return switch (self) {
@@ -439,7 +469,7 @@ pub const Type = union(enum) {
             .unix_fd => std.posix.fd_t,
             .string => Slice(u32, [*]const u8),
             .object_path => Slice(u32, [*]const u8),
-            .signature => []const Type,
+            .signature => Slice(u8, [*]const u8),
             .array => |e| []const e.Native(),
             .dict => |d| []const DictElement(d.key.Native(), d.value.Native()),
             .variant => Variant,
@@ -453,14 +483,13 @@ pub const Type = union(enum) {
                 const pad_len: u32 = pad4Len(@truncate(start));
                 return writeSum(&.{ start, pad_len + 4 });
             },
+            .signature => return writeSum(&.{ start, 2, value.len }),
             .string, .object_path => {
                 const pad_len: u32 = pad4Len(@truncate(start));
                 return writeSum(&.{ start, pad_len + 4 + 1, value.len });
             },
             .dict => |d| {
-                const array_align_pad: u32 = pad4Len(@truncate(start));
-                var offset: u32 = try writeSum(&.{ start, array_align_pad + 4 });
-                offset = try writeSum(&.{ offset, pad8Len(@truncate(offset)) });
+                var offset = try dictDataOffset(start);
                 for (value.*) |*elem| {
                     // each dict entry is 8-byte aligned (struct alignment)
                     offset = try writeSum(&.{ offset, pad8Len(@truncate(offset)) });
@@ -470,19 +499,24 @@ pub const Type = union(enum) {
                 return offset;
             },
             .variant => {
-                const sig_len: u32 = switch (value.*) {
-                    .i32, .u32 => 3,
+                const variant_sig = value.getSignature();
+                const after_sig = try Type.advance(.signature, start, &variant_sig);
+                return switch (value.*) {
+                    .i32 => |*v| try Type.advance(.i32, after_sig, v),
+                    .u32 => |*v| try Type.advance(.u32, after_sig, v),
+                    .string => |*v| try Type.advance(.string, after_sig, v),
                 };
-                const offset = try writeSum(&.{ start, sig_len });
-                return try writeSum(&.{ offset, switch (value.*) {
-                    .i32 => |*v| try Type.advance(.i32, offset, v),
-                    .u32 => |*v| try Type.advance(.u32, offset, v),
-                } });
             },
             else => @compileError("todo: support type: " ++ @tagName(sig_type)),
         }
     }
 };
+
+fn dictDataOffset(start: u32) error{Overflow}!u32 {
+    const pad_len: u32 = pad4Len(@truncate(start));
+    const after_size: u32 = try writeSum(&.{ start, pad_len + 4 });
+    return try writeSum(&.{ after_size, pad8Len(@truncate(after_size)) });
+}
 
 pub fn DictElement(comptime Key: type, comptime Value: type) type {
     return struct { key: Key, value: Value };
@@ -490,6 +524,15 @@ pub fn DictElement(comptime Key: type, comptime Value: type) type {
 pub const Variant = union(enum) {
     i32: i32,
     u32: u32,
+    string: Slice(u32, [*]const u8),
+
+    pub fn getSignature(variant: *const Variant) Slice(u8, [*]const u8) {
+        return switch (variant.*) {
+            .i32 => .initStatic("i"),
+            .u32 => .initStatic("u"),
+            .string => .initStatic("s"),
+        };
+    }
 };
 
 pub fn flushAuth(writer: *Writer) error{WriteFailed}!void {
@@ -687,14 +730,14 @@ pub fn WriteData(comptime signature: []const u8) type {
     });
 }
 
-fn calcLen(comptime signature: []const u8, data: WriteData(signature)) error{Overflow}!u32 {
+fn advance(start: u32, comptime signature: []const u8, data: WriteData(signature)) error{Overflow}!u32 {
+    var index = start;
     const types = comptime typesFromSig(signature);
-    var total_len: u32 = 0;
     inline for (types, 0..) |field_type, i| {
         const name = std.fmt.comptimePrint("{d}", .{i});
-        total_len = try field_type.advance(total_len, &@field(data, name));
+        index = try field_type.advance(index, &@field(data, name));
     }
-    return total_len;
+    return index;
 }
 
 /// This function assumes that the total size of the data can fit within a u32. This should always
@@ -702,14 +745,15 @@ fn calcLen(comptime signature: []const u8, data: WriteData(signature)) error{Ove
 /// be written in the message header as a u32.
 pub fn write(
     writer: *Writer,
-    start: u32,
+    full_write_start: u32,
     comptime signature: []const u8,
     data: WriteData(signature),
 ) error{WriteFailed}!u32 {
-    var index = start;
+    var index = full_write_start;
     const types = comptime typesFromSig(signature);
     inline for (types, 0..) |field_type, i| {
         const name = std.fmt.comptimePrint("{d}", .{i});
+        const after_field = field_type.advance(index, &@field(data, name)) catch unreachable;
         switch (field_type) {
             .u8 => {
                 try writer.writeByte(@field(data, name));
@@ -718,17 +762,61 @@ pub fn write(
             .u32 => {
                 const pad_len = pad4Len(@truncate(index));
                 try writer.splatByteAll(0, pad_len);
+                index += pad_len;
                 try writer.writeInt(u32, @field(data, name), native_endian);
-                index += @as(u32, pad_len) + 4;
+                index += 4;
+            },
+            .signature => {
+                try writer.writeByte(@field(data, name).len);
+                index += 1;
+                try writer.writeAll(@field(data, name).nativeSlice());
+                index += @field(data, name).len;
+                try writer.writeByte(0);
+                index += 1;
+            },
+            .string, .object_path => {
+                const pad_len = pad4Len(@truncate(index));
+                try writer.splatByteAll(0, pad_len);
+                index += pad_len;
+                try writer.writeInt(u32, @field(data, name).len, native_endian);
+                index += 4;
+                try writer.writeAll(@field(data, name).nativeSlice());
+                index += @field(data, name).len;
+                try writer.writeByte(0);
+                index += 1;
             },
             .dict => |d| {
-                _ = d;
-                @compileError("todo: write dict");
+                const data_start = dictDataOffset(index) catch unreachable;
+                const start_pad_len: u32 = pad4Len(@truncate(index));
+                try writer.splatByteAll(0, start_pad_len);
+                index += start_pad_len;
+                try writer.writeInt(u32, after_field - data_start, native_endian);
+                index += 4;
+                const data_pad_len = pad8Len(@truncate(index));
+                try writer.splatByteAll(0, data_pad_len);
+                index += data_pad_len;
+                std.debug.assert(index == data_start);
+                for (@field(data, name)) |*elem| {
+                    const pad_len = pad8Len(@truncate(index));
+                    try writer.splatByteAll(0, pad_len);
+                    index += pad_len;
+                    index = try write(writer, index, d.key.getSignature().nativeSlice(), .{elem.key});
+                    index = try write(writer, index, d.value.getSignature().nativeSlice(), .{elem.value});
+                }
+            },
+            .variant => {
+                index = try write(writer, index, "g", .{@field(data, name).getSignature()});
+                index = switch (@field(data, name)) {
+                    .i32 => @panic("todo"),
+                    .u32 => @panic("todo"),
+                    .string => |v| try write(writer, index, "s", .{v}),
+                };
             },
             else => @compileError(std.fmt.comptimePrint("todo: write field type {}", .{field_type})),
         }
+        std.debug.assert(index == after_field);
     }
-    std.debug.assert(calcLen(signature, data) catch unreachable == index - start);
+    std.debug.assert(index == advance(full_write_start, signature, data) catch unreachable);
     return index;
 }
 
@@ -738,7 +826,7 @@ pub fn writeMethodCall(
     call: MethodCall,
     body_data: WriteData(body_sig),
 ) error{ BodyTooBig, WriteFailed }!void {
-    const body_len = calcLen(body_sig, body_data) catch return error.BodyTooBig;
+    const body_len = advance(0, body_sig, body_data) catch return error.BodyTooBig;
     const array_data_len = call.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
     // NOTE: full header signature "yyyyuua(yv)"
     const after_serial = try write(writer, 0, "yyyyuu", .{
@@ -794,7 +882,7 @@ pub fn writeMethodReturn(
     args: MethodReturn,
     body_data: WriteData(body_sig),
 ) error{ BodyTooBig, WriteFailed }!void {
-    const body_len = calcLen(body_sig, body_data) catch return error.BodyTooBig;
+    const body_len = advance(0, body_sig, body_data) catch return error.BodyTooBig;
     const array_data_len = args.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
     const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
@@ -1118,24 +1206,27 @@ pub const BodyIterator = struct {
     // pending_string: ?u32 = null,
     const Pending = union(enum) {
         string: u32,
+        object: u32,
         array: u32,
     };
 
     pub const Value = union(enum) {
         string: struct { len: u32 },
+        object: struct { len: u32 },
         array: struct { size: u32 },
         boolean: bool,
     };
 
-    pub fn notifyConsumed(it: *BodyIterator, kind: enum { string, array }) void {
+    pub fn notifyConsumed(it: *BodyIterator, kind: enum { string, object, array }) void {
         it.bytes_read += switch (kind) {
             .string => it.pending.?.string + 1,
+            .object => it.pending.?.object + 1,
             .array => @panic("todo"),
         };
         it.pending = null;
     }
 
-    pub fn next(it: *BodyIterator, reader: *Reader) (DbusProtocolError || Reader.Error)!?Value {
+    pub fn next(it: *BodyIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!?Value {
         if (it.pending != null) {
             @panic("notifyConsumed was not called");
         }
@@ -1173,7 +1264,7 @@ pub const BodyIterator = struct {
                 it.sig_offset += 1;
                 return .{ .array = .{ .size = array_size } };
             },
-            's' => { // string
+            's', 'o' => |ch| { // string or object
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
                     log_dbus.err("body truncated", .{});
@@ -1188,9 +1279,18 @@ pub const BodyIterator = struct {
                     log_dbus.err("body truncated", .{});
                     return error.DbusProtocol;
                 }
-                it.pending = .{ .string = string_len };
                 it.sig_offset += 1;
-                return .{ .string = .{ .len = string_len } };
+                switch (ch) {
+                    's' => {
+                        it.pending = .{ .string = string_len };
+                        return .{ .string = .{ .len = string_len } };
+                    },
+                    'o' => {
+                        it.pending = .{ .object = string_len };
+                        return .{ .object = .{ .len = string_len } };
+                    },
+                    else => unreachable,
+                }
             },
             'b' => { // bool
                 const pad_len = pad4Len(@truncate(it.bytes_read));
@@ -1605,7 +1705,7 @@ fn nextType(comptime sig: []const u8) struct { Type, u8 } {
 
         // string types
         's' => .{ .string, 1 },
-        'o' => .{ .object, 1 },
+        'o' => .{ .object_path, 1 },
         'g' => .{ .signature, 1 },
 
         'v' => .{ .variant, 1 },
@@ -1827,7 +1927,7 @@ const String = struct {
     len: u32,
 };
 
-fn DynamicHeaders(comptime message_type: ?MessageType) type {
+pub fn DynamicHeaders(comptime message_type: ?MessageType) type {
     const maybe_message_type: MaybeMessageType = .opt(message_type);
     return struct {
         unknown_header_count: u32 = 0,
