@@ -418,7 +418,13 @@ pub const Type = union(enum) {
     signature, // zero or more "single complete types"
     // @"struct",
     array: *const Type, // 'a<TYPE>'
+    dict: struct {
+        key: *const Type,
+        value: *const Type,
+    },
+    variant, // 'v'
 
+    // TODO: might need NativeConst and NativeMut?
     pub fn Native(self: Type) type {
         return switch (self) {
             .u8 => u8,
@@ -435,6 +441,8 @@ pub const Type = union(enum) {
             .object_path => Slice(u32, [*]const u8),
             .signature => []const Type,
             .array => |e| []const e.Native(),
+            .dict => |d| []const DictElement(d.key.Native(), d.value.Native()),
+            .variant => Variant,
         };
     }
     fn getLen(comptime sig_type: Type, body_align: u3, value: *const sig_type.Native()) u32 {
@@ -448,9 +456,63 @@ pub const Type = union(enum) {
                 const pad_len: u32 = pad4Len(@truncate(body_align));
                 return pad_len + 4 + value.len + 1;
             },
+            .dict => |d| {
+                const array_align_pad: u32 = pad4Len(@truncate(body_align));
+                var total_len: u32 = array_align_pad + 4;
+                total_len += pad8Len(@truncate(body_align +% array_align_pad +% 4));
+                var current_align: u3 = 0;
+                for (value.*) |*elem| {
+                    // each dict entry is 8-byte aligned (struct alignment)
+                    const entry_pad: u32 = pad8Len(current_align);
+                    total_len += entry_pad;
+                    current_align +%= @truncate(entry_pad);
+
+                    const key_len = d.key.getLen(current_align, &elem.key);
+                    total_len += key_len;
+                    current_align +%= @truncate(key_len);
+
+                    const val_len = d.value.getLen(current_align, &elem.value);
+                    total_len += val_len;
+                    current_align +%= @truncate(val_len);
+                }
+
+                return total_len;
+            },
+            .variant => {
+                // Variant layout:
+                // - 1 byte: signature length
+                // - N bytes: signature string
+                // - 1 byte: null terminator
+                // - padding to value alignment
+                // - value bytes
+                switch (value.*) {
+                    .i32 => {
+                        // sig len (1) + sig "i" (1) + null (1) = 3 bytes
+                        const sig_total: u32 = 3;
+                        const after_sig_align: u3 = @truncate(body_align +% sig_total);
+                        const value_pad: u32 = pad4Len(@truncate(after_sig_align));
+                        return sig_total + value_pad + 4;
+                    },
+                    .u32 => {
+                        // sig len (1) + sig "u" (1) + null (1) = 3 bytes
+                        const sig_total: u32 = 3;
+                        const after_sig_align: u3 = @truncate(body_align +% sig_total);
+                        const value_pad: u32 = pad4Len(@truncate(after_sig_align));
+                        return sig_total + value_pad + 4;
+                    },
+                }
+            },
             else => @compileError("todo: support type: " ++ @tagName(sig_type)),
         }
     }
+};
+
+pub fn DictElement(comptime Key: type, comptime Value: type) type {
+    return struct { key: Key, value: Value };
+}
+pub const Variant = union(enum) {
+    i32: i32,
+    u32: u32,
 };
 
 pub fn flushAuth(writer: *Writer) error{WriteFailed}!void {
@@ -681,6 +743,10 @@ pub fn write(
                 try writer.splatByteAll(0, pad_len);
                 try writer.writeInt(u32, @field(data, name), native_endian);
                 index += @as(u32, pad_len) + 4;
+            },
+            .dict => |d| {
+                _ = d;
+                @compileError("todo: write dict");
             },
             else => @compileError(std.fmt.comptimePrint("todo: write field type {}", .{field_type})),
         }
@@ -1532,6 +1598,10 @@ fn scanType(sig: []const u8, offset: usize) ?usize {
     };
 }
 
+fn typeAddr(comptime t: Type) *const Type {
+    return &t;
+}
+
 fn nextType(comptime sig: []const u8) struct { Type, u8 } {
     std.debug.assert(sig.len > 0);
     return switch (sig[0]) {
@@ -1552,10 +1622,19 @@ fn nextType(comptime sig: []const u8) struct { Type, u8 } {
         'o' => .{ .object, 1 },
         'g' => .{ .signature, 1 },
 
-        // Variant
-        // 'v' => .{ Variant, 1 },
+        'v' => .{ .variant, 1 },
 
         'a' => blk: {
+            std.debug.assert(sig.len >= 2);
+            if (sig[1] == '{') {
+                const key_type, const key_char_count = nextType(sig[2..]);
+                const value_type, const value_char_count = nextType(sig[2 + key_char_count ..]);
+                std.debug.assert(sig[2 + key_char_count + value_char_count] == '}');
+                return .{
+                    .{ .dict = .{ .key = typeAddr(key_type), .value = typeAddr(value_type) } },
+                    2 + key_char_count + value_char_count + 1,
+                };
+            }
             const Element, const element_sig_len = nextType(sig[1..]);
             break :blk .{ []const Element, 1 + element_sig_len };
         },
