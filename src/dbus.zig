@@ -1298,6 +1298,7 @@ pub const BodyIterator = struct {
             log_dbus.err("body has {} bytes left but signature has no types left", .{it.body_len - it.bytes_read});
             return error.DbusProtocol;
         }
+
         switch (it.signature[it.sig_offset]) {
             'u' => {
                 const pad_len: u32 = pad4Len(@truncate(it.bytes_read));
@@ -1307,6 +1308,7 @@ pub const BodyIterator = struct {
                 it.bytes_read += pad_len;
                 const value = try reader.takeInt(u32, it.endian);
                 it.bytes_read += 4;
+                it.sig_offset += 1;
                 return .{ .u32 = value };
             },
             'a' => { // array
