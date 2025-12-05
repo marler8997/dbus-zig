@@ -97,26 +97,21 @@ fn connect() !std.net.Stream {
             }
         };
         const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-        if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+        try headers.expectReplySerial(1);
+        try headers.expectSignature("s");
         var it: dbus.BodyIterator = .{
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = headers.signatureSlice(),
         };
-        const string_len = blk: {
-            switch (try it.next(reader) orelse @panic("Hello reply is missing string name")) {
-                .string => |string| {
-                    if (string.len > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string.len});
-                    try reader.readSliceAll(name_buf[0..string.len]);
-                    try dbus.consumeStringNullTerm(reader);
-                    it.notifyConsumed(.string);
-                    break :blk string.len;
-                },
-                else => |v| std.debug.panic("Hello unexpected type {s}", .{@tagName(v)}),
-            }
-        };
-        if (try it.next(reader) != null) @panic("Hello reply body contains more than expected");
-        break :blk_name name_buf[0..string_len];
+        comptime var sig_index: usize = 0;
+        const string_size: u32 = try dbus.read("s", &sig_index, .string_size)(&it, reader);
+        if (string_size > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string_size});
+        try reader.readSliceAll(name_buf[0..string_size]);
+        try dbus.consumeStringNullTerm(reader);
+        it.notifyConsumed(.string);
+        try it.finish("s", sig_index);
+        break :blk_name name_buf[0..string_size];
     };
 
     std.log.info("our name is '{s}'", .{name});
@@ -221,7 +216,7 @@ fn call(call_args: []const Arg) !u8 {
     };
 
     const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-    if (headers.reply_serial != 2) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+    try headers.expectReplySerial(2);
     std.log.info("result signature '{s}'", .{headers.signatureSlice()});
 
     var stdout_buf: [1000]u8 = undefined;
@@ -246,13 +241,13 @@ fn readError(reader: *dbus.Reader, fixed: *const dbus.Fixed) !void {
         .signature = headers.signatureSlice(),
     };
     if (try it.next(reader)) |result| switch (result) {
-        .string => |string| {
+        .string_size => |string_size| {
             var msg_buf: [1024]u8 = undefined;
-            const msg_len = @min(string.len, msg_buf.len);
+            const msg_len = @min(string_size, msg_buf.len);
             try reader.readSliceAll(msg_buf[0..msg_len]);
             // Skip remaining bytes if message was truncated
-            if (string.len > msg_len) {
-                try reader.discardAll(string.len - msg_len);
+            if (string_size > msg_len) {
+                try reader.discardAll(string_size - msg_len);
             }
             try dbus.consumeStringNullTerm(reader);
             it.notifyConsumed(.string);

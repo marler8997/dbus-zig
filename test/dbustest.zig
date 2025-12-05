@@ -109,26 +109,21 @@ fn connect(addr_str: []const u8, addr: dbus.Address, out_name_buf: *[dbus.max_na
             }
         };
         const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-        if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+        try headers.expectReplySerial(1);
+        try headers.expectSignature("s");
         var it: dbus.BodyIterator = .{
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = headers.signatureSlice(),
         };
-        const string_len: u8 = blk: {
-            switch (try it.next(reader) orelse @panic("Hello reply is missing string name")) {
-                .string => |string| {
-                    const string_len_u8 = dbus.castNameLen(string.len) orelse std.debug.panic("assigned name is too long {}", .{string.len});
-                    try reader.readSliceAll(out_name_buf[0..string.len]);
-                    try dbus.consumeStringNullTerm(reader);
-                    it.notifyConsumed(.string);
-                    break :blk string_len_u8;
-                },
-                else => |v| std.debug.panic("Hello unexpected type {s}", .{@tagName(v)}),
-            }
-        };
-        if (try it.next(reader) != null) @panic("Hello reply body contains more than expected");
-        break :blk_name string_len;
+        comptime var sig_index: usize = 0;
+        const string_size: u32 = try dbus.read("s", &sig_index, .string_size)(&it, reader);
+        const string_size_u8 = dbus.castNameLen(string_size) orelse std.debug.panic("assigned name is too long {}", .{string_size});
+        try reader.readSliceAll(out_name_buf[0..string_size]);
+        try dbus.consumeStringNullTerm(reader);
+        it.notifyConsumed(.string);
+        try it.finish("s", sig_index);
+        break :blk_name string_size_u8;
     };
     return .{ stream, name_len };
 }
@@ -141,13 +136,13 @@ fn readError(reader: *dbus.Reader, fixed: *const dbus.Fixed) !void {
         .signature = headers.signatureSlice(),
     };
     if (try it.next(reader)) |result| switch (result) {
-        .string => |string| {
+        .string_size => |string_size| {
             var msg_buf: [1024]u8 = undefined;
-            const msg_len = @min(string.len, msg_buf.len);
+            const msg_len = @min(string_size, msg_buf.len);
             try reader.readSliceAll(msg_buf[0..msg_len]);
             // Skip remaining bytes if message was truncated
-            if (string.len > msg_len) {
-                try reader.discardAll(string.len - msg_len);
+            if (string_size > msg_len) {
+                try reader.discardAll(string_size - msg_len);
             }
             try dbus.consumeStringNullTerm(reader);
             it.notifyConsumed(.string);

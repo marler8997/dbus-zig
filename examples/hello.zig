@@ -68,26 +68,21 @@ pub fn main() !u8 {
             }
         };
         const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-        if (headers.reply_serial != 1) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+        try headers.expectReplySerial(1);
+        try headers.expectSignature("s");
         var it: dbus.BodyIterator = .{
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = headers.signatureSlice(),
         };
-        const string_len = blk: {
-            switch (try it.next(reader) orelse @panic("Hello reply is missing string name")) {
-                .string => |string| {
-                    if (string.len > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string.len});
-                    try reader.readSliceAll(name_buf[0..string.len]);
-                    try dbus.consumeStringNullTerm(reader);
-                    it.notifyConsumed(.string);
-                    break :blk string.len;
-                },
-                else => |v| std.debug.panic("Hello unexpected type {s}", .{@tagName(v)}),
-            }
-        };
-        if (try it.next(reader) != null) @panic("Hello reply body contains more than expected");
-        break :blk_name name_buf[0..string_len];
+        comptime var sig_index: usize = 0;
+        const string_size = try dbus.read("s", &sig_index, .string_size)(&it, reader);
+        const name_len: u8 = dbus.castNameLen(string_size) orelse std.debug.panic("assigned name is too long {}", .{string_size});
+        try reader.readSliceAll(name_buf[0..name_len]);
+        try dbus.consumeStringNullTerm(reader);
+        it.notifyConsumed(.string);
+        try it.finish("s", sig_index);
+        break :blk_name name_buf[0..name_len];
     };
 
     std.log.info("our name is '{s}'", .{name});
@@ -127,30 +122,27 @@ pub fn main() !u8 {
         };
 
         const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-        if (headers.reply_serial != 2) std.debug.panic("unexpected serial {}", .{headers.reply_serial});
+        try headers.expectReplySerial(2);
+        try headers.expectSignature("s");
         var it: dbus.BodyIterator = .{
             .endian = fixed.endian,
             .body_len = fixed.body_len,
             .signature = headers.signatureSlice(),
         };
-
-        switch (try it.next(reader) orelse @panic("Introspect reply is missing string name")) {
-            .string => |string| {
-                std.log.info("--- Introspect reply:", .{});
-                var remaining: u32 = string.len;
-                while (remaining > 0) {
-                    const take_len = @min(reader.buffer.len, remaining);
-                    const slice = try reader.take(take_len);
-                    std.debug.print("{s}", .{slice});
-                    remaining -= @intCast(slice.len);
-                }
-                try dbus.consumeStringNullTerm(reader);
-                it.notifyConsumed(.string);
-            },
-            else => |v| std.debug.panic("Introspect unexpected type {s}", .{@tagName(v)}),
+        comptime var sig_index: usize = 0;
+        const string_size: u32 = try dbus.read("s", &sig_index, .string_size)(&it, reader);
+        std.log.info("--- Introspect reply:", .{});
+        var remaining: u32 = string_size;
+        while (remaining > 0) {
+            const take_len = @min(reader.buffer.len, remaining);
+            const slice = try reader.take(take_len);
+            std.debug.print("{s}", .{slice});
+            remaining -= @intCast(slice.len);
         }
+        try dbus.consumeStringNullTerm(reader);
+        it.notifyConsumed(.string);
         std.log.info("---- end of Introspect reply", .{});
-        if (try it.next(reader) != null) @panic("Introspect reply body contains more than expected");
+        try it.finish("s", sig_index);
     }
 
     return 0;

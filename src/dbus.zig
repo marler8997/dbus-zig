@@ -428,6 +428,25 @@ pub const Type = union(enum) {
     },
     variant, // 'v'
 
+    pub fn eql(self: Type, other: Type) bool {
+        if (@tagName(self) != @tagName(other)) return false;
+        return switch (self) {
+            .u8, .bool, .i16, .u16, .i32, .u32, .i64, .u64, .f64, .unix_fd, .string, .object_path, .signature, .variant => true,
+            .array => |element_type| element_type.eql(other.array),
+            .dict => |d| d.key.eql(other.dict.key) and d.value.eql(other.dict.value),
+        };
+    }
+
+    pub fn matchesReadKind(self: Type, kind: ReadKind) bool {
+        return switch (kind) {
+            .boolean => self == .boolean,
+            .u32 => self == .u32,
+            .string_size => self == .string,
+            .object_path_size => self == .object_path,
+            .array_size => self == .array or self == .dict,
+        };
+    }
+
     pub fn getSignature(self: Type) Slice(u8, [*:0]const u8) {
         return switch (self) {
             .u8 => .initStatic("y"),
@@ -1038,7 +1057,7 @@ pub const HeaderFieldIterator = struct {
         it.pending_path = null;
     }
 
-    pub fn next(it: *HeaderFieldIterator, reader: *Reader) (DbusProtocolError || Reader.Error)!?Field {
+    pub fn next(it: *HeaderFieldIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!?Field {
         if (it.pending_path != null) {
             @panic("notifyPathConsumed was not called");
         }
@@ -1194,6 +1213,32 @@ pub fn consumeStringNullTerm(reader: *Reader) (DbusProtocolError || Reader.Error
     }
 }
 
+const ReadKind = enum {
+    boolean,
+    u32,
+    string_size,
+    object_path_size,
+    array_size,
+    pub fn Type(kind: ReadKind) type {
+        return switch (kind) {
+            .boolean => bool,
+            .u32 => u32,
+            .string_size => u32,
+            .object_path_size => u32,
+            .array_size => u32,
+        };
+    }
+    pub fn valueName(kind: ReadKind) [:0]const u8 {
+        return switch (kind) {
+            .boolean => "boolean",
+            .u32 => "u32",
+            .string_size => "string",
+            .object_path_size => "object path",
+            .array_size => "array",
+        };
+    }
+};
+
 pub const BodyIterator = struct {
     endian: std.builtin.Endian,
     body_len: u32,
@@ -1203,30 +1248,39 @@ pub const BodyIterator = struct {
     sig_offset: u32 = 0,
 
     pending: ?Pending = null,
-    // pending_string: ?u32 = null,
     const Pending = union(enum) {
         string: u32,
-        object: u32,
+        object_path: u32,
         array: u32,
     };
 
-    pub const Value = union(enum) {
-        string: struct { len: u32 },
-        object: struct { len: u32 },
-        array: struct { size: u32 },
+    pub const Node = union(ReadKind) {
         boolean: bool,
+        u32: u32,
+        string_size: u32,
+        object_path_size: u32,
+        array_size: u32,
+        pub fn valueName(node: *const Node) [:0]const u8 {
+            return switch (node.*) {
+                .boolean => "boolean",
+                .u32 => "u32",
+                .string_size => "string",
+                .object_path_size => "object path",
+                .array_size => "array",
+            };
+        }
     };
 
-    pub fn notifyConsumed(it: *BodyIterator, kind: enum { string, object, array }) void {
+    pub fn notifyConsumed(it: *BodyIterator, kind: enum { string, object_path, array }) void {
         it.bytes_read += switch (kind) {
             .string => it.pending.?.string + 1,
-            .object => it.pending.?.object + 1,
+            .object_path => it.pending.?.object_path + 1,
             .array => @panic("todo"),
         };
         it.pending = null;
     }
 
-    pub fn next(it: *BodyIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!?Value {
+    pub fn next(it: *BodyIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!?Node {
         if (it.pending != null) {
             @panic("notifyConsumed was not called");
         }
@@ -1245,6 +1299,16 @@ pub const BodyIterator = struct {
             return error.DbusProtocol;
         }
         switch (it.signature[it.sig_offset]) {
+            'u' => {
+                const pad_len: u32 = pad4Len(@truncate(it.bytes_read));
+                if (try readSum(&.{ it.bytes_read, pad_len + 4 }) > it.body_len)
+                    return error.DbusProtocol;
+                try reader.discardAll(pad_len);
+                it.bytes_read += pad_len;
+                const value = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                return .{ .u32 = value };
+            },
             'a' => { // array
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
@@ -1260,11 +1324,20 @@ pub const BodyIterator = struct {
                     log_dbus.err("body truncated", .{});
                     return error.DbusProtocol;
                 }
+
+                if (it.sig_offset >= it.signature.len) return error.DbusProtocol;
+                const initial_pad_len = switch (it.signature[it.sig_offset]) {
+                    'x', 't', 'd', '(', '{' => pad8Len(@truncate(it.bytes_read)),
+                    else => 0,
+                };
+                try reader.discardAll(initial_pad_len);
+                it.bytes_read = try readSum(&.{ it.bytes_read, initial_pad_len });
+
                 it.pending = .{ .array = array_size };
                 it.sig_offset += 1;
-                return .{ .array = .{ .size = array_size } };
+                return .{ .array_size = array_size };
             },
-            's', 'o' => |ch| { // string or object
+            's', 'o' => |ch| { // string or object-path
                 const pad_len = pad4Len(@truncate(it.bytes_read));
                 if (it.bytes_read + pad_len + 4 > it.body_len) {
                     log_dbus.err("body truncated", .{});
@@ -1283,11 +1356,11 @@ pub const BodyIterator = struct {
                 switch (ch) {
                     's' => {
                         it.pending = .{ .string = string_len };
-                        return .{ .string = .{ .len = string_len } };
+                        return .{ .string_size = string_len };
                     },
                     'o' => {
-                        it.pending = .{ .object = string_len };
-                        return .{ .object = .{ .len = string_len } };
+                        it.pending = .{ .object_path = string_len };
+                        return .{ .object_path_size = string_len };
                     },
                     else => unreachable,
                 }
@@ -1314,6 +1387,20 @@ pub const BodyIterator = struct {
             },
             else => |ch| std.debug.panic("todo: unknown or unsupported type sig '{c}'", .{ch}),
         }
+    }
+
+    /// Confirms the entire body has been read, otherwise, returns errror.DbusProtocol
+    pub fn finish(it: *BodyIterator, comptime sig: []const u8, comptime sig_index: usize) error{DbusProtocol}!void {
+        if (sig_index < sig.len) @compileError("signature hasn't been fully read, still have: " ++ sig[sig_index..]);
+        std.debug.assert(sig.len == sig_index);
+        if (it.pending != null) {
+            @panic("notifyConsumed was not called");
+        }
+        if (it.bytes_read < it.body_len) {
+            log_dbus.err("only {} bytes out of {} of the body were read", .{ it.bytes_read, it.body_len });
+            return error.DbusProtocol;
+        }
+        std.debug.assert(it.bytes_read == it.body_len);
     }
 };
 
@@ -1961,6 +2048,19 @@ pub fn DynamicHeaders(comptime message_type: ?MessageType) type {
             return if (self.signature) |*s| s.sliceConst() else "";
         }
 
+        pub fn expectReplySerial(self: *const Self, expected: u32) error{DbusProtocol}!void {
+            if (self.reply_serial != expected) {
+                log_dbus.err("expected serial {} but got {}", .{ expected, self.reply_serial });
+                return error.DbusProtocol;
+            }
+        }
+        pub fn expectSignature(self: *const Self, expected: []const u8) error{DbusProtocol}!void {
+            if (!std.mem.eql(u8, expected, self.signatureSlice())) {
+                log_dbus.err("expected signature '{s}' but got '{s}'", .{ expected, self.signatureSlice() });
+                return error.DbusProtocol;
+            }
+        }
+
         pub fn asGeneric(self: *const Self) DynamicHeaders(null) {
             return .{
                 .unknown_header_count = self.unknown_header_count,
@@ -1976,4 +2076,30 @@ pub fn DynamicHeaders(comptime message_type: ?MessageType) type {
             };
         }
     };
+}
+
+pub fn read(
+    comptime sig: []const u8,
+    comptime sig_index: *usize,
+    comptime kind: ReadKind,
+) fn (*BodyIterator, *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
+    const dbus_type, const char_count = nextType(sig[sig_index.*..]);
+    sig_index.* += char_count;
+    if (!dbus_type.matchesReadKind(kind)) @compileError("signature indicates type " ++ @tagName(dbus_type) ++ " but code is reading " ++ @tagName(kind));
+    return readFn(kind);
+}
+fn readFn(comptime kind: ReadKind) fn (*BodyIterator, *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
+    return (struct {
+        fn func(it: *BodyIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
+            const node = (try it.next(reader)) orelse {
+                log_dbus.err("expected {s} but body has ended", .{kind.valueName()});
+                return error.DbusProtocol;
+            };
+            if (kind != node) {
+                std.log.err("expected {s} but got {s}", .{ kind.valueName(), node.valueName() });
+                return error.DbusProtocol;
+            }
+            return @field(node, @tagName(kind));
+        }
+    }).func;
 }
