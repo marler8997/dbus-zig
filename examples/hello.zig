@@ -24,10 +24,11 @@ pub fn main() !u8 {
     var socket_writer = dbus.socketWriter(stream, &write_buf);
     var socket_reader = dbus.socketReader(stream, &read_buf);
     const writer = &socket_writer.interface;
-    const reader = socket_reader.interface();
+    var source_state: dbus.SourceState = .auth;
+    var source: dbus.Source = .{ .reader = socket_reader.interface(), .state = &source_state };
 
     try dbus.flushAuth(writer);
-    try dbus.readAuth(reader);
+    try source.readAuth();
     std.log.info("authenticated", .{});
 
     try writer.writeAll("BEGIN\r\n");
@@ -47,41 +48,42 @@ pub fn main() !u8 {
 
     var name_buf: [dbus.max_name:0]u8 = undefined;
 
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_file.interface;
+
     const name = blk_name: {
-        const fixed = blk_fixed: {
-            while (true) {
-                const fixed = try dbus.readFixed(reader);
-                switch (fixed.type) {
-                    .method_call => return error.UnexpectedDbusMethodCall,
-                    .method_return => break :blk_fixed fixed,
-                    .error_reply => {
-                        @panic("todo: handle error_reply");
-                    },
-                    .signal => {
-                        std.log.info("ignoring signal", .{});
-                        var stderr_buf: [1000]u8 = undefined;
-                        var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
-                        try fixed.stream(reader, &stderr_file.interface);
-                        try stderr_file.interface.flush();
-                    },
-                }
+        while (true) {
+            const msg_start = try source.readMsgStart();
+            switch (msg_start.type) {
+                .method_call => return error.UnexpectedDbusMethodCall,
+                .method_return => break,
+                .error_reply => {
+                    std.log.err("received error:", .{});
+                    try source.streamRemaining(stderr);
+                    try stderr.flush();
+                    return 0xff;
+                },
+                .signal => {
+                    std.log.info("ignoring signal", .{});
+                    try source.streamRemaining(stderr);
+                    try stderr.flush();
+                },
             }
-        };
-        const headers = try fixed.readMethodReturnHeaders(reader, &.{});
+        }
+
+        const headers = try source.readHeadersMethodReturn(&.{});
+        std.debug.assert(headers.path == null);
         try headers.expectReplySerial(1);
-        try headers.expectSignature("s");
-        var it: dbus.BodyIterator = .{
-            .endian = fixed.endian,
-            .body_len = fixed.body_len,
-            .signature = headers.signatureSlice(),
+        try source.expectSignature("s");
+        const string_size: u32 = try source.readBody(.string_size, {});
+        const name_len: u8 = dbus.castNameLen(string_size) orelse {
+            std.log.err("assigned name is too long {}", .{string_size});
+            return error.DbusProtocol;
         };
-        comptime var sig_index: usize = 0;
-        const string_size = try dbus.read("s", &sig_index, .string_size)(&it, reader);
-        const name_len: u8 = dbus.castNameLen(string_size) orelse std.debug.panic("assigned name is too long {}", .{string_size});
-        try reader.readSliceAll(name_buf[0..name_len]);
-        try dbus.consumeStringNullTerm(reader);
-        it.notifyConsumed(.string);
-        try it.finish("s", sig_index);
+        try source.dataReadSliceAll(name_buf[0..name_len]);
+        try source.dataReadNullTerm();
+        try source.bodyEnd();
         break :blk_name name_buf[0..name_len];
     };
 
@@ -100,49 +102,43 @@ pub fn main() !u8 {
         .{}, // No body
     );
     try writer.flush();
-    {
-        const fixed = blk_fixed: {
-            while (true) {
-                const fixed = try dbus.readFixed(reader);
-                switch (fixed.type) {
-                    .method_call => return error.UnexpectedDbusMethodCall,
-                    .method_return => break :blk_fixed fixed,
-                    .error_reply => {
-                        @panic("todo: handle error reply");
-                    },
-                    .signal => {
-                        std.log.info("ignoring signal", .{});
-                        var stderr_buf: [1000]u8 = undefined;
-                        var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
-                        try fixed.stream(reader, &stderr_file.interface);
-                        try stderr_file.interface.flush();
-                    },
-                }
-            }
-        };
 
-        const headers = try fixed.readMethodReturnHeaders(reader, &.{});
-        try headers.expectReplySerial(2);
-        try headers.expectSignature("s");
-        var it: dbus.BodyIterator = .{
-            .endian = fixed.endian,
-            .body_len = fixed.body_len,
-            .signature = headers.signatureSlice(),
-        };
-        comptime var sig_index: usize = 0;
-        const string_size: u32 = try dbus.read("s", &sig_index, .string_size)(&it, reader);
-        std.log.info("--- Introspect reply:", .{});
-        var remaining: u32 = string_size;
-        while (remaining > 0) {
-            const take_len = @min(reader.buffer.len, remaining);
-            const slice = try reader.take(take_len);
-            std.debug.print("{s}", .{slice});
-            remaining -= @intCast(slice.len);
+    {
+        while (true) {
+            const msg_start = try source.readMsgStart();
+            switch (msg_start.type) {
+                .method_call => return error.UnexpectedDbusMethodCall,
+                .method_return => break,
+                .error_reply => {
+                    std.log.err("received error:", .{});
+                    try source.streamRemaining(stderr);
+                    try stderr.flush();
+                    return 0xff;
+                },
+                .signal => {
+                    std.log.info("ignoring signal", .{});
+                    try source.streamRemaining(stderr);
+                    try stderr.flush();
+                },
+            }
         }
-        try dbus.consumeStringNullTerm(reader);
-        it.notifyConsumed(.string);
+
+        const headers = try source.readHeadersMethodReturn(&.{});
+        std.debug.assert(headers.path == null);
+        try headers.expectReplySerial(2);
+        try source.expectSignature("s");
+        const string_size = try source.readBody(.string_size, {});
+        const string_limit = source.bodyOffset() + string_size + 1;
+        std.log.info("--- Introspect reply:", .{});
+        while (source.bodyOffset() + 1 < string_limit) {
+            const remaining = source.dataRemaining();
+            if (remaining == 1) break;
+            const take_len = @min(remaining - 1, source.reader.buffer.len);
+            std.debug.print("{s}", .{try source.dataTake(take_len)});
+        }
         std.log.info("---- end of Introspect reply", .{});
-        try it.finish("s", sig_index);
+        try source.dataReadNullTerm();
+        try source.bodyEnd();
     }
 
     return 0;

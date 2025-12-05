@@ -48,10 +48,11 @@ fn connect() !std.net.Stream {
     var socket_writer = dbus.socketWriter(stream, &write_buf);
     var socket_reader = dbus.socketReader(stream, &read_buf);
     const writer = &socket_writer.interface;
-    const reader = socket_reader.interface();
+    var source_state: dbus.SourceState = .auth;
+    var source: dbus.Source = .{ .reader = socket_reader.interface(), .state = &source_state };
 
     try dbus.flushAuth(writer);
-    try dbus.readAuth(reader);
+    try source.readAuth();
     std.log.info("authenticated", .{});
 
     try writer.writeAll("BEGIN\r\n");
@@ -71,47 +72,43 @@ fn connect() !std.net.Stream {
 
     var name_buf: [dbus.max_name:0]u8 = undefined;
 
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_file.interface;
+
     const name = blk_name: {
-        const fixed = blk_fixed: {
-            while (true) {
-                const fixed = try dbus.readFixed(reader);
-                switch (fixed.type) {
-                    .method_call => return error.UnexpectedDbusMethodCall,
-                    .method_return => break :blk_fixed fixed,
-                    .error_reply => {
-                        std.log.err("received error after sending Hello:", .{});
-                        readError(reader, &fixed) catch |err| switch (err) {
-                            error.ReadFailed => return socket_reader.getError() orelse error.Unexpected,
-                            else => |e| return e,
-                        };
-                        std.process.exit(0xff);
-                    },
-                    .signal => {
-                        std.log.info("ignoring signal", .{});
-                        var stderr_buf: [1000]u8 = undefined;
-                        var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
-                        try fixed.stream(reader, &stderr_file.interface);
-                        try stderr_file.interface.flush();
-                    },
-                }
+        while (true) {
+            const msg_start = try source.readMsgStart();
+            switch (msg_start.type) {
+                .method_call => return error.UnexpectedDbusMethodCall,
+                .method_return => break,
+                .error_reply => {
+                    std.log.err("received error:", .{});
+                    try source.streamRemaining(stderr);
+                    try stderr.flush();
+                    std.process.exit(0xff);
+                },
+                .signal => {
+                    std.log.info("ignoring signal", .{});
+                    try source.streamRemaining(stderr);
+                    try stderr.flush();
+                },
             }
-        };
-        const headers = try fixed.readMethodReturnHeaders(reader, &.{});
+        }
+
+        const headers = try source.readHeadersMethodReturn(&.{});
+        std.debug.assert(headers.path == null);
         try headers.expectReplySerial(1);
-        try headers.expectSignature("s");
-        var it: dbus.BodyIterator = .{
-            .endian = fixed.endian,
-            .body_len = fixed.body_len,
-            .signature = headers.signatureSlice(),
+        try source.expectSignature("s");
+        const string_size: u32 = try source.readBody(.string_size, {});
+        const name_len: u8 = dbus.castNameLen(string_size) orelse {
+            std.log.err("assigned name is too long {}", .{string_size});
+            return error.DbusProtocol;
         };
-        comptime var sig_index: usize = 0;
-        const string_size: u32 = try dbus.read("s", &sig_index, .string_size)(&it, reader);
-        if (string_size > dbus.max_name) std.debug.panic("assigned name is too long {}", .{string_size});
-        try reader.readSliceAll(name_buf[0..string_size]);
-        try dbus.consumeStringNullTerm(reader);
-        it.notifyConsumed(.string);
-        try it.finish("s", sig_index);
-        break :blk_name name_buf[0..string_size];
+        try source.dataReadSliceAll(name_buf[0..name_len]);
+        try source.dataReadNullTerm();
+        try source.bodyEnd();
+        break :blk_name name_buf[0..name_len];
     };
 
     std.log.info("our name is '{s}'", .{name});
@@ -140,7 +137,8 @@ fn call(call_args: []const Arg) !u8 {
     var socket_writer = dbus.socketWriter(stream, &write_buf);
     var socket_reader = dbus.socketReader(stream, &read_buf);
     const writer = &socket_writer.interface;
-    const reader = socket_reader.interface();
+    var source_state: dbus.SourceState = .msg_start;
+    var source: dbus.Source = .{ .reader = socket_reader.interface(), .state = &source_state };
 
     const body_len: u32 = calcBodyLen(sig, args) catch |err| switch (err) {
         error.BodyTooBig => errExit("the body of this method call is too big", .{}),
@@ -190,44 +188,36 @@ fn call(call_args: []const Arg) !u8 {
 
     try writer.flush();
 
-    const fixed = blk_fixed: {
-        while (true) {
-            const fixed = try dbus.readFixed(reader);
-            switch (fixed.type) {
-                .method_call => return error.UnexpectedDbusMethodCall,
-                .method_return => break :blk_fixed fixed,
-                .error_reply => {
-                    std.log.err("error after sending method call:", .{});
-                    readError(reader, &fixed) catch |err| switch (err) {
-                        error.ReadFailed => return socket_reader.getError() orelse error.Unexpected,
-                        else => |e| return e,
-                    };
-                    std.process.exit(0xff);
-                },
-                .signal => {
-                    std.log.info("ignoring signal", .{});
-                    var stderr_buf: [1000]u8 = undefined;
-                    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
-                    try fixed.stream(reader, &stderr_file.interface);
-                    try stderr_file.interface.flush();
-                },
-            }
-        }
-    };
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_file.interface;
 
-    const headers = try fixed.readMethodReturnHeaders(reader, &.{});
+    while (true) {
+        const msg_start = try source.readMsgStart();
+        switch (msg_start.type) {
+            .method_call => return error.UnexpectedDbusMethodCall,
+            .method_return => break,
+            .error_reply => {
+                std.log.err("received error:", .{});
+                try source.streamRemaining(stderr);
+                try stderr.flush();
+                std.process.exit(0xff);
+            },
+            .signal => {
+                std.log.info("ignoring signal", .{});
+                try source.streamRemaining(stderr);
+                try stderr.flush();
+            },
+        }
+    }
+
+    const headers = try source.readHeadersMethodReturn(&.{});
     try headers.expectReplySerial(2);
-    std.log.info("result signature '{s}'", .{headers.signatureSlice()});
+    std.log.info("result signature '{s}'", .{source.bodySignatureSlice()});
 
     var stdout_buf: [1000]u8 = undefined;
     var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
-    try dbus.streamBody(
-        reader,
-        &stdout_file.interface,
-        fixed.endian,
-        headers.signatureSlice(),
-        fixed.body_len,
-    );
+    try source.streamBody(&stdout_file.interface);
     try stdout_file.interface.flush();
     std.log.info("success", .{});
     return 0;
