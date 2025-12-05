@@ -1,6 +1,6 @@
 .{
-    .name = .dbuszig,
-    .fingerprint = 0xd19eb08773bedc6b,
+    .name = .dbus,
+    .fingerprint = 0x45170d333e2eac86,
     .version = "0.0.0",
     .zig_version = "0.15.2",
     .minimum_zig_version = "0.14.0",
