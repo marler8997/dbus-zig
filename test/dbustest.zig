@@ -2,15 +2,20 @@ const State = struct {
     service_name: dbus.Slice(u32, [*]const u8),
     client_serial: u32,
     service_serial: u32,
-    client: ClientState,
+    client_waiting_for: ?TestSig,
 };
 
-const ClientState = enum {
-    sent_echo,
-    sent_echo_u,
-    sent_echo_au,
-    sent_echo_as,
-    done,
+const TestSig = enum {
+    empty,
+    u,
+    au,
+    as,
+    pub fn sig(s: TestSig) [:0]const u8 {
+        return switch (s) {
+            .empty => "",
+            inline else => |ct| @tagName(ct),
+        };
+    }
 };
 
 pub fn main() !void {
@@ -39,7 +44,7 @@ pub fn main() !void {
         .service_name = .{ .ptr = &service_name_buf, .len = service_name_len },
         .client_serial = 2,
         .service_serial = 2,
-        .client = .sent_echo,
+        .client_waiting_for = null,
     };
 
     while (client_conn.getSource().hasBufferedData()) {
@@ -52,14 +57,12 @@ pub fn main() !void {
     try flushMethodCall(
         client_conn.getWriter(),
         .{ .ptr = &service_name_buf, .len = service_name_len },
-        .echo,
         &state.client_serial,
+        @enumFromInt(0),
     );
+    state.client_waiting_for = @enumFromInt(0);
 
-    while (switch (state.client) {
-        .sent_echo, .sent_echo_u, .sent_echo_au, .sent_echo_as => true,
-        .done => false,
-    }) {
+    while (state.client_waiting_for != null) {
         try handleEvent(&state, &service_conn, &client_conn);
     }
 }
@@ -220,7 +223,7 @@ fn handleServiceMessage(state: *State, writer: *dbus.Writer, source: dbus.Source
             },
         };
 
-        if (std.mem.eql(u8, method.sliceConst(), "echo")) {
+        if (std.mem.eql(u8, method.sliceConst(), "echo_empty")) {
             std.debug.assert(std.mem.eql(u8, signature.sliceConst(), ""));
             try source.bodyEnd();
             try dbus.writeMethodReturn(
@@ -334,35 +337,20 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                 std.debug.assert(headers.error_name == null);
                 std.debug.assert(headers.reply_serial == state.client_serial - 1);
 
-                switch (state.client) {
-                    .sent_echo => {
+                const waiting_for = state.client_waiting_for orelse unreachable;
+                switch (waiting_for) {
+                    .empty => {
                         std.debug.assert(std.mem.eql(u8, "", source.bodySignatureSlice()));
                         try source.bodyEnd();
-                        //
-                        try flushMethodCall(
-                            writer,
-                            state.service_name,
-                            .{ .echo_u = 0x12345678 },
-                            &state.client_serial,
-                        );
-                        state.client = .sent_echo_u;
                     },
-                    .sent_echo_u => {
+                    .u => {
                         std.debug.assert(std.mem.eql(u8, "u", source.bodySignatureSlice()));
                         std.debug.assert(msg_start.body_len == 4);
                         const value = try source.readBody(.u32, {});
                         std.debug.assert(value == 0x12345678);
                         try source.bodyEnd();
-                        //
-                        try flushMethodCall(
-                            writer,
-                            state.service_name,
-                            .{ .echo_au = &echo_au_values },
-                            &state.client_serial,
-                        );
-                        state.client = .sent_echo_au;
                     },
-                    .sent_echo_au => {
+                    .au => {
                         std.debug.assert(std.mem.eql(u8, "au", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
@@ -373,16 +361,8 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                             value_index += 1;
                         }
                         try source.bodyEnd();
-                        //
-                        try flushMethodCall(
-                            writer,
-                            state.service_name,
-                            .{ .echo_as = &echo_as_values },
-                            &state.client_serial,
-                        );
-                        state.client = .sent_echo_as;
                     },
-                    .sent_echo_as => {
+                    .as => {
                         std.debug.assert(std.mem.eql(u8, "as", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
@@ -395,11 +375,24 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                             value_index += 1;
                         }
                         try source.bodyEnd();
-                        //
-                        state.client = .done;
                     },
-                    .done => @panic("impossible?"),
                 }
+
+                const next_sig: TestSig = blk: {
+                    const int = @as(u32, @intFromEnum(waiting_for)) + 1;
+                    if (int == std.meta.fields(TestSig).len) {
+                        state.client_waiting_for = null;
+                        return;
+                    }
+                    break :blk @enumFromInt(int);
+                };
+                try flushMethodCall(
+                    writer,
+                    state.service_name,
+                    &state.client_serial,
+                    next_sig,
+                );
+                state.client_waiting_for = next_sig;
             },
             .error_reply => {
                 std.log.err("Client received error", .{});
@@ -418,12 +411,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
     }
 }
 
-const Method = union(enum) {
-    echo,
-    echo_u: u32,
-    echo_au: []const u32,
-    echo_as: []const dbus.Slice(u32, [*]const u8),
-};
 const echo_au_values = [_]u32{ 100, 42, 0, 0xffffffff };
 const echo_as_values = [_]dbus.Slice(u32, [*]const u8){
     .initStatic("hello"),
@@ -431,23 +418,31 @@ const echo_as_values = [_]dbus.Slice(u32, [*]const u8){
     .initStatic("yay!"),
 };
 
+fn testSigData(comptime test_sig: TestSig) dbus.WriteData(test_sig.sig()) {
+    return switch (test_sig) {
+        .empty => .{},
+        .u => .{0x12345678},
+        .au => .{&echo_au_values},
+        .as => .{&echo_as_values},
+    };
+}
+
 fn flushMethodCall(
     writer: *dbus.Writer,
     service_name: dbus.Slice(u32, [*]const u8),
-    method: Method,
     client_serial_ref: *u32,
+    test_sig: TestSig,
 ) !void {
     const call: dbus.MethodCall = .{
         .serial = client_serial_ref.*,
         .destination = service_name,
         .path = .initStatic("/"),
-        .member = .initAssume(@tagName(method)),
+        .member = switch (test_sig) {
+            inline else => |ct| .initStatic("echo_" ++ @tagName(ct)),
+        },
     };
-    switch (method) {
-        .echo => try dbus.writeMethodCall(writer, "", call, .{}),
-        .echo_u => |value| try dbus.writeMethodCall(writer, "u", call, .{value}),
-        .echo_au => |value| try dbus.writeMethodCall(writer, "au", call, .{value}),
-        .echo_as => |value| try dbus.writeMethodCall(writer, "as", call, .{value}),
+    switch (test_sig) {
+        inline else => |ct| try dbus.writeMethodCall(writer, ct.sig(), call, testSigData(ct)),
     }
     try writer.flush();
     client_serial_ref.* += 1;
