@@ -10,6 +10,7 @@ const TestSig = enum {
     u,
     au,
     as,
+    @"a{uu}",
     pub fn sig(s: TestSig) [:0]const u8 {
         return switch (s) {
             .empty => "",
@@ -376,6 +377,20 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         }
                         try source.bodyEnd();
                     },
+                    .@"a{uu}" => {
+                        std.debug.assert(std.mem.eql(u8, "a{uu}", source.bodySignatureSlice()));
+                        var array: dbus.SourceArray = undefined;
+                        try source.readBody(.array_size, &array);
+                        if (true) @panic("todo");
+                        // var value_index: usize = 0;
+                        while (source.bodyOffset() < array.body_limit) {
+                            // const value1 = try source.readBody(.u32, {});
+                            // const value2 = try source.readBody(.u32, {});
+                            @panic("todo");
+                            // value_index += 1;
+                        }
+                        try source.bodyEnd();
+                    },
                 }
 
                 const next_sig: TestSig = blk: {
@@ -418,12 +433,19 @@ const echo_as_values = [_]dbus.Slice(u32, [*]const u8){
     .initStatic("yay!"),
 };
 
+const @"echo_a{uu}_values" = [_]dbus.DictElement(u32, u32){
+    .{ .key = 0x12345678, .value = 0xffffffff },
+    .{ .key = 0, .value = 1 },
+    .{ .key = 0x7fffffff, .value = 0x80000000 },
+};
+
 fn testSigData(comptime test_sig: TestSig) dbus.WriteData(test_sig.sig()) {
     return switch (test_sig) {
         .empty => .{},
         .u => .{0x12345678},
         .au => .{&echo_au_values},
         .as => .{&echo_as_values},
+        .@"a{uu}" => .{&@"echo_a{uu}_values"},
     };
 }
 
@@ -441,6 +463,7 @@ fn flushMethodCall(
             inline else => |ct| .initStatic("echo_" ++ @tagName(ct)),
         },
     };
+    std.log.info("client sending {s}...", .{call.member.?.nativeSlice()});
     switch (test_sig) {
         inline else => |ct| try dbus.writeMethodCall(writer, ct.sig(), call, testSigData(ct)),
     }
