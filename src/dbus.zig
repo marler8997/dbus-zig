@@ -984,11 +984,13 @@ const BodyIterator = struct {
 
 pub const SourceArray = struct {
     end: union(enum) {
-        value: u8,
+        value,
         parent_array: *SourceArray,
     },
     body_limit: u32,
-    sig_offset: u8,
+    sig_end: u8,
+    element_sig_offset: u8,
+    next_sig_offset: u8,
 };
 
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1343,9 +1345,7 @@ pub const Source = struct {
         switch (it.state) {
             .value => |sig_offset| {
                 std.debug.assert(sig_offset < it.signature.len);
-                std.debug.assert(kind.sig() == it.signature.buffer[sig_offset]);
-                const next_sig_offset = sig_offset + 1;
-                it.state = .{ .value = next_sig_offset };
+                it.state = .{ .value = kind.matchSig(it.signature.sliceConst(), sig_offset).? };
             },
             .string => unreachable,
             .array => source.onDataConsumed(.{ .read_body = kind }),
@@ -1386,9 +1386,13 @@ pub const Source = struct {
                 .string => {},
                 .array => |array| switch (consume_kind) {
                     .data, .child => {},
-                    .read_body => switch (it.signature.buffer[array.sig_offset]) {
-                        'u', 's' => {},
-                        else => @panic("todo update sig"),
+                    .read_body => |read_kind| {
+                        const consume_sig_end = read_kind.matchSig(it.signature.sliceConst(), array.next_sig_offset).?;
+                        array.next_sig_offset = consume_sig_end;
+                        array.next_sig_offset = if (consume_sig_end == array.sig_end or it.signature.buffer[consume_sig_end] == '}')
+                            array.element_sig_offset
+                        else
+                            consume_sig_end;
                     },
                 },
             };
@@ -1404,9 +1408,8 @@ pub const Source = struct {
                     return;
                 },
                 .array => |a| switch (a.end) {
-                    .value => |sig_offset| {
-                        const sig_offset_copy = sig_offset;
-                        it.state = .{ .value = sig_offset_copy };
+                    .value => {
+                        it.state = .{ .value = a.sig_end };
                         return;
                     },
                     .parent_array => |parent_array| {
@@ -1482,11 +1485,11 @@ pub const Source = struct {
             .string => unreachable,
             .array => |array| {
                 std.debug.assert(it.body_offset < array.body_limit);
-                break :blk array.sig_offset;
+                break :blk array.next_sig_offset;
             },
         };
         std.debug.assert(value_sig_offset < it.signature.len);
-        std.debug.assert(kind.sig() == it.signature.buffer[value_sig_offset]);
+        std.debug.assert(null != kind.matchSig(it.signature.sliceConst(), value_sig_offset));
 
         switch (kind) {
             .u32 => {
@@ -1537,14 +1540,17 @@ pub const Source = struct {
                     try source.reader.discardAll(pad_len);
                     it.body_offset += pad_len;
                 }
+                const element_sig_offset: u8 = value_sig_offset + 1;
                 source_array.* = .{
                     .end = switch (it.state) {
-                        .value => .{ .value = scanArrayElementSig(it.signature.sliceConst(), value_sig_offset + 1) },
+                        .value => .value,
                         .string => unreachable,
                         .array => |a| .{ .parent_array = a },
                     },
                     .body_limit = try incBodyLimited(it.body_size, &.{ it.body_offset, array_size }),
-                    .sig_offset = value_sig_offset + 1,
+                    .sig_end = scanArrayElementSig(it.signature.sliceConst(), element_sig_offset),
+                    .element_sig_offset = element_sig_offset,
+                    .next_sig_offset = element_sig_offset,
                 };
                 it.state = .{ .array = source_array };
                 source.onDataConsumed(.data);
@@ -1994,14 +2000,16 @@ const ReadKind = enum {
             .array_size => "array",
         };
     }
-    pub fn sig(kind: ReadKind) u8 {
-        return switch (kind) {
+    pub fn matchSig(kind: ReadKind, sig: []const u8, start: u8) ?u8 {
+        const offset: u8 = start + @as(u8, if (sig[start] == '{') 1 else 0);
+        const kind_char: u8 = switch (kind) {
             .boolean => 'b',
             .u32 => 'u',
             .string_size => 's',
             .object_path_size => 'o',
             .array_size => 'a',
         };
+        return if (sig[offset] == kind_char) (offset + 1) else null;
     }
 };
 
@@ -2178,12 +2186,26 @@ fn typeAddr(comptime t: Type) *const Type {
     return &t;
 }
 
-fn scanArrayElementSig(sig: []const u8, offset: u8) u8 {
+fn scanSig(sig: []const u8, offset: u8) u8 {
     return switch (sig[offset]) {
         'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 'h', 's', 'v' => offset + 1,
         'a' => @panic("todo"),
         '(' => @panic("todo"),
-        '{' => @panic("todo"),
+        else => unreachable,
+    };
+}
+fn scanArrayElementSig(sig: []const u8, offset: u8) u8 {
+    std.debug.assert(sig[offset - 1] == 'a');
+    return switch (sig[offset]) {
+        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 'h', 's', 'v' => offset + 1,
+        'a' => @panic("todo"),
+        '(' => @panic("todo"),
+        '{' => {
+            const after_key = scanSig(sig, offset + 1);
+            const after_value = scanSig(sig, after_key);
+            std.debug.assert(sig[after_value] == '}');
+            return after_value + 1;
+        },
         else => unreachable,
     };
 }

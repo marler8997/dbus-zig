@@ -10,6 +10,23 @@ const TestSig = enum {
     u,
     au,
     as,
+    @"a{uu}",
+    pub fn fromMember(member_str: []const u8) ?TestSig {
+        inline for (std.meta.fields(TestSig)) |field| {
+            const test_sig: TestSig = @enumFromInt(field.value);
+            if (std.mem.eql(u8, test_sig.member(), member_str)) return test_sig;
+        }
+        return null;
+    }
+    pub fn member(s: TestSig) [:0]const u8 {
+        return switch (s) {
+            .empty => "Echo",
+            .u => "EchoU",
+            .au => "EchoAu",
+            .as => "EchoAs",
+            .@"a{uu}" => "EchoAuu",
+        };
+    }
     pub fn sig(s: TestSig) [:0]const u8 {
         return switch (s) {
             .empty => "",
@@ -223,95 +240,126 @@ fn handleServiceMessage(state: *State, writer: *dbus.Writer, source: dbus.Source
             },
         };
 
-        if (std.mem.eql(u8, method.sliceConst(), "echo_empty")) {
-            std.debug.assert(std.mem.eql(u8, signature.sliceConst(), ""));
-            try source.bodyEnd();
-            try dbus.writeMethodReturn(
-                writer,
-                "",
-                .{
-                    .serial = state.service_serial,
-                    .reply_serial = msg_start.serial,
-                    .destination = .{ .ptr = &sender.buffer, .len = sender.len },
-                },
-                .{},
-            );
-            try writer.flush();
-            std.log.info("service sent echo return", .{});
-            state.service_serial += 1;
-        } else if (std.mem.eql(u8, method.sliceConst(), "echo_u")) {
-            std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "u"));
-            std.debug.assert(msg_start.body_len == 4);
-            const value = try source.readBody(.u32, {});
-            try source.bodyEnd();
-
-            try dbus.writeMethodReturn(
-                writer,
-                "u",
-                .{
-                    .serial = state.service_serial,
-                    .reply_serial = msg_start.serial,
-                    .destination = .{ .ptr = &sender.buffer, .len = sender.len },
-                },
-                .{value},
-            );
-            try writer.flush();
-            std.log.info("service sent echo_u return", .{});
-            state.service_serial += 1;
-        } else if (std.mem.eql(u8, method.sliceConst(), "echo_au")) {
-            std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "au"));
-            var array: dbus.SourceArray = undefined;
-            try source.readBody(.array_size, &array);
-            var value_index: usize = 0;
-            while (source.bodyOffset() < array.body_limit) {
+        const test_sig = TestSig.fromMember(method.sliceConst()) orelse std.debug.panic(
+            "unknown member '{s}'",
+            .{method.sliceConst()},
+        );
+        std.log.info("service handling {s}", .{@tagName(test_sig)});
+        switch (test_sig) {
+            .empty => {
+                std.debug.assert(std.mem.eql(u8, signature.sliceConst(), ""));
+                try source.bodyEnd();
+                try dbus.writeMethodReturn(
+                    writer,
+                    "",
+                    .{
+                        .serial = state.service_serial,
+                        .reply_serial = msg_start.serial,
+                        .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+                    },
+                    .{},
+                );
+                try writer.flush();
+                state.service_serial += 1;
+            },
+            .u => {
+                std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "u"));
+                std.debug.assert(msg_start.body_len == 4);
                 const value = try source.readBody(.u32, {});
-                std.debug.assert(echo_au_values[value_index] == value);
-                value_index += 1;
-            }
-            try source.bodyEnd();
+                try source.bodyEnd();
 
-            try dbus.writeMethodReturn(
-                writer,
-                "au",
-                .{
-                    .serial = state.service_serial,
-                    .reply_serial = msg_start.serial,
-                    .destination = .{ .ptr = &sender.buffer, .len = sender.len },
-                },
-                .{&echo_au_values},
-            );
-            try writer.flush();
-            std.log.info("service sent echo_au return", .{});
-            state.service_serial += 1;
-        } else if (std.mem.eql(u8, method.sliceConst(), "echo_as")) {
-            std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "as"));
-            var array: dbus.SourceArray = undefined;
-            try source.readBody(.array_size, &array);
-            var value_index: usize = 0;
-            while (source.bodyOffset() < array.body_limit) {
-                const string_size = try source.readBody(.string_size, {});
-                const string = try source.dataTake(string_size);
-                try source.dataReadNullTerm();
-                std.debug.assert(std.mem.eql(u8, echo_as_values[value_index].nativeSlice(), string));
-                value_index += 1;
-            }
-            try source.bodyEnd();
+                try dbus.writeMethodReturn(
+                    writer,
+                    "u",
+                    .{
+                        .serial = state.service_serial,
+                        .reply_serial = msg_start.serial,
+                        .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+                    },
+                    .{value},
+                );
+                try writer.flush();
+                state.service_serial += 1;
+            },
+            .au => {
+                std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "au"));
+                var array: dbus.SourceArray = undefined;
+                try source.readBody(.array_size, &array);
+                var value_index: usize = 0;
+                while (source.bodyOffset() < array.body_limit) {
+                    const value = try source.readBody(.u32, {});
+                    std.debug.assert(echo_au_values[value_index] == value);
+                    value_index += 1;
+                }
+                try source.bodyEnd();
 
-            try dbus.writeMethodReturn(
-                writer,
-                "as",
-                .{
-                    .serial = state.service_serial,
-                    .reply_serial = msg_start.serial,
-                    .destination = .{ .ptr = &sender.buffer, .len = sender.len },
-                },
-                .{&echo_as_values},
-            );
-            try writer.flush();
-            std.log.info("service sent echo_as return", .{});
-            state.service_serial += 1;
-        } else {
-            std.debug.panic("unsupported method '{s}'", .{method.sliceConst()});
+                try dbus.writeMethodReturn(
+                    writer,
+                    "au",
+                    .{
+                        .serial = state.service_serial,
+                        .reply_serial = msg_start.serial,
+                        .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+                    },
+                    .{&echo_au_values},
+                );
+                try writer.flush();
+                state.service_serial += 1;
+            },
+            .as => {
+                std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "as"));
+                var array: dbus.SourceArray = undefined;
+                try source.readBody(.array_size, &array);
+                var value_index: usize = 0;
+                while (source.bodyOffset() < array.body_limit) {
+                    const string_size = try source.readBody(.string_size, {});
+                    const string = try source.dataTake(string_size);
+                    try source.dataReadNullTerm();
+                    std.debug.assert(std.mem.eql(u8, echo_as_values[value_index].nativeSlice(), string));
+                    value_index += 1;
+                }
+                try source.bodyEnd();
+
+                try dbus.writeMethodReturn(
+                    writer,
+                    "as",
+                    .{
+                        .serial = state.service_serial,
+                        .reply_serial = msg_start.serial,
+                        .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+                    },
+                    .{&echo_as_values},
+                );
+                try writer.flush();
+                state.service_serial += 1;
+            },
+            .@"a{uu}" => {
+                std.debug.assert(std.mem.eql(u8, signature.sliceConst(), "a{uu}"));
+                var array: dbus.SourceArray = undefined;
+                try source.readBody(.array_size, &array);
+                var value_index: usize = 0;
+                while (source.bodyOffset() < array.body_limit) {
+                    const key = try source.readBody(.u32, {});
+                    std.debug.assert(key == echo_auu_values[value_index].key);
+                    const value = try source.readBody(.u32, {});
+                    std.debug.assert(value == echo_auu_values[value_index].value);
+                    value_index += 1;
+                }
+                try source.bodyEnd();
+
+                try dbus.writeMethodReturn(
+                    writer,
+                    "a{uu}",
+                    .{
+                        .serial = state.service_serial,
+                        .reply_serial = msg_start.serial,
+                        .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+                    },
+                    .{&echo_auu_values},
+                );
+                try writer.flush();
+                state.service_serial += 1;
+            },
         }
 
         if (!source.hasBufferedData()) break;
@@ -376,6 +424,20 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         }
                         try source.bodyEnd();
                     },
+                    .@"a{uu}" => {
+                        std.debug.assert(std.mem.eql(u8, "a{uu}", source.bodySignatureSlice()));
+                        var array: dbus.SourceArray = undefined;
+                        try source.readBody(.array_size, &array);
+                        var value_index: usize = 0;
+                        while (source.bodyOffset() < array.body_limit) {
+                            const key = try source.readBody(.u32, {});
+                            std.debug.assert(key == echo_auu_values[value_index].key);
+                            const value = try source.readBody(.u32, {});
+                            std.debug.assert(value == echo_auu_values[value_index].value);
+                            value_index += 1;
+                        }
+                        try source.bodyEnd();
+                    },
                 }
 
                 const next_sig: TestSig = blk: {
@@ -417,6 +479,11 @@ const echo_as_values = [_]dbus.Slice(u32, [*]const u8){
     .initStatic("there"),
     .initStatic("yay!"),
 };
+const echo_auu_values = [_]dbus.DictElement(u32, u32){
+    .{ .key = 0x12345678, .value = 0xffffffff },
+    .{ .key = 0, .value = 1 },
+    .{ .key = 0x7fffffff, .value = 0x80000000 },
+};
 
 fn testSigData(comptime test_sig: TestSig) dbus.WriteData(test_sig.sig()) {
     return switch (test_sig) {
@@ -424,6 +491,7 @@ fn testSigData(comptime test_sig: TestSig) dbus.WriteData(test_sig.sig()) {
         .u => .{0x12345678},
         .au => .{&echo_au_values},
         .as => .{&echo_as_values},
+        .@"a{uu}" => .{&echo_auu_values},
     };
 }
 
@@ -437,10 +505,9 @@ fn flushMethodCall(
         .serial = client_serial_ref.*,
         .destination = service_name,
         .path = .initStatic("/"),
-        .member = switch (test_sig) {
-            inline else => |ct| .initStatic("echo_" ++ @tagName(ct)),
-        },
+        .member = .initAssume(test_sig.member()),
     };
+    std.log.info("client sending {s}...", .{call.member.?.nativeSlice()});
     switch (test_sig) {
         inline else => |ct| try dbus.writeMethodCall(writer, ct.sig(), call, testSigData(ct)),
     }
