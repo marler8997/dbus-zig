@@ -1035,7 +1035,7 @@ const BodyIterator = struct {
             return switch (state.*) {
                 .value => .value,
                 .string => unreachable,
-                .variant => @panic("todo: variant arrays"),
+                .variant => |variant| .{ .variant = variant },
                 .array => |array| .{ .parent_array = array },
             };
         }
@@ -1413,7 +1413,7 @@ pub const Source = struct {
         }
     }
 
-    fn onBodyConsumed(source: Source, comptime consume_sig: []const u8) error{DbusProtocol}!void {
+    fn onBodyConsumed(source: Source, consume_sig: []const u8) void {
         const it = switch (source.state.*) {
             .err, .auth, .msg_start, .headers => unreachable,
             .body => |*it| it,
@@ -1445,8 +1445,13 @@ pub const Source = struct {
                 it.state = switch (variant.end) {
                     .value => .{ .value = variant.restore.sig_offset },
                     .variant => @panic("todo"),
-                    .parent_array => @panic("todo"),
+                    .parent_array => |array| .{ .array = array },
                 };
+                switch (variant.end) {
+                    .value => {},
+                    .variant => @panic("todo"),
+                    .parent_array => source.onDataConsumed("v"),
+                }
             },
             .string => unreachable,
             .array => source.onDataConsumed(consume_sig),
@@ -1490,12 +1495,13 @@ pub const Source = struct {
                     );
                 },
             };
-            maybe_consumed_sig = switch (it.state) {
+            const consumed_sig: []const u8 = switch (it.state) {
                 .value => unreachable,
                 .string => "s",
                 .variant => "v",
                 .array => |array| it.current_signature.slice()[array.element_sig_offset - 1 .. array.sig_end],
             };
+            maybe_consumed_sig = consumed_sig;
             switch (switch (it.state) {
                 .value => unreachable,
                 .string => |*s| s.end,
@@ -1512,8 +1518,10 @@ pub const Source = struct {
                     it.state = .{ .value = next_sig_offset };
                     return;
                 },
-                .variant => {
-                    @panic("todo");
+                .variant => |variant| {
+                    it.current_signature = &variant.signature;
+                    it.state = .{ .variant = variant };
+                    return source.onBodyConsumed(consumed_sig);
                 },
                 .parent_array => |parent_array| {
                     const parent_copy = parent_array;
@@ -1615,7 +1623,7 @@ pub const Source = struct {
                 it.body_offset += pad_len;
                 const value = try source.reader.takeInt(u32, it.endian);
                 it.body_offset += 4;
-                try source.onBodyConsumed("u");
+                source.onBodyConsumed("u");
                 return value;
             },
             .string_size, .object_path_size => {

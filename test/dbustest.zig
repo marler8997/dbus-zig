@@ -12,12 +12,14 @@ const TestCase = enum {
     as,
     dict_uu,
     dict_us,
+    dict_uv,
     v_u,
     pub fn sig(case: TestCase) [:0]const u8 {
         return switch (case) {
             .empty => "",
             .dict_uu => "a{uu}",
             .dict_us => "a{us}",
+            .dict_uv => "a{uv}",
             .v_u => "v",
             inline else => |ct| @tagName(ct),
         };
@@ -336,6 +338,33 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         }
                         try source.bodyEnd();
                     },
+                    .dict_uv => {
+                        std.debug.assert(std.mem.eql(u8, "a{uv}", source.bodySignatureSlice()));
+                        var array: dbus.SourceArray = undefined;
+                        try source.readBody(.array_size, &array);
+                        var value_index: usize = 0;
+                        while (source.bodyOffset() < array.body_limit) {
+                            const key = try source.readBody(.u32, {});
+                            std.debug.assert(key == testvalues.dict_uv[value_index].key);
+                            var variant: dbus.SourceVariant = undefined;
+                            try source.readBody(.variant_sig, &variant);
+                            if (std.mem.eql(u8, variant.signature.slice(), "u")) {
+                                const value = try source.readBody(.u32, {});
+                                std.debug.assert(testvalues.dict_uv[value_index].value.u32 == value);
+                            } else if (std.mem.eql(u8, variant.signature.slice(), "s")) {
+                                const string_size = try source.readBody(.string_size, {});
+                                const string = try source.dataTake(string_size);
+                                try source.dataReadNullTerm();
+                                std.debug.assert(
+                                    std.mem.eql(u8, testvalues.dict_uv[value_index].value.string.nativeSlice(), string),
+                                );
+                            } else {
+                                std.debug.panic("todo: sig '{s}'", .{variant.signature.slice()});
+                            }
+                            value_index += 1;
+                        }
+                        try source.bodyEnd();
+                    },
                     .v_u => {
                         std.debug.assert(std.mem.eql(u8, source.bodySignatureSlice(), "v"));
                         var variant: dbus.SourceVariant = undefined;
@@ -407,6 +436,13 @@ const testvalues = struct {
         .{ .key = 0x7fffffff, .value = .initStatic("Another string\nHello\n") },
         .{ .key = 123, .value = .initStatic("a") },
         .{ .key = 456, .value = .initStatic("") },
+    };
+
+    pub const dict_uv = &dict_uv_array;
+    const dict_uv_array = [_]dbus.DictElement(u32, dbus.Variant){
+        .{ .key = 10, .value = .{ .u32 = 0x123 } },
+        .{ .key = 11, .value = .{ .string = .initStatic("a string") } },
+        // TODO: add sub variant/array values
     };
 
     pub const v_u: dbus.Variant = .{ .u32 = 0xf02958ab };
