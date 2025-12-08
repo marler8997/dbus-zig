@@ -10,12 +10,14 @@ const TestCase = enum {
     u,
     au,
     as,
-    auu,
+    dict_uu,
+    dict_us,
     v_u,
     pub fn sig(case: TestCase) [:0]const u8 {
         return switch (case) {
             .empty => "",
-            .auu => "a{uu}",
+            .dict_uu => "a{uu}",
+            .dict_us => "a{us}",
             .v_u => "v",
             inline else => |ct| @tagName(ct),
         };
@@ -304,16 +306,32 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         }
                         try source.bodyEnd();
                     },
-                    .auu => {
+                    .dict_uu => {
                         std.debug.assert(std.mem.eql(u8, "a{uu}", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const key = try source.readBody(.u32, {});
-                            std.debug.assert(key == testvalues.auu[value_index].key);
+                            std.debug.assert(key == testvalues.dict_uu[value_index].key);
                             const value = try source.readBody(.u32, {});
-                            std.debug.assert(value == testvalues.auu[value_index].value);
+                            std.debug.assert(value == testvalues.dict_uu[value_index].value);
+                            value_index += 1;
+                        }
+                        try source.bodyEnd();
+                    },
+                    .dict_us => {
+                        std.debug.assert(std.mem.eql(u8, "a{us}", source.bodySignatureSlice()));
+                        var array: dbus.SourceArray = undefined;
+                        try source.readBody(.array_size, &array);
+                        var value_index: usize = 0;
+                        while (source.bodyOffset() < array.body_limit) {
+                            const key = try source.readBody(.u32, {});
+                            std.debug.assert(key == testvalues.dict_us[value_index].key);
+                            const string_size = try source.readBody(.string_size, {});
+                            const string = try source.dataTake(string_size);
+                            try source.dataReadNullTerm();
+                            std.debug.assert(std.mem.eql(u8, testvalues.dict_us[value_index].value.nativeSlice(), string));
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -375,11 +393,20 @@ const testvalues = struct {
         .initStatic("yay!"),
     };
 
-    pub const auu = &auu_array;
-    const auu_array = [_]dbus.DictElement(u32, u32){
+    pub const dict_uu = &dict_uu_array;
+    const dict_uu_array = [_]dbus.DictElement(u32, u32){
         .{ .key = 0x12345678, .value = 0xffffffff },
         .{ .key = 0, .value = 1 },
         .{ .key = 0x7fffffff, .value = 0x80000000 },
+    };
+
+    pub const dict_us = &dict_us_array;
+    const dict_us_array = [_]dbus.DictElement(u32, dbus.Slice(u32, [*]const u8)){
+        .{ .key = 10, .value = .initStatic("The value for the 10 key") },
+        .{ .key = 100, .value = .initStatic("FooBar") },
+        .{ .key = 0x7fffffff, .value = .initStatic("Another string\nHello\n") },
+        .{ .key = 123, .value = .initStatic("a") },
+        .{ .key = 456, .value = .initStatic("") },
     };
 
     pub const v_u: dbus.Variant = .{ .u32 = 0xf02958ab };

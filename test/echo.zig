@@ -88,15 +88,20 @@ fn echoBody(
             );
             sig_offset += 1;
 
-            const element_sig = blk: {
+            const element_sig, const is_dict = blk: {
                 if (sig[sig_offset] == '{') {
                     std.debug.assert(sig[array.sig_end - 1] == '}');
-                    break :blk sig[sig_offset + 1 .. array.sig_end - 1];
+                    break :blk .{ sig[sig_offset + 1 .. array.sig_end - 1], true };
                 }
-                break :blk sig[sig_offset..array.sig_end];
+                break :blk .{ sig[sig_offset..array.sig_end], false };
             };
 
             while (source.bodyOffset() < array.body_limit) {
+                {
+                    const pad_len = if (is_dict) dbus.pad8Len(@truncate(write_body_offset)) else 0;
+                    try writer.splatByteAll(0, pad_len);
+                    write_body_offset += pad_len;
+                }
                 write_body_offset = try echoBody(
                     source,
                     writer,

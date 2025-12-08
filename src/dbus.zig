@@ -571,6 +571,21 @@ fn dictDataOffset(start: u32) error{Overflow}!u32 {
     return arrayDataOffset(start, .yes);
 }
 
+fn arraySigAdvance(sig: []const u8, start: u8, end: u8, next: u8) u8 {
+    std.debug.assert(start < end);
+    std.debug.assert(start <= next);
+    std.debug.assert(next <= end);
+    if (next == end) return start;
+    if (next + 1 == end and sig[next] == '}') return start;
+    return switch (sig[next]) {
+        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v', 'a' => next,
+        else => std.debug.panic(
+            "todo: arraySigAdvance to {} ('{s}') correct? sig='{s}' start={} end={}",
+            .{ next, sig[next .. next + 1], sig, start, end },
+        ),
+    };
+}
+
 pub fn DictElement(comptime Key: type, comptime Value: type) type {
     return struct { key: Key, value: Value };
 }
@@ -1398,7 +1413,7 @@ pub const Source = struct {
         }
     }
 
-    fn onBodyConsumed(source: Source, kind: ReadKind) error{DbusProtocol}!void {
+    fn onBodyConsumed(source: Source, comptime consume_sig: []const u8) error{DbusProtocol}!void {
         const it = switch (source.state.*) {
             .err, .auth, .msg_start, .headers => unreachable,
             .body => |*it| it,
@@ -1407,15 +1422,25 @@ pub const Source = struct {
         std.debug.assert(it.body_offset <= it.body_size);
         switch (it.state) {
             .value => |sig_offset| {
-                std.debug.assert(sig_offset < it.current_signature.len);
-                it.state = .{ .value = kind.matchSig(it.current_signature.slice(), sig_offset).? };
+                std.debug.assert(sig_offset + consume_sig.len <= it.current_signature.len);
+                std.debug.assert(std.mem.eql(
+                    u8,
+                    it.current_signature.slice()[sig_offset..][0..consume_sig.len],
+                    consume_sig,
+                ));
+                it.state = .{ .value = @intCast(sig_offset + consume_sig.len) };
             },
             .variant => |variant| {
                 std.debug.assert(it.current_signature == &variant.signature);
                 std.debug.assert(variant.sig_offset < variant.signature.len);
-                const sig_end = kind.matchSig(variant.signature.slice(), variant.sig_offset).?;
-                // this *might* need to be a DbusProtcol error?
-                std.debug.assert(sig_end == variant.signature.len);
+                // TODO: one or more of these checks might need to be a DbusProtocol error rather
+                //       than runtime assert
+                std.debug.assert(variant.sig_offset + consume_sig.len == variant.signature.len);
+                std.debug.assert(std.mem.eql(
+                    u8,
+                    variant.signature.slice()[0..consume_sig.len],
+                    consume_sig,
+                ));
                 it.current_signature = variant.restore.signature;
                 it.state = switch (variant.end) {
                     .value => .{ .value = variant.restore.sig_offset },
@@ -1424,30 +1449,22 @@ pub const Source = struct {
                 };
             },
             .string => unreachable,
-            .array => source.onDataConsumed(.{ .read_body = kind }),
+            .array => source.onDataConsumed(consume_sig),
         }
     }
 
     // only call if we're in a "body data" state, updates the current state if all the
     // data has been consumed
-    fn onDataConsumed(source: Source, first_consume_kind: union(enum) {
-        data,
-        read_body: ReadKind,
-        child,
-    }) void {
+    fn onDataConsumed(source: Source, maybe_first_sig: ?[]const u8) void {
         const it = switch (source.state.*) {
             .err, .auth, .msg_start, .headers => unreachable,
             .body => |*it| it,
         };
-        var consume_kind = first_consume_kind;
+        var maybe_consumed_sig = maybe_first_sig;
         while (true) {
             switch (it.state) {
                 .value => unreachable,
-                .string => switch (consume_kind) {
-                    .data => {},
-                    .read_body => unreachable,
-                    .child => unreachable,
-                },
+                .string => std.debug.assert(maybe_consumed_sig == null),
                 .variant => unreachable,
                 .array => {},
             }
@@ -1463,19 +1480,22 @@ pub const Source = struct {
                 .value => unreachable,
                 .string => {},
                 .variant => unreachable,
-                .array => |array| switch (consume_kind) {
-                    .data, .child => {},
-                    .read_body => |read_kind| {
-                        const consume_sig_end = read_kind.matchSig(it.current_signature.slice(), array.next_sig_offset).?;
-                        array.next_sig_offset = consume_sig_end;
-                        array.next_sig_offset = if (consume_sig_end == array.sig_end or it.current_signature.buffer[consume_sig_end] == '}')
-                            array.element_sig_offset
-                        else
-                            consume_sig_end;
-                    },
+                .array => |array| if (maybe_consumed_sig) |sig| {
+                    std.debug.assert(std.mem.eql(u8, it.current_signature.buffer[array.next_sig_offset..][0..sig.len], sig));
+                    array.next_sig_offset = arraySigAdvance(
+                        it.current_signature.slice(),
+                        array.element_sig_offset,
+                        array.sig_end,
+                        @intCast(array.next_sig_offset + sig.len),
+                    );
                 },
             };
-
+            maybe_consumed_sig = switch (it.state) {
+                .value => unreachable,
+                .string => "s",
+                .variant => "v",
+                .array => |array| it.current_signature.slice()[array.element_sig_offset - 1 .. array.sig_end],
+            };
             switch (switch (it.state) {
                 .value => unreachable,
                 .string => |*s| s.end,
@@ -1500,8 +1520,6 @@ pub const Source = struct {
                     it.state = .{ .array = parent_copy };
                 },
             }
-            // TODO???
-            consume_kind = .child;
         }
     }
 
@@ -1576,11 +1594,17 @@ pub const Source = struct {
             .variant => |variant| variant.sig_offset,
             .array => |array| {
                 std.debug.assert(it.body_offset < array.body_limit);
+                if (it.current_signature.buffer[array.next_sig_offset] == '{') {
+                    const pad_len: u32 = pad8Len(@truncate(it.body_offset));
+                    try source.reader.discardAll(pad_len);
+                    it.body_offset = try incBodyLimited(it.body_size, &.{ it.body_offset, pad_len });
+                    array.next_sig_offset += 1;
+                }
                 break :blk array.next_sig_offset;
             },
         };
         std.debug.assert(value_sig_offset < it.current_signature.len);
-        std.debug.assert(null != kind.matchSig(it.current_signature.slice(), value_sig_offset));
+        std.debug.assert(kind.sigChar() == it.current_signature.slice()[value_sig_offset]);
 
         switch (kind) {
             .u32 => {
@@ -1591,7 +1615,7 @@ pub const Source = struct {
                 it.body_offset += pad_len;
                 const value = try source.reader.takeInt(u32, it.endian);
                 it.body_offset += 4;
-                try source.onBodyConsumed(.u32);
+                try source.onBodyConsumed("u");
                 return value;
             },
             .string_size, .object_path_size => {
@@ -1662,7 +1686,7 @@ pub const Source = struct {
                     .next_sig_offset = element_sig_offset,
                 };
                 it.state = .{ .array = read_context };
-                source.onDataConsumed(.data);
+                source.onDataConsumed(null);
                 return;
             },
             else => @compileError("todo: implement read kind " ++ @tagName(kind)),
@@ -1714,7 +1738,7 @@ pub const Source = struct {
         std.debug.assert(it.body_offset + size <= body_limit);
         const result = try source.reader.take(size);
         it.body_offset += @intCast(size);
-        source.onDataConsumed(.data);
+        source.onDataConsumed(null);
         return result;
     }
 
@@ -1750,7 +1774,7 @@ pub const Source = struct {
         std.debug.assert(it.body_offset + slice.len <= body_limit);
         try source.reader.readSliceAll(slice);
         it.body_offset += @intCast(slice.len);
-        source.onDataConsumed(.data);
+        source.onDataConsumed(null);
     }
     pub fn dataReadNullTerm(source: Source) error{ DbusProtocol, ReadFailed, EndOfStream }!void {
         const it = switch (source.state.*) {
@@ -1771,7 +1795,7 @@ pub const Source = struct {
             log_dbus.err("expected 0 terminator but got {}", .{nullterm});
             return error.DbusProtocol;
         }
-        source.onDataConsumed(.data);
+        source.onDataConsumed(null);
     }
 
     pub fn dataStreamExact(source: Source, writer: *Writer, n: u32) error{ ReadFailed, EndOfStream, WriteFailed }!void {
@@ -1789,7 +1813,7 @@ pub const Source = struct {
         std.debug.assert(it.body_offset + n <= body_limit);
         try source.reader.streamExact(writer, n);
         it.body_offset += n;
-        source.onDataConsumed(.data);
+        source.onDataConsumed(null);
     }
 };
 
@@ -2124,9 +2148,9 @@ const ReadKind = enum {
             .array_size => "array",
         };
     }
-    pub fn matchSig(kind: ReadKind, sig: []const u8, start: u8) ?u8 {
-        const offset: u8 = start + @as(u8, if (sig[start] == '{') 1 else 0);
-        const kind_char: u8 = switch (kind) {
+
+    pub fn sigChar(kind: ReadKind) u8 {
+        return switch (kind) {
             .boolean => 'b',
             .u32 => 'u',
             .string_size => 's',
@@ -2134,7 +2158,6 @@ const ReadKind = enum {
             .variant_sig => 'v',
             .array_size => 'a',
         };
-        return if (sig[offset] == kind_char) (offset + 1) else null;
     }
 };
 
