@@ -531,7 +531,7 @@ pub const Type = union(enum) {
                 return writeSum(&.{ start, pad_len + 4 + 1, value.len });
             },
             .array => |element| {
-                var offset = try arrayDataOffset(start, arrayElementAlign8(element.getSigFirstChar()));
+                var offset = try arrayDataOffset(start, .fromSig(element.getSigFirstChar()));
                 for (value.*) |*e| {
                     offset = try element.advance(offset, e);
                 }
@@ -561,14 +561,14 @@ pub const Type = union(enum) {
     }
 };
 
-fn arrayDataOffset(start: u32, element_align_8: bool) error{Overflow}!u32 {
+fn arrayDataOffset(start: u32, element_align8: Align8) error{Overflow}!u32 {
     const pad_len: u32 = pad4Len(@truncate(start));
     const after_size: u32 = try writeSum(&.{ start, pad_len + 4 });
-    return try writeSum(&.{ after_size, if (element_align_8) pad8Len(@truncate(after_size)) else 0 });
+    return try writeSum(&.{ after_size, element_align8.padLen(@truncate(after_size)) });
 }
 fn dictDataOffset(start: u32) error{Overflow}!u32 {
     // all dict elements are structs which require 8-byte alignment
-    return arrayDataOffset(start, true);
+    return arrayDataOffset(start, .yes);
 }
 
 pub fn DictElement(comptime Key: type, comptime Value: type) type {
@@ -797,32 +797,16 @@ pub fn write(
                 index += 1;
             },
             .string, .object_path => {
-                const pad_len = pad4Len(@truncate(index));
-                try writer.splatByteAll(0, pad_len);
-                index += pad_len;
-                try writer.writeInt(u32, @field(data, name).len, native_endian);
-                index += 4;
+                index = try writeStringSize(writer, index, @field(data, name).len);
                 try writer.writeAll(@field(data, name).nativeSlice());
                 index += @field(data, name).len;
                 try writer.writeByte(0);
                 index += 1;
             },
             .array => |element| {
-                const element_align_8 = arrayElementAlign8(element.getSigFirstChar());
-                const data_start = arrayDataOffset(index, element_align_8) catch unreachable;
-                {
-                    const pad_len: u32 = pad4Len(@truncate(index));
-                    try writer.splatByteAll(0, pad_len);
-                    index += pad_len;
-                }
-                try writer.writeInt(u32, after_field - data_start, native_endian);
-                index += 4;
-                if (element_align_8) {
-                    const pad_len = pad8Len(@truncate(index));
-                    try writer.splatByteAll(0, pad_len);
-                    index += pad_len;
-                }
-                std.debug.assert(index == data_start);
+                const element_align8: Align8 = .fromSig(element.getSigFirstChar());
+                const array_size = after_field - (arrayDataOffset(index, element_align8) catch unreachable);
+                index = try writeArraySize(writer, element_align8, index, array_size);
                 for (@field(data, name)) |*e| {
                     index = try write(writer, index, element.getSignature().nativeSlice(), .{e.*});
                 }
@@ -860,6 +844,53 @@ pub fn write(
     }
     std.debug.assert(index == advance(full_write_start, signature, data) catch unreachable);
     return index;
+}
+
+pub const Align8 = enum {
+    no,
+    yes,
+    pub fn fromSig(ch: u8) Align8 {
+        return switch (ch) {
+            'x', 't', 'd', '(', '{' => .yes,
+            else => .no,
+        };
+    }
+    pub fn padLen(a: Align8, offset_align: u3) u3 {
+        return switch (a) {
+            .no => 0,
+            .yes => pad8Len(offset_align),
+        };
+    }
+};
+
+pub fn writeStringSize(writer: *Writer, body_start: u32, string_size: u32) error{WriteFailed}!u32 {
+    const pad_len = pad4Len(@truncate(body_start));
+    try writer.splatByteAll(0, pad_len);
+    try writer.writeInt(u32, string_size, native_endian);
+    return body_start + @as(u32, pad_len) + 4;
+}
+pub fn writeArraySize(
+    writer: *Writer,
+    element_align8: Align8,
+    body_start: u32,
+    array_size: u32,
+) error{WriteFailed}!u32 {
+    const data_start = arrayDataOffset(body_start, element_align8) catch unreachable;
+    var body_offset: u32 = body_start;
+    {
+        const pad_len: u32 = pad4Len(@truncate(body_offset));
+        try writer.splatByteAll(0, pad_len);
+        body_offset += pad_len;
+    }
+    try writer.writeInt(u32, array_size, native_endian);
+    body_offset += 4;
+    {
+        const pad_len = element_align8.padLen(@truncate(body_offset));
+        try writer.splatByteAll(0, pad_len);
+        body_offset += pad_len;
+    }
+    std.debug.assert(body_offset == data_start);
+    return data_start;
 }
 
 pub fn writeMethodCall(
@@ -929,7 +960,7 @@ pub fn writeMethodReturn(
     const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
         @intFromEnum(MessageType.method_return), // 2
-        0, // flags,
+        0, // flags
         1, // protocol version
         body_len,
         args.serial,
@@ -1661,6 +1692,7 @@ pub const Source = struct {
         const body_limit = switch (it.state) {
             .value => unreachable,
             .string => |*s| s.body_limit,
+            .variant => unreachable,
             .array => |a| a.body_limit,
         };
         std.debug.assert(it.body_offset < body_limit);
@@ -1741,12 +1773,32 @@ pub const Source = struct {
         }
         source.onDataConsumed(.data);
     }
+
+    pub fn dataStreamExact(source: Source, writer: *Writer, n: u32) error{ ReadFailed, EndOfStream, WriteFailed }!void {
+        const it = switch (source.state.*) {
+            .err, .auth, .msg_start, .headers => unreachable,
+            .body => |*it| it,
+        };
+        errdefer source.state.* = .err;
+        const body_limit = switch (it.state) {
+            .value => unreachable,
+            .string => |*s| s.body_limit,
+            .variant => unreachable,
+            .array => |a| a.body_limit,
+        };
+        std.debug.assert(it.body_offset + n <= body_limit);
+        try source.reader.streamExact(writer, n);
+        it.body_offset += n;
+        source.onDataConsumed(.data);
+    }
 };
 
 fn Bounded(comptime max: comptime_int) type {
     return struct {
         buffer: [max:0]u8,
-        len: std.math.IntFittingRange(0, max),
+        len: Len,
+
+        const Len = std.math.IntFittingRange(0, max);
 
         const Self = @This();
         pub fn empty() Self {
@@ -1757,6 +1809,10 @@ fn Bounded(comptime max: comptime_int) type {
         }
         pub fn slice(self: *const Self) []const u8 {
             return self.buffer[0..self.len];
+        }
+
+        pub fn sliceDbus(self: *const Self) Slice(Len, [*]const u8) {
+            return .{ .ptr = &self.buffer, .len = self.len };
         }
 
         pub const format = if (zig_atleast_15) formatNew else formatLegacy;
@@ -2081,13 +2137,6 @@ const ReadKind = enum {
         return if (sig[offset] == kind_char) (offset + 1) else null;
     }
 };
-
-fn arrayElementAlign8(element_sig_first_char: u8) bool {
-    return switch (element_sig_first_char) {
-        'x', 't', 'd', '(', '{' => true,
-        else => false,
-    };
-}
 
 /// Returns the initial padding size between the array size and its first element.
 /// This padding is always present event if the array is empty (has a size of 0).
