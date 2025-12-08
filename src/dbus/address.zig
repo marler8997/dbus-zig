@@ -36,7 +36,6 @@ pub const Address = union(Transport) {
                         //std.debug.assert(len_without_null <= kv.unescaped_value.len);
                         //const new_len = len_without_null + 1;
                         //resolved[len_without_null] = 0;
-                        //_ = allocator.shrink(resolved, new_len);
                         //path = std.meta.assumeSentinel(resolved.ptr, 0);
                         //std.debug.assert(std.mem.len(path) == new_len);
                         path = kv.unescaped_value;
@@ -49,17 +48,6 @@ pub const Address = union(Transport) {
                         .unescaped_path = path orelse return error.UnixMissingPath,
                     },
                 };
-            },
-        }
-    }
-};
-
-pub const AllocatedAddress = struct {
-    addr: Address,
-    pub fn deinit(self: AllocatedAddress, allocator: *std.mem.Allocator) void {
-        switch (self) {
-            .unix => |unix_addr| {
-                allocator.free(u8, unix_addr.path[0 .. std.mem.len(unix_addr.path) + 1]);
             },
         }
     }
