@@ -1817,7 +1817,7 @@ pub const Source = struct {
     }
 };
 
-fn Bounded(comptime max: comptime_int) type {
+pub fn Bounded(comptime max: comptime_int) type {
     return struct {
         buffer: [max:0]u8,
         len: Len,
