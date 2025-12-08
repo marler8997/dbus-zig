@@ -285,7 +285,7 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const value = try source.readBody(.u32, {});
-                            std.debug.assert(echo_au_values[value_index] == value);
+                            std.debug.assert(testvalues.au[value_index] == value);
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -299,7 +299,7 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                             const string_size = try source.readBody(.string_size, {});
                             const string = try source.dataTake(string_size);
                             try source.dataReadNullTerm();
-                            std.debug.assert(std.mem.eql(u8, echo_as_values[value_index].nativeSlice(), string));
+                            std.debug.assert(std.mem.eql(u8, testvalues.as[value_index].nativeSlice(), string));
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -311,9 +311,9 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const key = try source.readBody(.u32, {});
-                            std.debug.assert(key == echo_auu_values[value_index].key);
+                            std.debug.assert(key == testvalues.auu[value_index].key);
                             const value = try source.readBody(.u32, {});
-                            std.debug.assert(value == echo_auu_values[value_index].value);
+                            std.debug.assert(value == testvalues.auu[value_index].value);
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -362,31 +362,28 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
     }
 }
 
-const echo_au_values = [_]u32{ 100, 42, 0, 0xffffffff };
-const echo_as_values = [_]dbus.Slice(u32, [*]const u8){
-    .initStatic("hello"),
-    .initStatic("there"),
-    .initStatic("yay!"),
-};
-const echo_auu_values = [_]dbus.DictElement(u32, u32){
-    .{ .key = 0x12345678, .value = 0xffffffff },
-    .{ .key = 0, .value = 1 },
-    .{ .key = 0x7fffffff, .value = 0x80000000 },
-};
 const testvalues = struct {
+    pub const u: u32 = 0x12345678;
+
+    pub const au = &au_array;
+    const au_array = [_]u32{ 100, 42, 0, 0xffffffff };
+
+    pub const as = &as_array;
+    const as_array = [_]dbus.Slice(u32, [*]const u8){
+        .initStatic("hello"),
+        .initStatic("there"),
+        .initStatic("yay!"),
+    };
+
+    pub const auu = &auu_array;
+    const auu_array = [_]dbus.DictElement(u32, u32){
+        .{ .key = 0x12345678, .value = 0xffffffff },
+        .{ .key = 0, .value = 1 },
+        .{ .key = 0x7fffffff, .value = 0x80000000 },
+    };
+
     pub const v_u: dbus.Variant = .{ .u32 = 0xf02958ab };
 };
-
-fn testCaseData(comptime test_case: TestCase) dbus.WriteData(test_case.sig()) {
-    return switch (test_case) {
-        .empty => .{},
-        .u => .{0x12345678},
-        .au => .{&echo_au_values},
-        .as => .{&echo_as_values},
-        .auu => .{&echo_auu_values},
-        .v_u => .{testvalues.v_u},
-    };
-}
 
 fn flushMethodCall(
     writer: *dbus.Writer,
@@ -406,7 +403,10 @@ fn flushMethodCall(
             writer,
             test_case_ct.sig(),
             call,
-            testCaseData(test_case_ct),
+            switch (test_case_ct) {
+                .empty => .{},
+                inline else => .{@field(testvalues, @tagName(test_case_ct))},
+            },
         ),
     }
     try writer.flush();
