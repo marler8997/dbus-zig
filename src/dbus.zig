@@ -420,7 +420,8 @@ pub const Type = union(enum) {
     string,
     object_path, // a string that is also a "syntactically valid object path"
     signature, // zero or more "single complete types"
-    // @"struct",
+    // @"struct": []const Type,
+    // @"struct": []const u8, // the signature
     array: *const Type, // 'a<TYPE>'
     dict: struct {
         key: *const Type,
@@ -462,6 +463,7 @@ pub const Type = union(enum) {
             .string => 's',
             .object_path => 'o',
             .signature => 'g',
+            // .@"struct" => '(',
             .array => 'a',
             .dict => 'a',
             .variant => 'v',
@@ -744,7 +746,7 @@ pub const MethodCall = struct {
     }
 };
 
-pub fn WriteData(comptime signature: []const u8) type {
+pub fn Tuple(comptime signature: []const u8) type {
     const types = typesFromSig(signature);
     var fields: [types.len]std.builtin.Type.StructField = undefined;
     inline for (types, &fields, 0..) |field_type, *field, i| {
@@ -767,7 +769,7 @@ pub fn WriteData(comptime signature: []const u8) type {
     });
 }
 
-fn advance(start: u32, comptime signature: []const u8, data: WriteData(signature)) error{Overflow}!u32 {
+fn advance(start: u32, comptime signature: []const u8, data: Tuple(signature)) error{Overflow}!u32 {
     var index = start;
     const types = comptime typesFromSig(signature);
     inline for (types, 0..) |field_type, i| {
@@ -784,7 +786,7 @@ pub fn write(
     writer: *Writer,
     full_write_start: u32,
     comptime signature: []const u8,
-    data: WriteData(signature),
+    data: Tuple(signature),
 ) error{WriteFailed}!u32 {
     var index = full_write_start;
     const types = comptime typesFromSig(signature);
@@ -912,7 +914,7 @@ pub fn writeMethodCall(
     writer: *Writer,
     comptime body_sig: []const u8,
     call: MethodCall,
-    body_data: WriteData(body_sig),
+    body_data: Tuple(body_sig),
 ) error{ BodyTooBig, WriteFailed }!void {
     const body_len = advance(0, body_sig, body_data) catch return error.BodyTooBig;
     const array_data_len = call.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
@@ -968,7 +970,7 @@ pub fn writeMethodReturn(
     writer: *Writer,
     comptime body_sig: []const u8,
     args: MethodReturn,
-    body_data: WriteData(body_sig),
+    body_data: Tuple(body_sig),
 ) error{ BodyTooBig, WriteFailed }!void {
     const body_len = advance(0, body_sig, body_data) catch return error.BodyTooBig;
     const array_data_len = args.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
@@ -2282,9 +2284,7 @@ fn typesFromSig(comptime sig: []const u8) [countTypes(sig)]Type {
         var type_index: u8 = 0;
         var sig_index: u8 = 0;
         while (sig_index < sig.len) : (type_index += 1) {
-            types[type_index], const char_count = nextType(sig[sig_index..]);
-            std.debug.assert(char_count > 0);
-            sig_index += char_count;
+            types[type_index], sig_index = nextType(sig, sig_index);
         }
         std.debug.assert(sig_index == sig.len);
         return types;
@@ -2298,28 +2298,28 @@ fn typesFromSig(comptime sig: []const u8) [countTypes(sig)]Type {
 /// - An array: a followed by a single complete type or dict entry
 ///      - a dict entry {kv} where k is a basic type and v is a complete type (only valid as an array element)
 /// - A struct: (...) containing zero or more complete types
-fn scanType(sig: []const u8, offset: usize) ?usize {
-    if (offset >= sig.len) return null;
-    return switch (sig[offset]) {
-        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => offset + 1,
+fn scanType(sig: []const u8, start: usize) ?usize {
+    if (start >= sig.len) return null;
+    return switch (sig[start]) {
+        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => start + 1,
         'a' => { // array
-            if (offset + 1 >= sig.len) return null;
-            if (sig[offset + 1] == '{') {
-                if (offset + 2 >= sig.len) return null;
+            if (start + 1 >= sig.len) return null;
+            if (sig[start + 1] == '{') {
+                if (start + 2 >= sig.len) return null;
                 // key must be a basic type (not container nor variant)
-                switch (sig[offset + 2]) {
+                switch (sig[start + 2]) {
                     'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h' => {},
                     else => return null,
                 }
-                const after_value = scanType(sig, offset + 3) orelse return null;
+                const after_value = scanType(sig, start + 3) orelse return null;
                 if (after_value >= sig.len) return null;
                 if (sig[after_value] != '}') return null;
                 return after_value + 1;
             }
-            return scanType(sig, offset + 1);
+            return scanType(sig, start + 1);
         },
         '(' => { // struct
-            var pos = offset + 1;
+            var pos = start + 1;
             if (pos >= sig.len or sig[pos] == ')') return null;
             while (pos < sig.len and sig[pos] != ')') {
                 pos = scanType(sig, pos) orelse return null;
@@ -2359,47 +2359,41 @@ fn scanArrayElementSig(sig: []const u8, offset: u8) u8 {
     };
 }
 
-fn nextType(comptime sig: []const u8) struct { Type, u8 } {
-    std.debug.assert(sig.len > 0);
-    return switch (sig[0]) {
+fn nextType(comptime sig: []const u8, start: u8) struct { Type, u8 } {
+    return switch (sig[start]) {
         // basic types
-        'y' => .{ .u8, 1 },
-        'b' => .{ .bool, 1 },
-        'n' => .{ .i16, 1 },
-        'q' => .{ .u16, 1 },
-        'i' => .{ .i32, 1 },
-        'u' => .{ .u32, 1 },
-        'x' => .{ .i64, 1 },
-        't' => .{ .u64, 1 },
-        'd' => .{ .f64, 1 },
-        // 'h' => .{ u32, 1 },
+        'y' => .{ .u8, start + 1 },
+        'b' => .{ .bool, start + 1 },
+        'n' => .{ .i16, start + 1 },
+        'q' => .{ .u16, start + 1 },
+        'i' => .{ .i32, start + 1 },
+        'u' => .{ .u32, start + 1 },
+        'x' => .{ .i64, start + 1 },
+        't' => .{ .u64, start + 1 },
+        'd' => .{ .f64, start + 1 },
+        // 'h' => .{ u32, start+ 1 },
 
         // string types
-        's' => .{ .string, 1 },
-        'o' => .{ .object_path, 1 },
-        'g' => .{ .signature, 1 },
+        's' => .{ .string, start + 1 },
+        'o' => .{ .object_path, start + 1 },
+        'g' => .{ .signature, start + 1 },
 
-        'v' => .{ .variant, 1 },
+        'v' => .{ .variant, start + 1 },
 
-        'a' => blk: {
-            std.debug.assert(sig.len >= 2);
-            if (sig[1] == '{') {
-                const key_type, const key_char_count = nextType(sig[2..]);
-                const value_type, const value_char_count = nextType(sig[2 + key_char_count ..]);
-                std.debug.assert(sig[2 + key_char_count + value_char_count] == '}');
-                return .{
-                    .{ .dict = .{ .key = typeAddr(key_type), .value = typeAddr(value_type) } },
-                    2 + key_char_count + value_char_count + 1,
-                };
+        'a' => {
+            if (sig[start + 1] == '{') {
+                const key_type, var offset = nextType(sig, start + 2);
+                const value_type, offset = nextType(sig, offset);
+                std.debug.assert(sig[offset] == '}');
+                return .{ .{ .dict = .{
+                    .key = typeAddr(key_type),
+                    .value = typeAddr(value_type),
+                } }, offset + 1 };
             }
-            const element_type, const element_sig_len = nextType(sig[1..]);
-            break :blk .{ .{ .array = typeAddr(element_type) }, 1 + element_sig_len };
+            const element_type, const offset = nextType(sig, start + 1);
+            return .{ .{ .array = typeAddr(element_type) }, offset };
         },
-        // '(' => blk: {
-        //     const inner = parseStructFields(sig[1..]);
-        //     break :blk .{ inner[0], 1 + inner[1] + 1 }; // +1 for '(' and +1 for ')'
-        // },
-        // '{' => blk: {
+        // '{' => {
         //     const key = nextType(sig[1..]);
         //     const value = nextType(sig[1 + key[1] ..]);
         //     break :blk .{ struct { key: key[0], value: value[0] }, 1 + key[1] + value[1] + 1 };

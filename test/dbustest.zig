@@ -440,7 +440,7 @@ const dict_uv_values = [_]dbus.DictElement(u32, dbus.Variant){
     // TODO: add sub variant/array values
 };
 
-fn testValues(comptime case: TestCase) dbus.WriteData(case.sig()) {
+fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
     return switch (case) {
         .empty => .{},
         .u => .{0x12345678},
