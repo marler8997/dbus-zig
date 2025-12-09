@@ -9,8 +9,10 @@ const TestCase = enum {
     empty,
     u,
     uu,
+    struct_uu,
     au,
     as,
+    a_struct_uu,
     dict_uu,
     dict_us,
     dict_uv,
@@ -19,6 +21,8 @@ const TestCase = enum {
         return switch (case) {
             .empty => "",
             .uu => "uu",
+            .struct_uu => "(uu)",
+            .a_struct_uu => "a(uu)",
             .dict_uu => "a{uu}",
             .dict_us => "a{us}",
             .dict_uv => "a{uv}",
@@ -289,6 +293,12 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         std.debug.assert(testValues(.uu)[1] == try source.readBody(.u32, {}));
                         try source.bodyEnd();
                     },
+                    .struct_uu => {
+                        std.debug.assert(std.mem.eql(u8, "(uu)", source.bodySignatureSlice()));
+                        std.debug.assert(testValues(.struct_uu)[0][0] == try source.readBody(.u32, {}));
+                        std.debug.assert(testValues(.struct_uu)[0][1] == try source.readBody(.u32, {}));
+                        try source.bodyEnd();
+                    },
                     .au => {
                         std.debug.assert(std.mem.eql(u8, "au", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
@@ -311,6 +321,20 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                             const string = try source.dataTake(string_size);
                             try source.dataReadNullTerm();
                             std.debug.assert(std.mem.eql(u8, testValues(.as)[0][value_index].nativeSlice(), string));
+                            value_index += 1;
+                        }
+                        try source.bodyEnd();
+                    },
+                    .a_struct_uu => {
+                        std.debug.assert(std.mem.eql(u8, "a(uu)", source.bodySignatureSlice()));
+                        var array: dbus.SourceArray = undefined;
+                        try source.readBody(.array_size, &array);
+                        var value_index: usize = 0;
+                        while (source.bodyOffset() < array.body_limit) {
+                            const first = try source.readBody(.u32, {});
+                            std.debug.assert(first == testValues(.a_struct_uu)[0][value_index][0]);
+                            const second = try source.readBody(.u32, {});
+                            std.debug.assert(second == testValues(.a_struct_uu)[0][value_index][1]);
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -422,6 +446,11 @@ const as_values = [_]dbus.Slice(u32, [*]const u8){
     .initStatic("there"),
     .initStatic("yay!"),
 };
+const a_struct_uu_values = [_]struct { u32, u32 }{
+    .{ 0x12345678, 0xffffffff },
+    .{ 0, 1 },
+    .{ 0x7fffffff, 0x80000000 },
+};
 const dict_uu_values = [_]dbus.DictElement(u32, u32){
     .{ .key = 0x12345678, .value = 0xffffffff },
     .{ .key = 0, .value = 1 },
@@ -445,8 +474,10 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
         .empty => .{},
         .u => .{0x12345678},
         .uu => .{ 0x9abcdef0, 0x12f0a4d7 },
+        .struct_uu => .{.{ 0xb9bfbcc0, 0x264ecbea }},
         .au => .{&au_values},
         .as => .{&as_values},
+        .a_struct_uu => .{&a_struct_uu_values},
         .dict_uu => .{&dict_uu_values},
         .dict_us => .{&dict_us_values},
         .dict_uv => .{&dict_uv_values},

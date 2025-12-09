@@ -51,6 +51,7 @@ fn echoBody(
 ) !u32 {
     var sig_offset: usize = 0;
     var write_body_offset: u32 = body_start;
+
     while (sig_offset < sig.len) switch (sig[sig_offset]) {
         'u' => {
             const value = try source.readBody(.u32, {});
@@ -110,6 +111,21 @@ fn echoBody(
                 );
             }
             sig_offset = array.sig_end;
+        },
+        '(' => {
+            {
+                const pad_len = dbus.pad8Len(@truncate(write_body_offset));
+                try writer.splatByteAll(0, pad_len);
+                write_body_offset += pad_len;
+            }
+            const sig_end = dbus.scanStructSig(sig, @intCast(sig_offset + 1));
+            write_body_offset = try echoBody(
+                source,
+                writer,
+                sig[sig_offset + 1 .. sig_end - 1],
+                write_body_offset,
+            );
+            sig_offset = sig_end;
         },
         else => std.debug.panic("todo: handle sig char '{c}'", .{sig[sig_offset]}),
     };

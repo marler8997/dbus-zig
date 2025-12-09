@@ -420,8 +420,7 @@ pub const Type = union(enum) {
     string,
     object_path, // a string that is also a "syntactically valid object path"
     signature, // zero or more "single complete types"
-    // @"struct": []const Type,
-    // @"struct": []const u8, // the signature
+    @"struct": []const u8, // the signature
     array: *const Type, // 'a<TYPE>'
     dict: struct {
         key: *const Type,
@@ -463,14 +462,14 @@ pub const Type = union(enum) {
             .string => 's',
             .object_path => 'o',
             .signature => 'g',
-            // .@"struct" => '(',
+            .@"struct" => '(',
             .array => 'a',
             .dict => 'a',
             .variant => 'v',
         };
     }
 
-    pub fn getSignature(self: Type) Slice(u8, [*:0]const u8) {
+    pub fn getSignature(self: Type) Slice(u8, [*]const u8) {
         return switch (self) {
             .u8 => .initStatic("y"),
             .bool => .initStatic("b"),
@@ -485,7 +484,7 @@ pub const Type = union(enum) {
             .string => .initStatic("s"),
             .object_path => .initStatic("o"),
             .signature => .initStatic("g"),
-            // // @"struct",
+            .@"struct" => |sig| .initStatic(sig),
             // .array =>
             // array: *const Type, // 'a<TYPE>'
             // dict: struct {
@@ -514,6 +513,7 @@ pub const Type = union(enum) {
             .string => Slice(u32, [*]const u8),
             .object_path => Slice(u32, [*]const u8),
             .signature => Slice(u8, [*]const u8),
+            .@"struct" => |sig| Tuple(sig[1 .. sig.len - 1]),
             .array => |e| []const e.Native(),
             .dict => |d| []const DictElement(d.key.Native(), d.value.Native()),
             .variant => Variant,
@@ -531,6 +531,13 @@ pub const Type = union(enum) {
             .string, .object_path => {
                 const pad_len: u32 = pad4Len(@truncate(start));
                 return writeSum(&.{ start, pad_len + 4 + 1, value.len });
+            },
+            .@"struct" => |sig| {
+                var offset = try writeSum(&.{ start, pad8Len(@truncate(start)) });
+                inline for (comptime typesFromSig(sig[1 .. sig.len - 1]), 0..) |field_type, field_index| {
+                    offset = try field_type.advance(offset, &value[field_index]);
+                }
+                return offset;
             },
             .array => |element| {
                 var offset = try arrayDataOffset(start, .fromSig(element.getSigFirstChar()));
@@ -577,15 +584,19 @@ fn arraySigAdvance(sig: []const u8, start: u8, end: u8, next: u8) u8 {
     std.debug.assert(start < end);
     std.debug.assert(start <= next);
     std.debug.assert(next <= end);
-    if (next == end) return start;
-    if (next + 1 == end and sig[next] == '}') return start;
-    return switch (sig[next]) {
-        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v', 'a' => next,
-        else => std.debug.panic(
-            "todo: arraySigAdvance to {} ('{s}') correct? sig='{s}' start={} end={}",
-            .{ next, sig[next .. next + 1], sig, start, end },
-        ),
-    };
+    var i = next;
+    while (true) {
+        if (i == end) return start;
+        if (i + 1 == end and sig[i] == '}') return start;
+        switch (sig[i]) {
+            'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v', 'a' => return i,
+            ')' => i = i + 1,
+            else => std.debug.panic(
+                "todo: arraySigAdvance to {} ('{s}') correct? sig='{s}' start={} end={}",
+                .{ next, sig[next .. next + 1], sig, start, end },
+            ),
+        }
+    }
 }
 
 pub fn DictElement(comptime Key: type, comptime Value: type) type {
@@ -749,6 +760,7 @@ pub const MethodCall = struct {
 pub fn Tuple(comptime signature: []const u8) type {
     const types = typesFromSig(signature);
     var fields: [types.len]std.builtin.Type.StructField = undefined;
+    @setEvalBranchQuota(signature.len * 2000);
     inline for (types, &fields, 0..) |field_type, *field, i| {
         const name = std.fmt.comptimePrint("{d}", .{i});
         field.* = .{
@@ -819,6 +831,21 @@ pub fn write(
                 index += @field(data, name).len;
                 try writer.writeByte(0);
                 index += 1;
+            },
+            .@"struct" => |struct_sig| {
+                {
+                    const pad_len = pad8Len(@truncate(index));
+                    try writer.splatByteAll(0, pad_len);
+                    index += pad_len;
+                }
+                inline for (comptime typesFromSig(struct_sig[1 .. struct_sig.len - 1]), 0..) |struct_field_type, struct_index| {
+                    index = try write(
+                        writer,
+                        index,
+                        struct_field_type.getSignature().nativeSlice(),
+                        .{data[i][struct_index]},
+                    );
+                }
             },
             .array => |element| {
                 const element_align8: Align8 = .fromSig(element.getSigFirstChar());
@@ -1598,7 +1625,7 @@ pub const Source = struct {
         };
         errdefer source.state.* = .err;
         std.debug.assert(it.body_offset < it.body_size);
-        const value_sig_offset = blk: switch (it.state) {
+        const initial_sig_offset = blk: switch (it.state) {
             .value => |sig_offset| sig_offset,
             .string => unreachable,
             .variant => |variant| variant.sig_offset,
@@ -1613,7 +1640,25 @@ pub const Source = struct {
                 break :blk array.next_sig_offset;
             },
         };
-        std.debug.assert(value_sig_offset < it.current_signature.len);
+        const value_sig_offset = blk: {
+            var sig_offset = initial_sig_offset;
+            while (true) {
+                std.debug.assert(sig_offset < it.current_signature.len);
+                if (it.current_signature.buffer[sig_offset] != '(')
+                    break :blk sig_offset;
+                const pad_len: u32 = pad8Len(@truncate(it.body_offset));
+                if (try incBody(&.{ it.body_offset, pad_len }) > it.body_size)
+                    return error.DbusProtocol;
+                try source.reader.discardAll(pad_len);
+                sig_offset += 1;
+                switch (it.state) {
+                    .value => it.state = .{ .value = sig_offset },
+                    .string => unreachable,
+                    .variant => |variant| variant.sig_offset = sig_offset,
+                    .array => |array| array.next_sig_offset = sig_offset,
+                }
+            }
+        };
         std.debug.assert(kind.sigChar() == it.current_signature.slice()[value_sig_offset]);
 
         switch (kind) {
@@ -2343,12 +2388,19 @@ fn scanSig(sig: []const u8, offset: u8) u8 {
         else => unreachable,
     };
 }
+pub fn scanStructSig(sig: []const u8, start: u8) u8 {
+    var offset: u8 = start;
+    while (sig[offset] != ')') {
+        offset = @intCast(scanType(sig, offset).?);
+    }
+    return offset + 1;
+}
 fn scanArrayElementSig(sig: []const u8, offset: u8) u8 {
     std.debug.assert(sig[offset - 1] == 'a');
     return switch (sig[offset]) {
         'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 'h', 's', 'v' => offset + 1,
         'a' => @panic("todo"),
-        '(' => @panic("todo"),
+        '(' => scanStructSig(sig, offset + 1),
         '{' => {
             const after_key = scanSig(sig, offset + 1);
             const after_value = scanSig(sig, after_key);
@@ -2392,6 +2444,18 @@ fn nextType(comptime sig: []const u8, start: u8) struct { Type, u8 } {
             }
             const element_type, const offset = nextType(sig, start + 1);
             return .{ .{ .array = typeAddr(element_type) }, offset };
+        },
+        '(' => {
+            var sig_index: usize = start + 1;
+            while (true) {
+                if (sig_index >= sig.len) @compileError("invalid type signature '" ++ sig ++ "' (missing close paren)");
+                if (sig[sig_index] == ')') {
+                    sig_index += 1;
+                    break;
+                }
+                sig_index = scanType(sig, sig_index) orelse @compileError("invalid type signature '" ++ sig ++ "'");
+            }
+            return .{ .{ .@"struct" = sig[start..sig_index] }, sig_index };
         },
         // '{' => {
         //     const key = nextType(sig[1..]);
