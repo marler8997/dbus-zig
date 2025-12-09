@@ -8,6 +8,7 @@ const State = struct {
 const TestCase = enum {
     empty,
     u,
+    uu,
     au,
     as,
     dict_uu,
@@ -17,6 +18,7 @@ const TestCase = enum {
     pub fn sig(case: TestCase) [:0]const u8 {
         return switch (case) {
             .empty => "",
+            .uu => "uu",
             .dict_uu => "a{uu}",
             .dict_us => "a{us}",
             .dict_uv => "a{uv}",
@@ -278,8 +280,13 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                     .u => {
                         std.debug.assert(std.mem.eql(u8, "u", source.bodySignatureSlice()));
                         std.debug.assert(msg_start.body_len == 4);
-                        const value = try source.readBody(.u32, {});
-                        std.debug.assert(value == 0x12345678);
+                        std.debug.assert(testValues(.u)[0] == try source.readBody(.u32, {}));
+                        try source.bodyEnd();
+                    },
+                    .uu => {
+                        std.debug.assert(std.mem.eql(u8, "uu", source.bodySignatureSlice()));
+                        std.debug.assert(testValues(.uu)[0] == try source.readBody(.u32, {}));
+                        std.debug.assert(testValues(.uu)[1] == try source.readBody(.u32, {}));
                         try source.bodyEnd();
                     },
                     .au => {
@@ -289,7 +296,7 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const value = try source.readBody(.u32, {});
-                            std.debug.assert(testvalues.au[value_index] == value);
+                            std.debug.assert(testValues(.au)[0][value_index] == value);
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -303,7 +310,7 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                             const string_size = try source.readBody(.string_size, {});
                             const string = try source.dataTake(string_size);
                             try source.dataReadNullTerm();
-                            std.debug.assert(std.mem.eql(u8, testvalues.as[value_index].nativeSlice(), string));
+                            std.debug.assert(std.mem.eql(u8, testValues(.as)[0][value_index].nativeSlice(), string));
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -315,9 +322,9 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const key = try source.readBody(.u32, {});
-                            std.debug.assert(key == testvalues.dict_uu[value_index].key);
+                            std.debug.assert(key == testValues(.dict_uu)[0][value_index].key);
                             const value = try source.readBody(.u32, {});
-                            std.debug.assert(value == testvalues.dict_uu[value_index].value);
+                            std.debug.assert(value == testValues(.dict_uu)[0][value_index].value);
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -329,11 +336,11 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const key = try source.readBody(.u32, {});
-                            std.debug.assert(key == testvalues.dict_us[value_index].key);
+                            std.debug.assert(key == testValues(.dict_us)[0][value_index].key);
                             const string_size = try source.readBody(.string_size, {});
                             const string = try source.dataTake(string_size);
                             try source.dataReadNullTerm();
-                            std.debug.assert(std.mem.eql(u8, testvalues.dict_us[value_index].value.nativeSlice(), string));
+                            std.debug.assert(std.mem.eql(u8, testValues(.dict_us)[0][value_index].value.nativeSlice(), string));
                             value_index += 1;
                         }
                         try source.bodyEnd();
@@ -345,18 +352,18 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         var value_index: usize = 0;
                         while (source.bodyOffset() < array.body_limit) {
                             const key = try source.readBody(.u32, {});
-                            std.debug.assert(key == testvalues.dict_uv[value_index].key);
+                            std.debug.assert(key == testValues(.dict_uv)[0][value_index].key);
                             var variant: dbus.SourceVariant = undefined;
                             try source.readBody(.variant_sig, &variant);
                             if (std.mem.eql(u8, variant.signature.slice(), "u")) {
                                 const value = try source.readBody(.u32, {});
-                                std.debug.assert(testvalues.dict_uv[value_index].value.u32 == value);
+                                std.debug.assert(testValues(.dict_uv)[0][value_index].value.u32 == value);
                             } else if (std.mem.eql(u8, variant.signature.slice(), "s")) {
                                 const string_size = try source.readBody(.string_size, {});
                                 const string = try source.dataTake(string_size);
                                 try source.dataReadNullTerm();
                                 std.debug.assert(
-                                    std.mem.eql(u8, testvalues.dict_uv[value_index].value.string.nativeSlice(), string),
+                                    std.mem.eql(u8, testValues(.dict_uv)[0][value_index].value.string.nativeSlice(), string),
                                 );
                             } else {
                                 std.debug.panic("todo: sig '{s}'", .{variant.signature.slice()});
@@ -371,7 +378,7 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.readBody(.variant_sig, &variant);
                         std.debug.assert(std.mem.eql(u8, source.currentSignature().slice(), "u"));
                         const value = try source.readBody(.u32, {});
-                        std.debug.assert(value == testvalues.v_u.u32);
+                        std.debug.assert(value == testValues(.v_u)[0].u32);
                         try source.bodyEnd();
                     },
                 }
@@ -409,44 +416,43 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
     }
 }
 
-const testvalues = struct {
-    pub const u: u32 = 0x12345678;
-
-    pub const au = &au_array;
-    const au_array = [_]u32{ 100, 42, 0, 0xffffffff };
-
-    pub const as = &as_array;
-    const as_array = [_]dbus.Slice(u32, [*]const u8){
-        .initStatic("hello"),
-        .initStatic("there"),
-        .initStatic("yay!"),
-    };
-
-    pub const dict_uu = &dict_uu_array;
-    const dict_uu_array = [_]dbus.DictElement(u32, u32){
-        .{ .key = 0x12345678, .value = 0xffffffff },
-        .{ .key = 0, .value = 1 },
-        .{ .key = 0x7fffffff, .value = 0x80000000 },
-    };
-
-    pub const dict_us = &dict_us_array;
-    const dict_us_array = [_]dbus.DictElement(u32, dbus.Slice(u32, [*]const u8)){
-        .{ .key = 10, .value = .initStatic("The value for the 10 key") },
-        .{ .key = 100, .value = .initStatic("FooBar") },
-        .{ .key = 0x7fffffff, .value = .initStatic("Another string\nHello\n") },
-        .{ .key = 123, .value = .initStatic("a") },
-        .{ .key = 456, .value = .initStatic("") },
-    };
-
-    pub const dict_uv = &dict_uv_array;
-    const dict_uv_array = [_]dbus.DictElement(u32, dbus.Variant){
-        .{ .key = 10, .value = .{ .u32 = 0x123 } },
-        .{ .key = 11, .value = .{ .string = .initStatic("a string") } },
-        // TODO: add sub variant/array values
-    };
-
-    pub const v_u: dbus.Variant = .{ .u32 = 0xf02958ab };
+const au_values = [_]u32{ 100, 42, 0, 0xffffffff };
+const as_values = [_]dbus.Slice(u32, [*]const u8){
+    .initStatic("hello"),
+    .initStatic("there"),
+    .initStatic("yay!"),
 };
+const dict_uu_values = [_]dbus.DictElement(u32, u32){
+    .{ .key = 0x12345678, .value = 0xffffffff },
+    .{ .key = 0, .value = 1 },
+    .{ .key = 0x7fffffff, .value = 0x80000000 },
+};
+const dict_us_values = [_]dbus.DictElement(u32, dbus.Slice(u32, [*]const u8)){
+    .{ .key = 10, .value = .initStatic("The value for the 10 key") },
+    .{ .key = 100, .value = .initStatic("FooBar") },
+    .{ .key = 0x7fffffff, .value = .initStatic("Another string\nHello\n") },
+    .{ .key = 123, .value = .initStatic("a") },
+    .{ .key = 456, .value = .initStatic("") },
+};
+const dict_uv_values = [_]dbus.DictElement(u32, dbus.Variant){
+    .{ .key = 10, .value = .{ .u32 = 0x123 } },
+    .{ .key = 11, .value = .{ .string = .initStatic("a string") } },
+    // TODO: add sub variant/array values
+};
+
+fn testValues(comptime case: TestCase) dbus.WriteData(case.sig()) {
+    return switch (case) {
+        .empty => .{},
+        .u => .{0x12345678},
+        .uu => .{ 0x9abcdef0, 0x12f0a4d7 },
+        .au => .{&au_values},
+        .as => .{&as_values},
+        .dict_uu => .{&dict_uu_values},
+        .dict_us => .{&dict_us_values},
+        .dict_uv => .{&dict_uv_values},
+        .v_u => .{.{ .u32 = 0xf02958ab }},
+    };
+}
 
 fn flushMethodCall(
     writer: *dbus.Writer,
@@ -466,10 +472,7 @@ fn flushMethodCall(
             writer,
             test_case_ct.sig(),
             call,
-            switch (test_case_ct) {
-                .empty => .{},
-                inline else => .{@field(testvalues, @tagName(test_case_ct))},
-            },
+            testValues(test_case_ct),
         ),
     }
     try writer.flush();
