@@ -817,6 +817,13 @@ pub fn write(
                 try writer.writeInt(u32, @field(data, name), native_endian);
                 index += 4;
             },
+            .i32 => {
+                const pad_len = pad4Len(@truncate(index));
+                try writer.splatByteAll(0, pad_len);
+                index += pad_len;
+                try writer.writeInt(i32, @field(data, name), native_endian);
+                index += 4;
+            },
             .signature => {
                 try writer.writeByte(@field(data, name).len);
                 index += 1;
@@ -1673,6 +1680,17 @@ pub const Source = struct {
                 source.onBodyConsumed("u");
                 return value;
             },
+            .i32 => {
+                const pad_len: u32 = pad4Len(@truncate(it.body_offset));
+                if (try incBody(&.{ it.body_offset, pad_len + 4 }) > it.body_size)
+                    return error.DbusProtocol;
+                try source.reader.discardAll(pad_len);
+                it.body_offset += pad_len;
+                const value = try source.reader.takeInt(i32, it.endian);
+                it.body_offset += 4;
+                source.onBodyConsumed("i");
+                return value;
+            },
             .string_size, .object_path_size => {
                 const pad_len: u32 = pad4Len(@truncate(it.body_offset));
                 if (try incBody(&.{ it.body_offset, pad_len + 4 }) > it.body_size)
@@ -2168,6 +2186,7 @@ pub fn consumeStringNullTerm(reader: *Reader) error{ DbusProtocol, ReadFailed, E
 const ReadKind = enum {
     boolean,
     u32,
+    i32,
     string_size,
     object_path_size,
     variant_sig,
@@ -2176,6 +2195,7 @@ const ReadKind = enum {
         return switch (kind) {
             .boolean => bool,
             .u32 => u32,
+            .i32 => i32,
             .string_size => u32,
             .object_path_size => u32,
             .variant_sig => void,
@@ -2186,6 +2206,7 @@ const ReadKind = enum {
         return switch (kind) {
             .boolean,
             .u32,
+            .i32,
             .string_size,
             .object_path_size,
             => void,
@@ -2208,6 +2229,7 @@ const ReadKind = enum {
         return switch (kind) {
             .boolean => 'b',
             .u32 => 'u',
+            .i32 => 'i',
             .string_size => 's',
             .object_path_size => 'o',
             .variant_sig => 'v',

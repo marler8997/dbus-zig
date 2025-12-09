@@ -8,6 +8,7 @@ const State = struct {
 const TestCase = enum {
     empty,
     u,
+    i,
     uu,
     struct_uu,
     au,
@@ -276,31 +277,33 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                 std.debug.assert(headers.reply_serial == state.client_serial - 1);
 
                 const waiting_for = state.client_waiting_for orelse unreachable;
+                std.debug.assert(std.mem.eql(u8, waiting_for.sig(), source.bodySignatureSlice()));
+
                 switch (waiting_for) {
                     .empty => {
-                        std.debug.assert(std.mem.eql(u8, "", source.bodySignatureSlice()));
                         try source.bodyEnd();
                     },
                     .u => {
-                        std.debug.assert(std.mem.eql(u8, "u", source.bodySignatureSlice()));
                         std.debug.assert(msg_start.body_len == 4);
                         std.debug.assert(testValues(.u)[0] == try source.readBody(.u32, {}));
                         try source.bodyEnd();
                     },
+                    .i => {
+                        std.debug.assert(msg_start.body_len == 4);
+                        std.debug.assert(testValues(.i)[0] == try source.readBody(.i32, {}));
+                        try source.bodyEnd();
+                    },
                     .uu => {
-                        std.debug.assert(std.mem.eql(u8, "uu", source.bodySignatureSlice()));
                         std.debug.assert(testValues(.uu)[0] == try source.readBody(.u32, {}));
                         std.debug.assert(testValues(.uu)[1] == try source.readBody(.u32, {}));
                         try source.bodyEnd();
                     },
                     .struct_uu => {
-                        std.debug.assert(std.mem.eql(u8, "(uu)", source.bodySignatureSlice()));
                         std.debug.assert(testValues(.struct_uu)[0][0] == try source.readBody(.u32, {}));
                         std.debug.assert(testValues(.struct_uu)[0][1] == try source.readBody(.u32, {}));
                         try source.bodyEnd();
                     },
                     .au => {
-                        std.debug.assert(std.mem.eql(u8, "au", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
@@ -312,7 +315,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.bodyEnd();
                     },
                     .as => {
-                        std.debug.assert(std.mem.eql(u8, "as", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
@@ -326,7 +328,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.bodyEnd();
                     },
                     .a_struct_uu => {
-                        std.debug.assert(std.mem.eql(u8, "a(uu)", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
@@ -340,7 +341,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.bodyEnd();
                     },
                     .dict_uu => {
-                        std.debug.assert(std.mem.eql(u8, "a{uu}", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
@@ -354,7 +354,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.bodyEnd();
                     },
                     .dict_us => {
-                        std.debug.assert(std.mem.eql(u8, "a{us}", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
@@ -370,7 +369,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.bodyEnd();
                     },
                     .dict_uv => {
-                        std.debug.assert(std.mem.eql(u8, "a{uv}", source.bodySignatureSlice()));
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
                         var value_index: usize = 0;
@@ -397,7 +395,6 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         try source.bodyEnd();
                     },
                     .v_u => {
-                        std.debug.assert(std.mem.eql(u8, source.bodySignatureSlice(), "v"));
                         var variant: dbus.SourceVariant = undefined;
                         try source.readBody(.variant_sig, &variant);
                         std.debug.assert(std.mem.eql(u8, source.currentSignature().slice(), "u"));
@@ -473,6 +470,7 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
     return switch (case) {
         .empty => .{},
         .u => .{0x12345678},
+        .i => .{0x7f00aba2},
         .uu => .{ 0x9abcdef0, 0x12f0a4d7 },
         .struct_uu => .{.{ 0xb9bfbcc0, 0x264ecbea }},
         .au => .{&au_values},
