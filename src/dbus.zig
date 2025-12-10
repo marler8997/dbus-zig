@@ -563,6 +563,7 @@ pub const Type = union(enum) {
                     .i32 => |*v| try Type.advance(.i32, after_sig, v),
                     .u32 => |*v| try Type.advance(.u32, after_sig, v),
                     .string => |*v| try Type.advance(.string, after_sig, v),
+                    .struct_uu => |*v| try Type.advance(.{ .@"struct" = "(uu)" }, after_sig, v),
                 };
             },
             else => @compileError("todo: support type: " ++ @tagName(sig_type)),
@@ -580,6 +581,14 @@ fn dictDataOffset(start: u32) error{Overflow}!u32 {
     return arrayDataOffset(start, .yes);
 }
 
+fn variantSigAdvance(sig: *const Bounded(255), start: u8) u8 {
+    std.debug.assert(start <= sig.len);
+    var offset = start;
+    while (offset < sig.len and sig.buffer[offset] == ')') {
+        offset += 1;
+    }
+    return offset;
+}
 fn arraySigAdvance(sig: []const u8, start: u8, end: u8, next: u8) u8 {
     std.debug.assert(start < end);
     std.debug.assert(start <= next);
@@ -606,12 +615,14 @@ pub const Variant = union(enum) {
     i32: i32,
     u32: u32,
     string: Slice(u32, [*]const u8),
+    struct_uu: Tuple("uu"),
 
     pub fn getSignature(variant: *const Variant) Slice(u8, [*]const u8) {
         return switch (variant.*) {
             .i32 => .initStatic("i"),
             .u32 => .initStatic("u"),
             .string => .initStatic("s"),
+            .struct_uu => .initStatic("(uu)"),
         };
     }
 };
@@ -887,6 +898,7 @@ pub fn write(
                     .i32 => @panic("todo"),
                     .u32 => |v| try write(writer, index, "u", .{v}),
                     .string => |v| try write(writer, index, "s", .{v}),
+                    .struct_uu => |v| try write(writer, index, "(uu)", .{v}),
                 };
             },
             else => @compileError(std.fmt.comptimePrint("todo: write field type {}", .{field_type})),
@@ -1468,25 +1480,33 @@ pub const Source = struct {
             },
             .variant => |variant| {
                 std.debug.assert(it.current_signature == &variant.signature);
-                std.debug.assert(variant.sig_offset < variant.signature.len);
                 // TODO: one or more of these checks might need to be a DbusProtocol error rather
                 //       than runtime assert
-                std.debug.assert(variant.sig_offset + consume_sig.len == variant.signature.len);
+                std.debug.assert(variant.sig_offset + consume_sig.len <= variant.signature.len);
                 std.debug.assert(std.mem.eql(
                     u8,
-                    variant.signature.slice()[0..consume_sig.len],
+                    variant.signature.slice()[variant.sig_offset..][0..consume_sig.len],
                     consume_sig,
                 ));
-                it.current_signature = variant.restore.signature;
-                it.state = switch (variant.end) {
-                    .value => .{ .value = variant.restore.sig_offset },
-                    .variant => @panic("todo"),
-                    .parent_array => |array| .{ .array = array },
-                };
-                switch (variant.end) {
-                    .value => {},
-                    .variant => @panic("todo"),
-                    .parent_array => source.onDataConsumed("v"),
+                const new_sig_offset = variantSigAdvance(
+                    &variant.signature,
+                    @intCast(variant.sig_offset + consume_sig.len),
+                );
+                std.debug.assert(new_sig_offset > variant.sig_offset);
+                variant.sig_offset = new_sig_offset;
+                std.debug.assert(variant.sig_offset <= variant.signature.len);
+                if (variant.sig_offset == variant.signature.len) {
+                    it.current_signature = variant.restore.signature;
+                    it.state = switch (variant.end) {
+                        .value => .{ .value = variant.restore.sig_offset },
+                        .variant => @panic("todo"),
+                        .parent_array => |array| .{ .array = array },
+                    };
+                    switch (variant.end) {
+                        .value => {},
+                        .variant => @panic("todo"),
+                        .parent_array => source.onDataConsumed("v"),
+                    }
                 }
             },
             .string => unreachable,
@@ -1654,9 +1674,8 @@ pub const Source = struct {
                 if (it.current_signature.buffer[sig_offset] != '(')
                     break :blk sig_offset;
                 const pad_len: u32 = pad8Len(@truncate(it.body_offset));
-                if (try incBody(&.{ it.body_offset, pad_len }) > it.body_size)
-                    return error.DbusProtocol;
                 try source.reader.discardAll(pad_len);
+                it.body_offset = try incBody(&.{ it.body_offset, pad_len });
                 sig_offset += 1;
                 switch (it.state) {
                     .value => it.state = .{ .value = sig_offset },

@@ -18,6 +18,7 @@ const TestCase = enum {
     dict_us,
     dict_uv,
     v_u,
+    v_uu,
     pub fn sig(case: TestCase) [:0]const u8 {
         return switch (case) {
             .empty => "",
@@ -28,6 +29,7 @@ const TestCase = enum {
             .dict_us => "a{us}",
             .dict_uv => "a{uv}",
             .v_u => "v",
+            .v_uu => "v",
             inline else => |ct| @tagName(ct),
         };
     }
@@ -402,6 +404,16 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         std.debug.assert(value == testValues(.v_u)[0].u32);
                         try source.bodyEnd();
                     },
+                    .v_uu => {
+                        var variant: dbus.SourceVariant = undefined;
+                        try source.readBody(.variant_sig, &variant);
+                        std.debug.assert(std.mem.eql(u8, source.currentSignature().slice(), "(uu)"));
+                        const first = try source.readBody(.u32, {});
+                        std.debug.assert(first == testValues(.v_uu)[0].struct_uu[0]);
+                        const second = try source.readBody(.u32, {});
+                        std.debug.assert(second == testValues(.v_uu)[0].struct_uu[1]);
+                        try source.bodyEnd();
+                    },
                 }
 
                 const next_case: TestCase = blk: {
@@ -480,6 +492,7 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
         .dict_us => .{&dict_us_values},
         .dict_uv => .{&dict_uv_values},
         .v_u => .{.{ .u32 = 0xf02958ab }},
+        .v_uu => .{.{ .struct_uu = .{ 0xd2be463a, 0xa193801e } }},
     };
 }
 
