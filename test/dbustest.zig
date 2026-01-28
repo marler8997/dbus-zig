@@ -46,16 +46,17 @@ pub fn main() !void {
     try service_conn.connect(session_addr_str.str, addr);
 
     var service_name_buf: [dbus.max_name]u8 = undefined;
-    const service_name_len = try service_conn.hello(&service_name_buf);
+    const service_name_len, const service_unix_fds = try service_conn.hello(&service_name_buf);
     const service_name = service_name_buf[0..service_name_len];
-    std.log.info("ServiceName '{s}'", .{service_name});
+    std.log.info("ServiceName '{s}' unix_fds={}", .{ service_name, service_unix_fds });
 
     var client_conn: Connection = undefined;
     try client_conn.connect(session_addr_str.str, addr);
 
     var client_name_buf: [dbus.max_name]u8 = undefined;
-    const client_name = client_name_buf[0..try client_conn.hello(&client_name_buf)];
-    std.log.info("ClientName '{s}'", .{client_name});
+    const client_name_len, const client_unix_fds = try client_conn.hello(&client_name_buf);
+    const client_name = client_name_buf[0..client_name_len];
+    std.log.info("ClientName '{s}' unix_fds={}", .{ client_name, client_unix_fds });
 
     var state: State = .{
         .service_name = .{ .ptr = &service_name_buf, .len = service_name_len },
@@ -118,13 +119,26 @@ const Connection = struct {
         };
     }
 
-    pub fn hello(connection: *Connection, out_name_buf: *[dbus.max_name]u8) !u8 {
+    pub fn hello(connection: *Connection, out_name_buf: *[dbus.max_name]u8) !struct { u8, bool } {
         const writer = connection.getWriter();
         const source = connection.getSource();
 
         try dbus.flushAuth(writer);
         try source.readAuth();
         std.log.info("authenticated", .{});
+
+        try writer.writeAll("NEGOTIATE_UNIX_FD\r\n");
+        try writer.flush();
+        const unix_fd = blk: switch (try source.readNegotiateUnixFd()) {
+            .agree => {
+                std.log.info("NEGOTIATE_UNIX_FD: agree", .{});
+                break :blk true;
+            },
+            .err => |msg| {
+                std.log.warn("NEGOTIATE_UNIX_FD: ERROR {s}", .{msg});
+                break :blk false;
+            },
+        };
 
         try writer.writeAll("BEGIN\r\n");
         try dbus.writeMethodCall(
@@ -176,7 +190,7 @@ const Connection = struct {
         try source.dataReadSliceAll(out_name_buf[0..name_len]);
         try source.dataReadNullTerm();
         try source.bodyEnd();
-        return name_len;
+        return .{ name_len, unix_fd };
     }
 };
 

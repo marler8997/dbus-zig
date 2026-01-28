@@ -1153,8 +1153,33 @@ pub const Source = struct {
             // TODO: maybe fallback to other auth mechanisms?
             return error.DbusAuthRejected;
         }
-        log_dbus.info("DBUS Protocol: unhandled reply from server '{s}'", .{reply});
-        source.state.* = .err;
+        log_dbus.err("DBUS Protocol: unhandled reply from server '{s}'", .{reply});
+        return error.DbusProtocol;
+    }
+
+    pub fn readNegotiateUnixFd(source: Source) error{ DbusProtocol, ReadFailed, EndOfStream }!union(enum) {
+        agree,
+        err: []const u8,
+    } {
+        std.debug.assert(source.state.* == .msg_start);
+        std.debug.assert(source.reader.buffer.len >= min_read_buf);
+        errdefer source.state.* = .err;
+
+        const reply = source.reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.ReadFailed, error.EndOfStream => |e| return e,
+            error.StreamTooLong => {
+                log_dbus.err("DBUS Protocol: NEGOTIATE_UNIX_FD reply exceeded {} bytes", .{source.reader.buffer.len});
+                return error.DbusProtocol;
+            },
+        };
+        // 0.15.2 doesn't toss the delimiter
+        if (zig_atleast_15_2) source.reader.toss(1);
+        if (std.mem.eql(u8, reply, "AGREE_UNIX_FD\r")) return .agree;
+        const error_prefix = "ERROR";
+        if (std.mem.startsWith(u8, reply, error_prefix)) return .{
+            .err = std.mem.trim(u8, reply[error_prefix.len..], " \r"),
+        };
+        log_dbus.err("DBUS Protocol: unhandled reply from server '{f}'", .{std.zig.fmtString(reply)});
         return error.DbusProtocol;
     }
 
