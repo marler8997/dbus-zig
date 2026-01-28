@@ -17,6 +17,17 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "");
 
+    {
+        const unit_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/dbus.zig"),
+                .target = target,
+                .optimize = mode,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(unit_test).step);
+    }
+
     const examples = b.step("examples", "build/install all the examples");
 
     inline for (&.{ "hello", "monitor" }) |example_name| {
