@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    const test_step = b.step("test", "");
+
     const examples = b.step("examples", "build/install all the examples");
 
     inline for (&.{ "hello", "monitor" }) |example_name| {
@@ -29,6 +31,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
+        test_step.dependOn(&exe.step);
         const install = b.addInstallArtifact(exe, .{});
         b.getInstallStep().dependOn(&install.step);
         b.step("build-" ++ example_name, "Build the " ++ example_name ++ " example").dependOn(&install.step);
@@ -95,8 +98,6 @@ pub fn build(b: *std.Build) void {
         run_step.dependOn(&run_cmd.step);
         break :blk exe;
     };
-
-    const test_step = b.step("test", "");
 
     {
         const run = b.addRunArtifact(dbusc);
