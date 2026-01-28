@@ -6,6 +6,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardOptimizeOption(.{});
 
+    const ci = b.option(bool, "ci", "Run on the CI") orelse false;
+
     const dbus_module = b.addModule("dbus", .{
         .root_source_file = b.path("src/dbus.zig"),
     });
@@ -108,7 +110,9 @@ pub fn build(b: *std.Build) void {
         b.step("test-list-names", "").dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
-    {
+
+    // This test fails on CI with permission denied
+    if (!ci) {
         const run = b.addRunArtifact(dbusc);
         run.addArg("call");
         run.addArg("org.freedesktop.DBus");
