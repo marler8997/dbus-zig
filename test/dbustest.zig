@@ -2,7 +2,24 @@ const State = struct {
     service_name: dbus.Slice(u32, [*]const u8),
     client_serial: u32,
     service_serial: u32,
-    client_waiting_for: ?TestCase,
+    client_waiting_for: ?WaitingFor,
+
+    const WaitingFor = union(TestCase) {
+        empty,
+        u,
+        i,
+        uu,
+        struct_uu,
+        au,
+        as,
+        a_struct_uu,
+        dict_uu,
+        dict_us,
+        dict_uv,
+        v_u,
+        v_uu,
+        h: std.posix.fd_t, // pipe read end for verification
+    };
 };
 
 const TestCase = enum {
@@ -19,6 +36,8 @@ const TestCase = enum {
     dict_uv,
     v_u,
     v_uu,
+    h, // unix_fd - must be last since it requires special sendmsg/recvmsg handling
+
     pub fn sig(case: TestCase) [:0]const u8 {
         return switch (case) {
             .empty => "",
@@ -36,6 +55,8 @@ const TestCase = enum {
 };
 
 pub fn main() !void {
+    try testFdPassingNoDbus();
+
     const session_addr_str = dbus.getSessionBusAddressString();
     const addr = dbus.Address.fromString(session_addr_str.str) catch |err| errExit(
         "invalid dbus address from environment variable '{s}': {s}",
@@ -66,22 +87,72 @@ pub fn main() !void {
     };
 
     while (client_conn.getSource().hasBufferedData()) {
-        try handleClientMessage(&state, client_conn.getWriter(), client_conn.getSource());
+        try handleClientMessage(&state, client_conn.stream.handle, client_conn.getWriter(), client_conn.getSource(), null);
     }
     while (service_conn.getSource().hasBufferedData()) {
-        try handleServiceMessage(&state, service_conn.getWriter(), service_conn.getSource());
+        try handleServiceMessage(&state, service_conn.stream.handle, service_conn.getSource(), null);
     }
 
-    try flushMethodCall(
+    state.client_waiting_for = try flushMethodCall(
         client_conn.getWriter(),
-        .{ .ptr = &service_name_buf, .len = service_name_len },
+        client_conn.stream.handle,
+        state.service_name,
         &state.client_serial,
         @enumFromInt(0),
     );
-    state.client_waiting_for = @enumFromInt(0);
 
     while (state.client_waiting_for != null) {
         try handleEvent(&state, &service_conn, &client_conn);
+    }
+}
+
+fn testFdPassingNoDbus() !void {
+    var pair: [2]std.posix.fd_t = undefined;
+    if (std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &pair) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer std.posix.close(pair[0]);
+    defer std.posix.close(pair[1]);
+
+    const send_data = "hello from sender";
+
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]); // read end stays with us
+
+    {
+        defer std.posix.close(pipe[1]);
+        var control: dbus.Cmsg(std.posix.fd_t) = .{
+            .level = std.posix.SOL.SOCKET,
+            .type = dbus.SCM.RIGHTS,
+            .data = pipe[1],
+        };
+        _ = try dbus.sendCmsg(std.posix.fd_t, pair[0], send_data, &control);
+    }
+
+    const received_fd = blk: {
+        var recv_buf: [100]u8 = undefined;
+        var recv_control: dbus.Cmsg(std.posix.fd_t) = undefined;
+        const data_len, const control_len = try dbus.recvCmsg(std.posix.fd_t, pair[1], &recv_buf, &recv_control);
+        std.debug.assert(data_len == send_data.len);
+        std.debug.assert(std.mem.eql(u8, recv_buf[0..data_len], send_data));
+
+        std.debug.assert(control_len == @sizeOf(@TypeOf(recv_control)));
+        break :blk recv_control.data;
+    };
+    defer std.posix.close(received_fd);
+
+    const test_message = "message through passed fd";
+    {
+        const len = try std.posix.write(received_fd, test_message);
+        std.debug.assert(len == test_message.len);
+    }
+
+    // Read from the pipe's read end to verify the FD works
+    {
+        var pipe_buf: [100]u8 = undefined;
+        const n = try std.posix.read(pipe[0], &pipe_buf);
+        std.debug.assert(n == test_message.len);
+        std.debug.assert(std.mem.eql(u8, pipe_buf[0..n], test_message));
     }
 }
 
@@ -206,18 +277,55 @@ fn handleEvent(
     const ready = try std.posix.poll(&fds, -1);
     std.debug.assert(ready != 0); // should be impossible with infinite timeout
     var handled: u32 = 0;
+
+    const expecting_fd = if (state.client_waiting_for) |wf| wf == .h else false;
+
     if (fds[0].revents & std.posix.POLL.IN != 0) {
         handled += 1;
-        try handleServiceMessage(state, service_conn.getWriter(), service_conn.getSource());
+        if (expecting_fd) {
+            var recv_buf: [1000]u8 = undefined;
+            var recv_control: dbus.Cmsg(std.posix.fd_t) = undefined;
+            const data_len, const control_len = try dbus.recvCmsg(
+                std.posix.fd_t,
+                service_conn.stream.handle,
+                &recv_buf,
+                &recv_control,
+            );
+            std.debug.assert(control_len == @sizeOf(@TypeOf(recv_control)));
+            var reader: dbus.Reader = .fixed(recv_buf[0..data_len]);
+            var source_state: dbus.SourceState = .msg_start;
+            const source = dbus.Source{ .reader = &reader, .state = &source_state };
+            try handleServiceMessage(state, service_conn.stream.handle, source, recv_control.data);
+        } else {
+            try handleServiceMessage(state, service_conn.stream.handle, service_conn.getSource(), null);
+        }
     }
     if (fds[1].revents & std.posix.POLL.IN != 0) {
         handled += 1;
-        try handleClientMessage(state, client_conn.getWriter(), client_conn.getSource());
+        if (expecting_fd) {
+            var recv_buf: [1000]u8 = undefined;
+            var recv_control: dbus.Cmsg(std.posix.fd_t) = undefined;
+            const data_len, const control_len = try dbus.recvCmsg(
+                std.posix.fd_t,
+                client_conn.stream.handle,
+                &recv_buf,
+                &recv_control,
+            );
+            std.debug.assert(control_len == @sizeOf(@TypeOf(recv_control)));
+            var reader: dbus.Reader = .fixed(recv_buf[0..data_len]);
+            var source_state: dbus.SourceState = .msg_start;
+            const source = dbus.Source{ .reader = &reader, .state = &source_state };
+            try handleClientMessage(state, client_conn.stream.handle, client_conn.getWriter(), source, recv_control.data);
+        } else {
+            try handleClientMessage(state, client_conn.stream.handle, client_conn.getWriter(), client_conn.getSource(), null);
+        }
     }
     std.debug.assert(handled == ready);
-    return;
 }
-fn handleServiceMessage(state: *State, writer: *dbus.Writer, source: dbus.Source) !void {
+fn handleServiceMessage(state: *State, socket_handle: std.posix.fd_t, source: dbus.Source, received_fd: ?std.posix.fd_t) !void {
+    defer if (received_fd) |fd| std.posix.close(fd);
+    if (received_fd) |fd| std.log.info("Service received 'h' message with FD {}", .{fd});
+
     var stderr_buf: [1000]u8 = undefined;
     var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_file.interface;
@@ -261,19 +369,55 @@ fn handleServiceMessage(state: *State, writer: *dbus.Writer, source: dbus.Source
         std.log.info("service handling {s}", .{@tagName(test_sig)});
         std.debug.assert(std.mem.eql(u8, signature.slice(), test_sig.sig()));
 
-        try echo.handle(source, writer, .{
-            .serial = state.service_serial,
-            .reply_serial = msg_start.serial,
-            .destination = .{ .ptr = &sender.buffer, .len = sender.len },
-        });
-        try writer.flush();
+        if (received_fd) |fd| {
+            // Handle 'h' (unix_fd) - need sendmsg to attach FD to reply
+            const fd_index = try source.readBody(.unix_fd, {});
+            std.debug.assert(fd_index == 0);
+            try source.bodyEnd();
+
+            var reply_buf: [500]u8 = undefined;
+            var reply_writer: dbus.Writer = .fixed(&reply_buf);
+            try dbus.writeMethodReturn(&reply_writer, "h", .{
+                .serial = state.service_serial,
+                .reply_serial = msg_start.serial,
+                .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+                .unix_fds = 1,
+            }, .{@as(u32, 0)});
+
+            var reply_control: dbus.Cmsg(std.posix.fd_t) = .{
+                .level = std.posix.SOL.SOCKET,
+                .type = dbus.SCM.RIGHTS,
+                .data = fd,
+            };
+            _ = try dbus.sendCmsg(std.posix.fd_t, socket_handle, reply_buf[0..reply_writer.end], &reply_control);
+            std.log.info("Service sent 'h' reply with FD attached", .{});
+        } else {
+            // Normal case - use buffered writer
+            var write_buf: [1000]u8 = undefined;
+            const stream = std.net.Stream{ .handle = socket_handle };
+            var stream_writer: dbus.Stream15.Writer = .init(stream, &write_buf);
+            const writer = &stream_writer.interface;
+
+            try echo.handle(source, writer, .{
+                .serial = state.service_serial,
+                .reply_serial = msg_start.serial,
+                .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+            });
+            try writer.flush();
+        }
         state.service_serial += 1;
 
         if (!source.hasBufferedData()) break;
     }
 }
 
-fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source) !void {
+fn handleClientMessage(
+    state: *State,
+    socket_handle: std.posix.fd_t,
+    writer: *dbus.Writer,
+    source: dbus.Source,
+    received_fd: ?std.posix.fd_t,
+) !void {
     var stderr_buf: [1000]u8 = undefined;
     var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_file.interface;
@@ -293,7 +437,8 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                 std.debug.assert(headers.reply_serial == state.client_serial - 1);
 
                 const waiting_for = state.client_waiting_for orelse unreachable;
-                std.debug.assert(std.mem.eql(u8, waiting_for.sig(), source.bodySignatureSlice()));
+                const test_case = std.meta.activeTag(waiting_for);
+                std.debug.assert(std.mem.eql(u8, test_case.sig(), source.bodySignatureSlice()));
 
                 switch (waiting_for) {
                     .empty => {
@@ -428,23 +573,44 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         std.debug.assert(second == testValues(.v_uu)[0].struct_uu[1]);
                         try source.bodyEnd();
                     },
+                    .h => |pipe_read_fd| {
+                        defer std.posix.close(pipe_read_fd);
+                        const echoed_fd = received_fd orelse unreachable;
+                        defer std.posix.close(echoed_fd);
+                        std.log.info("Client received 'h' reply with FD {}", .{echoed_fd});
+
+                        const fd_index = try source.readBody(.unix_fd, {});
+                        std.debug.assert(fd_index == 0);
+                        try source.bodyEnd();
+
+                        // Verify the FD works by writing through it and reading from the test pipe
+                        const test_message = "FD passed through D-Bus!";
+                        _ = try std.posix.write(echoed_fd, test_message);
+
+                        var verify_buf: [100]u8 = undefined;
+                        const n = try std.posix.read(pipe_read_fd, &verify_buf);
+                        std.debug.assert(n == test_message.len);
+                        std.debug.assert(std.mem.eql(u8, verify_buf[0..n], test_message));
+
+                        std.log.info("FD passing test PASSED!", .{});
+                    },
                 }
 
                 const next_case: TestCase = blk: {
-                    const int = @as(u32, @intFromEnum(waiting_for)) + 1;
+                    const int = @as(u32, @intFromEnum(test_case)) + 1;
                     if (int == std.meta.fields(TestCase).len) {
                         state.client_waiting_for = null;
                         return;
                     }
                     break :blk @enumFromInt(int);
                 };
-                try flushMethodCall(
+                state.client_waiting_for = try flushMethodCall(
                     writer,
+                    socket_handle,
                     state.service_name,
                     &state.client_serial,
                     next_case,
                 );
-                state.client_waiting_for = next_case;
             },
             .error_reply => {
                 std.log.err("Client received error", .{});
@@ -507,32 +673,64 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
         .dict_uv => .{&dict_uv_values},
         .v_u => .{.{ .u32 = 0xf02958ab }},
         .v_uu => .{.{ .struct_uu = .{ 0xd2be463a, 0xa193801e } }},
+        .h => .{@as(u32, 0)}, // fd_index = 0
     };
 }
 
+/// Sends a method call. For 'h' test case, returns the pipe read fd to store in WaitingFor.
 fn flushMethodCall(
     writer: *dbus.Writer,
+    socket_handle: std.posix.fd_t,
     service_name: dbus.Slice(u32, [*]const u8),
     client_serial_ref: *u32,
     test_case: TestCase,
-) !void {
+) !State.WaitingFor {
     const call: dbus.MethodCall = .{
         .serial = client_serial_ref.*,
         .destination = service_name,
         .path = .initStatic("/"),
         .member = .initAssume(@tagName(test_case)),
+        .unix_fds = if (test_case == .h) 1 else null,
     };
     std.log.info("client sending {s}...", .{call.member.?.nativeSlice()});
-    switch (test_case) {
-        inline else => |test_case_ct| try dbus.writeMethodCall(
-            writer,
-            test_case_ct.sig(),
-            call,
-            testValues(test_case_ct),
-        ),
-    }
-    try writer.flush();
+
     client_serial_ref.* += 1;
+
+    if (test_case == .h) {
+        // Special handling for 'h' - need sendmsg with FD
+        // Create the test pipe
+        const pipe = try std.posix.pipe();
+
+        // Build the message to a fixed buffer
+        var send_buf: [500]u8 = undefined;
+        var fixed_writer: dbus.Writer = .fixed(&send_buf);
+        try dbus.writeMethodCall(&fixed_writer, "h", call, .{@as(u32, 0)});
+
+        // Send with FD attached via SCM_RIGHTS
+        var control: dbus.Cmsg(std.posix.fd_t) = .{
+            .level = std.posix.SOL.SOCKET,
+            .type = dbus.SCM.RIGHTS,
+            .data = pipe[1], // send write end
+        };
+        _ = try dbus.sendCmsg(std.posix.fd_t, socket_handle, send_buf[0..fixed_writer.end], &control);
+        std.posix.close(pipe[1]); // close our copy after sending
+
+        return .{ .h = pipe[0] }; // return read end for verification
+    } else {
+        switch (test_case) {
+            .h => unreachable,
+            inline else => |test_case_ct| {
+                try dbus.writeMethodCall(
+                    writer,
+                    test_case_ct.sig(),
+                    call,
+                    testValues(test_case_ct),
+                );
+                try writer.flush();
+                return @unionInit(State.WaitingFor, @tagName(test_case_ct), {});
+            },
+        }
+    }
 }
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {

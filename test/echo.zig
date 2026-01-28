@@ -63,6 +63,11 @@ fn echoBody(
             write_body_offset = try dbus.write(writer, write_body_offset, "i", .{value});
             sig_offset += 1;
         },
+        'h' => {
+            const fd_index = try source.readBody(.unix_fd, {});
+            write_body_offset = try dbus.write(writer, write_body_offset, "h", .{fd_index});
+            sig_offset += 1;
+        },
         's' => {
             const string_size = try source.readBody(.string_size, {});
             write_body_offset = try dbus.writeStringSize(writer, write_body_offset, string_size);

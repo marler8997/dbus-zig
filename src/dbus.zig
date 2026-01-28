@@ -263,6 +263,7 @@ const HeaderFieldSignature = enum {
 
 const HeaderFieldU32Kind = enum(u8) {
     reply_serial = 5,
+    unix_fds = 9,
 };
 const HeaderFieldStringKind = enum(u8) {
     path = 1,
@@ -458,7 +459,7 @@ pub const Type = union(enum) {
             .i64 => 'x',
             .u64 => 't',
             .f64 => 'd',
-            .unix_fd => 'x',
+            .unix_fd => 'h',
             .string => 's',
             .object_path => 'o',
             .signature => 'g',
@@ -480,7 +481,7 @@ pub const Type = union(enum) {
             .i64 => .initStatic("x"),
             .u64 => .initStatic("t"),
             .f64 => .initStatic("d"),
-            .unix_fd => .initStatic("x"),
+            .unix_fd => .initStatic("h"),
             .string => .initStatic("s"),
             .object_path => .initStatic("o"),
             .signature => .initStatic("g"),
@@ -509,7 +510,7 @@ pub const Type = union(enum) {
             .i64 => i64,
             .u64 => u64,
             .f64 => f64,
-            .unix_fd => std.posix.fd_t,
+            .unix_fd => u32, // fd index in the ancillary data array
             .string => Slice(u32, [*]const u8),
             .object_path => Slice(u32, [*]const u8),
             .signature => Slice(u8, [*]const u8),
@@ -523,7 +524,7 @@ pub const Type = union(enum) {
     fn advance(comptime sig_type: Type, start: u32, value: *const sig_type.Native()) error{Overflow}!u32 {
         switch (sig_type) {
             .u8 => return writeSum(&.{ start, 1 }),
-            .i32, .u32 => {
+            .i32, .u32, .unix_fd => {
                 const pad_len: u32 = pad4Len(@truncate(start));
                 return writeSum(&.{ start, pad_len + 4 });
             },
@@ -757,6 +758,7 @@ pub const MethodCall = struct {
     destination: ?Slice(u32, [*]const u8) = null,
     interface: ?Slice(u32, [*]const u8) = null,
     member: ?Slice(u32, [*]const u8) = null,
+    unix_fds: ?u32 = null,
     pub fn calcHeaderArrayLen(self: *const MethodCall, signature: ?Slice(u8, [*]const u8)) u32 {
         var header_align: u3 = 0;
         const path_len = calcHeaderStringLen(&header_align, self.path);
@@ -764,7 +766,8 @@ pub const MethodCall = struct {
         const iface_len = if (self.interface) |s| calcHeaderStringLen(&header_align, s) else 0;
         const member_len = if (self.member) |s| calcHeaderStringLen(&header_align, s) else 0;
         const sig_len = if (signature) |s| calcHeaderSigLen(&header_align, s) else 0;
-        return path_len + dest_len + iface_len + member_len + sig_len;
+        const unix_fds_len = if (self.unix_fds != null) calcHeaderU32Len(&header_align) else 0;
+        return path_len + dest_len + iface_len + member_len + sig_len + unix_fds_len;
     }
 };
 
@@ -833,6 +836,13 @@ pub fn write(
                 try writer.splatByteAll(0, pad_len);
                 index += pad_len;
                 try writer.writeInt(i32, @field(data, name), native_endian);
+                index += 4;
+            },
+            .unix_fd => {
+                const pad_len = pad4Len(@truncate(index));
+                try writer.splatByteAll(0, pad_len);
+                index += pad_len;
+                try writer.writeInt(u32, @field(data, name), native_endian);
                 index += 4;
             },
             .signature => {
@@ -990,6 +1000,9 @@ pub fn writeMethodCall(
     if (body_sig.len > 0) {
         try writeHeaderSig(writer, &header_align, .initAssume(body_sig));
     }
+    if (call.unix_fds) |unix_fds| {
+        try writeHeaderU32(writer, &header_align, .unix_fds, unix_fds);
+    }
     try writer.splatByteAll(0, pad8Len(header_align));
 
     if (body_sig.len > 0) {
@@ -1002,13 +1015,15 @@ pub const MethodReturn = struct {
     serial: u32,
     reply_serial: u32,
     destination: ?Slice(u32, [*]const u8) = null,
+    unix_fds: ?u32 = null,
 
     pub fn calcHeaderArrayLen(self: *const MethodReturn, signature: ?Slice(u8, [*]const u8)) u32 {
         var header_align: u3 = 0;
         const reply_serial_len = calcHeaderU32Len(&header_align);
         const dest_len = if (self.destination) |s| calcHeaderStringLen(&header_align, s) else 0;
         const sig_len = if (signature) |s| calcHeaderSigLen(&header_align, s) else 0;
-        return reply_serial_len + dest_len + sig_len;
+        const unix_fds_len = if (self.unix_fds != null) calcHeaderU32Len(&header_align) else 0;
+        return reply_serial_len + dest_len + sig_len + unix_fds_len;
     }
 };
 
@@ -1037,6 +1052,9 @@ pub fn writeMethodReturn(
     }
     if (body_sig.len > 0) {
         try writeHeaderSig(writer, &header_align, .initStatic(body_sig));
+    }
+    if (args.unix_fds) |unix_fds| {
+        try writeHeaderU32(writer, &header_align, .unix_fds, unix_fds);
     }
     try writer.splatByteAll(0, pad8Len(header_align));
 
@@ -1450,6 +1468,13 @@ pub const Source = struct {
                 }
                 signature = str;
             },
+            .unix_fds => |fds| {
+                if (headers.unix_fds != null) {
+                    log_dbus.err("duplicate unix_fds header", .{});
+                    return error.DbusProtocol;
+                }
+                headers.unix_fds = fds;
+            },
         };
 
         // need to copy these values out of state so we can use them when re-assigning state
@@ -1729,6 +1754,17 @@ pub const Source = struct {
                 const value = try source.reader.takeInt(i32, it.endian);
                 it.body_offset += 4;
                 source.onBodyConsumed("i");
+                return value;
+            },
+            .unix_fd => {
+                const pad_len: u32 = pad4Len(@truncate(it.body_offset));
+                if (try incBody(&.{ it.body_offset, pad_len + 4 }) > it.body_size)
+                    return error.DbusProtocol;
+                try source.reader.discardAll(pad_len);
+                it.body_offset += pad_len;
+                const value = try source.reader.takeInt(u32, it.endian);
+                it.body_offset += 4;
+                source.onBodyConsumed("h");
                 return value;
             },
             .string_size, .object_path_size => {
@@ -2029,6 +2065,7 @@ pub const HeaderFieldIterator = struct {
         destination: Bounded(255),
         sender: Bounded(255),
         signature: Bounded(255),
+        unix_fds: u32,
     };
 
     endian: std.builtin.Endian,
@@ -2206,7 +2243,11 @@ pub const HeaderFieldIterator = struct {
                 return .{ .reply_serial = value };
             },
             .unix_fds => {
-                @panic("todo");
+                // we should already be aligned on a 4-byte boundary
+                std.debug.assert(pad4Len(@truncate(it.bytes_read)) == 0);
+                const value = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                return .{ .unix_fds = value };
             },
             .unknown => {
                 @panic("todo");
@@ -2227,6 +2268,7 @@ const ReadKind = enum {
     boolean,
     u32,
     i32,
+    unix_fd,
     string_size,
     object_path_size,
     variant_sig,
@@ -2234,7 +2276,7 @@ const ReadKind = enum {
     pub fn ReadType(kind: ReadKind) type {
         return switch (kind) {
             .boolean => bool,
-            .u32 => u32,
+            .u32, .unix_fd => u32,
             .i32 => i32,
             .string_size => u32,
             .object_path_size => u32,
@@ -2247,6 +2289,7 @@ const ReadKind = enum {
             .boolean,
             .u32,
             .i32,
+            .unix_fd,
             .string_size,
             .object_path_size,
             => void,
@@ -2258,6 +2301,8 @@ const ReadKind = enum {
         return switch (kind) {
             .boolean => "boolean",
             .u32 => "u32",
+            .i32 => "i32",
+            .unix_fd => "unix_fd",
             .string_size => "string",
             .object_path_size => "object path",
             .variant_sig => "variant",
@@ -2270,6 +2315,7 @@ const ReadKind = enum {
             .boolean => 'b',
             .u32 => 'u',
             .i32 => 'i',
+            .unix_fd => 'h',
             .string_size => 's',
             .object_path_size => 'o',
             .variant_sig => 'v',
@@ -2485,7 +2531,7 @@ fn nextType(comptime sig: []const u8, start: u8) struct { Type, u8 } {
         'x' => .{ .i64, start + 1 },
         't' => .{ .u64, start + 1 },
         'd' => .{ .f64, start + 1 },
-        // 'h' => .{ u32, start+ 1 },
+        'h' => .{ .unix_fd, start + 1 },
 
         // string types
         's' => .{ .string, start + 1 },
@@ -2786,3 +2832,84 @@ pub fn DynamicHeaders(comptime message_type: ?MessageType) type {
 //         }
 //     }).func;
 // }
+
+pub const SCM = struct {
+    pub const RIGHTS = 1;
+};
+
+const Cmsghdr = extern struct {
+    len: usize, // data byte count, including header
+    level: c_int, // originating protocol (i.e. std.os.linux.SOL.SOCKET)
+    type: c_int, // protocol-specific type (i.e. SCM.RIGHTS)
+};
+pub fn Cmsg(comptime T: type) type {
+    return extern struct {
+        len: usize = @sizeOf(Cmsghdr) + @sizeOf(T),
+        level: c_int,
+        type: c_int,
+        data: T,
+    };
+}
+
+pub fn sendCmsg(
+    comptime T: type,
+    sock: std.posix.fd_t,
+    data: []const u8,
+    control: *const Cmsg(T),
+) !usize {
+    var iov = [_]std.posix.iovec_const{
+        .{ .base = data.ptr, .len = data.len },
+    };
+    var msg = std.os.linux.msghdr_const{
+        .name = null,
+        .namelen = 0,
+        .iov = @ptrCast(&iov),
+        .iovlen = 1,
+        .control = control,
+        .controllen = @sizeOf(@TypeOf(control.*)),
+        .flags = 0,
+    };
+    const rc = std.os.linux.sendmsg(sock, &msg, std.os.linux.MSG.NOSIGNAL);
+    if (rc > std.math.maxInt(isize)) {
+        return std.posix.unexpectedErrno(@enumFromInt(rc));
+    }
+    return rc;
+}
+
+pub fn recvCmsg(
+    comptime T: type,
+    sock: std.posix.fd_t,
+    buffer: []u8,
+    control: *Cmsg(T),
+) std.posix.RecvFromError!struct { usize, usize } {
+    while (true) {
+        var iov = [_]std.posix.iovec{
+            .{ .base = buffer.ptr, .len = buffer.len },
+        };
+        var msg = std.os.linux.msghdr{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = control,
+            .controllen = @sizeOf(@TypeOf(control.*)),
+            .flags = 0,
+        };
+        const rc = std.os.linux.recvmsg(sock, &msg, 0);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{ @intCast(rc), msg.controllen },
+            .BADF => unreachable, // always a race condition
+            .FAULT => unreachable,
+            .INVAL => unreachable,
+            .NOTCONN => return error.SocketNotConnected,
+            .NOTSOCK => unreachable,
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .NOMEM => return error.SystemResources,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
