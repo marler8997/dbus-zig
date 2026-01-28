@@ -372,6 +372,10 @@ pub fn pad4Len(len: u2) u2 {
 pub fn pad8Len(len: u3) u3 {
     return padLen(8, len);
 }
+test {
+    _ = address;
+}
+
 test pad8Len {
     try std.testing.expectEqual(0, pad8Len(0));
     try std.testing.expectEqual(0, pad8Len(@truncate(8)));

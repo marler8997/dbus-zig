@@ -263,7 +263,11 @@ fn handleServiceMessage(
                 const headers = try source.readHeadersMethodCall(&path_buf);
                 std.debug.assert(headers.path.len == 1);
                 std.debug.assert(std.mem.eql(u8, path_buf[0..1], "/"));
-                std.debug.assert(headers.interface == null);
+                std.debug.assert(std.mem.eql(
+                    u8,
+                    headers.interface.?.slice(),
+                    interface_name.nativeSlice(),
+                ));
                 std.debug.assert(headers.error_name == null);
                 std.debug.assert(headers.reply_serial == null);
                 std.debug.assert(headers.sender != null);
@@ -581,6 +585,7 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
 }
 
 const test_memfd_name = "TestDbusMemfd";
+const interface_name: dbus.Slice(u32, [*]const u8) = .initStatic("org.example.Test");
 
 fn flushMethodCall(
     msg_writer: *dbus.MsgWriter,
@@ -592,6 +597,7 @@ fn flushMethodCall(
         .serial = client_serial_ref.*,
         .destination = service_name,
         .path = .initStatic("/"),
+        .interface = interface_name,
         .member = .initAssume(@tagName(test_case)),
         .unix_fds = switch (test_case.fdCount()) {
             0 => null,

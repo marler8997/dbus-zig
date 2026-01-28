@@ -1,0 +1,19 @@
+name: Test
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+      fail-fast: true
+    runs-on: ${{matrix.os}}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: marler8997/setup-anyzig@master
+      # run against a private session bus; the runner has no session bus and
+      # the system bus policy denies some of the calls the tests make
+      - run: dbus-run-session -- zig build test --summary all
