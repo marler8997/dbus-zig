@@ -21,11 +21,11 @@ pub fn main() !u8 {
     std.log.info("connected to session bus '{s}', authenticating...", .{session_addr_str.str});
     var write_buf: [1000]u8 = undefined;
     var read_buf: [1000]u8 = undefined;
-    var socket_writer = dbus.socketWriter(stream, &write_buf);
-    var socket_reader = dbus.socketReader(stream, &read_buf);
-    const writer = &socket_writer.interface;
+    var msg_writer: dbus.MsgWriter = .init(stream, &write_buf);
+    var msg_reader: dbus.MsgReader = .init(stream, &read_buf);
+    const writer = &msg_writer.interface;
     var source_state: dbus.SourceState = .auth;
-    var source: dbus.Source = .{ .reader = socket_reader.interface(), .state = &source_state };
+    var source: dbus.Source = .{ .reader = msg_reader.interface(), .state = &source_state };
 
     try dbus.flushAuth(writer);
     try source.readAuth();

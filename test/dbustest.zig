@@ -19,6 +19,8 @@ const TestCase = enum {
     dict_uv,
     v_u,
     v_uu,
+    h,
+    u_again, // added so h is not the last test
     pub fn sig(case: TestCase) [:0]const u8 {
         return switch (case) {
             .empty => "",
@@ -30,7 +32,14 @@ const TestCase = enum {
             .dict_uv => "a{uv}",
             .v_u => "v",
             .v_uu => "v",
+            .u_again => "u",
             inline else => |ct| @tagName(ct),
+        };
+    }
+    pub fn fdCount(case: TestCase) u1 {
+        return switch (case) {
+            .h => 1,
+            else => 0,
         };
     }
 };
@@ -46,17 +55,17 @@ pub fn main() !void {
     try service_conn.connect(session_addr_str.str, addr);
 
     var service_name_buf: [dbus.max_name]u8 = undefined;
-    const service_name_len, const service_unix_fds = try service_conn.hello(&service_name_buf);
+    const service_name_len = try service_conn.hello(&service_name_buf);
     const service_name = service_name_buf[0..service_name_len];
-    std.log.info("ServiceName '{s}' unix_fds={}", .{ service_name, service_unix_fds });
+    std.log.info("ServiceName '{s}'", .{service_name});
 
     var client_conn: Connection = undefined;
     try client_conn.connect(session_addr_str.str, addr);
 
     var client_name_buf: [dbus.max_name]u8 = undefined;
-    const client_name_len, const client_unix_fds = try client_conn.hello(&client_name_buf);
+    const client_name_len = try client_conn.hello(&client_name_buf);
     const client_name = client_name_buf[0..client_name_len];
-    std.log.info("ClientName '{s}' unix_fds={}", .{ client_name, client_unix_fds });
+    std.log.info("ClientName '{s}'", .{client_name});
 
     var state: State = .{
         .service_name = .{ .ptr = &service_name_buf, .len = service_name_len },
@@ -66,10 +75,20 @@ pub fn main() !void {
     };
 
     while (client_conn.getSource().hasBufferedData()) {
-        try handleClientMessage(&state, client_conn.getWriter(), client_conn.getSource());
+        try handleClientMessage(
+            &state,
+            client_conn.getWriter(),
+            &client_conn.msg_reader.unix_fds,
+            client_conn.getSource(),
+        );
     }
     while (service_conn.getSource().hasBufferedData()) {
-        try handleServiceMessage(&state, service_conn.getWriter(), service_conn.getSource());
+        try handleServiceMessage(
+            &state,
+            service_conn.getWriter(),
+            &service_conn.msg_reader.unix_fds,
+            service_conn.getSource(),
+        );
     }
 
     try flushMethodCall(
@@ -89,9 +108,11 @@ const Connection = struct {
     write_buf: [1000]u8,
     read_buf: [1000]u8,
     stream: std.net.Stream,
-    stream_writer: dbus.Stream15.Writer,
-    stream_reader: dbus.Stream15.Reader,
+    msg_writer: dbus.MsgWriter,
+    msg_reader: dbus.MsgReader,
     source_state: dbus.SourceState,
+
+    const fd_buf_count = 10;
 
     pub fn connect(connection: *Connection, addr_str: []const u8, addr: dbus.Address) !void {
         const stream = dbus.connect(addr) catch |err| errExit(
@@ -103,24 +124,24 @@ const Connection = struct {
             .write_buf = undefined,
             .read_buf = undefined,
             .stream = stream,
-            .stream_writer = .init(stream, &connection.write_buf),
-            .stream_reader = .init(stream, &connection.read_buf),
+            .msg_writer = .init(stream, &connection.write_buf),
+            .msg_reader = .init(stream, &connection.read_buf),
             .source_state = .auth,
         };
     }
 
-    pub fn getWriter(connection: *Connection) *dbus.Writer {
-        return &connection.stream_writer.interface;
+    pub fn getWriter(connection: *Connection) *dbus.MsgWriter {
+        return &connection.msg_writer;
     }
     pub fn getSource(connection: *Connection) dbus.Source {
         return .{
-            .reader = connection.stream_reader.interface(),
+            .reader = connection.msg_reader.interface(),
             .state = &connection.source_state,
         };
     }
 
-    pub fn hello(connection: *Connection, out_name_buf: *[dbus.max_name]u8) !struct { u8, bool } {
-        const writer = connection.getWriter();
+    pub fn hello(connection: *Connection, out_name_buf: *[dbus.max_name]u8) !u8 {
+        const writer = &connection.getWriter().interface;
         const source = connection.getSource();
 
         try dbus.flushAuth(writer);
@@ -129,16 +150,10 @@ const Connection = struct {
 
         try writer.writeAll("NEGOTIATE_UNIX_FD\r\n");
         try writer.flush();
-        const unix_fd = blk: switch (try source.readNegotiateUnixFd()) {
-            .agree => {
-                std.log.info("NEGOTIATE_UNIX_FD: agree", .{});
-                break :blk true;
-            },
-            .err => |msg| {
-                std.log.warn("NEGOTIATE_UNIX_FD: ERROR {s}", .{msg});
-                break :blk false;
-            },
-        };
+        switch (try source.readNegotiateUnixFd()) {
+            .agree => {},
+            .err => |msg| std.debug.panic("NEGOTIATE_UNIX_FD: ERROR {s}", .{msg}),
+        }
 
         try writer.writeAll("BEGIN\r\n");
         try dbus.writeMethodCall(
@@ -190,7 +205,7 @@ const Connection = struct {
         try source.dataReadSliceAll(out_name_buf[0..name_len]);
         try source.dataReadNullTerm();
         try source.bodyEnd();
-        return .{ name_len, unix_fd };
+        return name_len;
     }
 };
 
@@ -208,16 +223,31 @@ fn handleEvent(
     var handled: u32 = 0;
     if (fds[0].revents & std.posix.POLL.IN != 0) {
         handled += 1;
-        try handleServiceMessage(state, service_conn.getWriter(), service_conn.getSource());
+        try handleServiceMessage(
+            state,
+            service_conn.getWriter(),
+            &service_conn.msg_reader.unix_fds,
+            service_conn.getSource(),
+        );
     }
     if (fds[1].revents & std.posix.POLL.IN != 0) {
         handled += 1;
-        try handleClientMessage(state, client_conn.getWriter(), client_conn.getSource());
+        try handleClientMessage(
+            state,
+            client_conn.getWriter(),
+            &client_conn.msg_reader.unix_fds,
+            client_conn.getSource(),
+        );
     }
     std.debug.assert(handled == ready);
     return;
 }
-fn handleServiceMessage(state: *State, writer: *dbus.Writer, source: dbus.Source) !void {
+fn handleServiceMessage(
+    state: *State,
+    msg_writer: *dbus.MsgWriter,
+    unix_fds: *dbus.UnixFds,
+    source: dbus.Source,
+) !void {
     var stderr_buf: [1000]u8 = undefined;
     var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_file.interface;
@@ -254,26 +284,35 @@ fn handleServiceMessage(state: *State, writer: *dbus.Writer, source: dbus.Source
             },
         };
 
-        const test_sig = std.meta.stringToEnum(TestCase, method.slice()) orelse std.debug.panic(
+        const test_case = std.meta.stringToEnum(TestCase, method.slice()) orelse std.debug.panic(
             "unknown method/test case '{s}'",
             .{method.slice()},
         );
-        std.log.info("service handling {s}", .{@tagName(test_sig)});
-        std.debug.assert(std.mem.eql(u8, signature.slice(), test_sig.sig()));
+        std.log.info("service handling {s}", .{@tagName(test_case)});
+        std.debug.assert(std.mem.eql(u8, signature.slice(), test_case.sig()));
 
-        try echo.handle(source, writer, .{
+        try echo.handle(unix_fds, source, msg_writer, .{
             .serial = state.service_serial,
             .reply_serial = msg_start.serial,
             .destination = .{ .ptr = &sender.buffer, .len = sender.len },
+            .unix_fds = switch (test_case.fdCount()) {
+                0 => null,
+                1 => 1,
+            },
         });
-        try writer.flush();
+        try msg_writer.interface.flush();
         state.service_serial += 1;
 
         if (!source.hasBufferedData()) break;
     }
 }
 
-fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source) !void {
+fn handleClientMessage(
+    state: *State,
+    msg_writer: *dbus.MsgWriter,
+    unix_fds: *dbus.UnixFds,
+    source: dbus.Source,
+) !void {
     var stderr_buf: [1000]u8 = undefined;
     var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_file.interface;
@@ -428,6 +467,19 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                         std.debug.assert(second == testValues(.v_uu)[0].struct_uu[1]);
                         try source.bodyEnd();
                     },
+                    .h => {
+                        std.debug.assert(msg_start.body_len == 4);
+                        std.debug.assert(0 == try source.readBody(.unix_fd_index, {}));
+                        try source.bodyEnd();
+                        const fd = unix_fds.take(0).?;
+                        defer std.posix.close(fd);
+                        std.debug.assert(try isTestMemfd(fd));
+                    },
+                    .u_again => {
+                        std.debug.assert(msg_start.body_len == 4);
+                        std.debug.assert(testValues(.u_again)[0] == try source.readBody(.u32, {}));
+                        try source.bodyEnd();
+                    },
                 }
 
                 const next_case: TestCase = blk: {
@@ -439,7 +491,7 @@ fn handleClientMessage(state: *State, writer: *dbus.Writer, source: dbus.Source)
                     break :blk @enumFromInt(int);
                 };
                 try flushMethodCall(
-                    writer,
+                    msg_writer,
                     state.service_name,
                     &state.client_serial,
                     next_case,
@@ -507,11 +559,15 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
         .dict_uv => .{&dict_uv_values},
         .v_u => .{.{ .u32 = 0xf02958ab }},
         .v_uu => .{.{ .struct_uu = .{ 0xd2be463a, 0xa193801e } }},
+        .h => .{0}, // fd index 0
+        .u_again => .{0x9abcdef0},
     };
 }
 
+const test_memfd_name = "TestDbusMemfd";
+
 fn flushMethodCall(
-    writer: *dbus.Writer,
+    msg_writer: *dbus.MsgWriter,
     service_name: dbus.Slice(u32, [*]const u8),
     client_serial_ref: *u32,
     test_case: TestCase,
@@ -521,18 +577,63 @@ fn flushMethodCall(
         .destination = service_name,
         .path = .initStatic("/"),
         .member = .initAssume(@tagName(test_case)),
+        .unix_fds = switch (test_case.fdCount()) {
+            0 => null,
+            1 => 1,
+        },
     };
     std.log.info("client sending {s}...", .{call.member.?.nativeSlice()});
+
+    std.debug.assert(msg_writer.control == null);
+    defer std.debug.assert(msg_writer.control == null);
+
+    const memfd: std.posix.fd_t = switch (test_case.fdCount()) {
+        0 => undefined,
+        1 => try std.posix.memfd_createZ(test_memfd_name, 0),
+    };
+    defer switch (test_case.fdCount()) {
+        0 => {},
+        1 => {
+            std.log.info("closing fd {} (client message sent)", .{memfd});
+            std.posix.close(memfd);
+        },
+    };
+
+    var write_entry: dbus.cmsg.Entry(std.posix.fd_t) = switch (test_case.fdCount()) {
+        0 => undefined,
+        1 => .{
+            .level = std.os.linux.SOL.SOCKET,
+            .type = dbus.SCM.RIGHTS,
+            .data = memfd,
+        },
+    };
+    switch (test_case.fdCount()) {
+        0 => {},
+        1 => msg_writer.control = write_entry.singleEntryArray(),
+    }
+    defer switch (test_case.fdCount()) {
+        0 => {},
+        1 => msg_writer.control = null,
+    };
+
     switch (test_case) {
         inline else => |test_case_ct| try dbus.writeMethodCall(
-            writer,
+            &msg_writer.interface,
             test_case_ct.sig(),
             call,
             testValues(test_case_ct),
         ),
     }
-    try writer.flush();
+    try msg_writer.interface.flush();
     client_serial_ref.* += 1;
+}
+
+fn isTestMemfd(fd: std.posix.fd_t) !bool {
+    var buf: [200]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&buf, "/proc/self/fd/{d}", .{fd}) catch unreachable;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link_target = try std.posix.readlinkZ(path, &link_buf);
+    return std.mem.startsWith(u8, link_target, "/memfd:" ++ test_memfd_name);
 }
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {

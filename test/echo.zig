@@ -1,6 +1,7 @@
 pub fn handle(
+    unix_fds: *dbus.UnixFds,
     source: dbus.Source,
-    response_writer: *dbus.Writer,
+    response_writer: *dbus.MsgWriter,
     return_args: dbus.MethodReturn,
 ) !void {
     // this code tests and demonstrates that we can dynamically read/write data with
@@ -31,16 +32,46 @@ pub fn handle(
     if (maybe_sig) |sig| {
         try dbus.writeHeaderSig(writer, &header_align, .initAssume(sig.slice()));
     }
+    if (dbus.nonZeroFdCount(return_args.unix_fds)) |count| {
+        try dbus.writeHeaderU32(writer, &header_align, .unix_fds, count);
+    }
     try writer.splatByteAll(0, dbus.pad8Len(header_align));
 
     const body_start = writer.end;
-
-    const body_size: u32 = try echoBody(source, writer, if (maybe_sig) |s| s.slice() else "", 0);
+    const body_size: u32, const maybe_fd_index: ?u32 = blk: {
+        var maybe_fd_index: ?u32 = null;
+        const body_size: u32 = try echoBody(
+            source,
+            writer,
+            if (maybe_sig) |s| s.slice() else "",
+            0,
+            &maybe_fd_index,
+        );
+        break :blk .{ body_size, maybe_fd_index };
+    };
     try source.bodyEnd();
+
+    switch (return_args.unix_fds orelse 0) {
+        0 => std.debug.assert(maybe_fd_index == null),
+        1 => std.debug.assert(maybe_fd_index != null),
+        else => unreachable,
+    }
 
     std.debug.assert(writer.end - body_start == body_size);
     std.mem.writeInt(u32, hold_buffer[4..8], body_size, dbus.native_endian);
-    try response_writer.writeAll(hold_buffer[0..writer.end]);
+
+    std.debug.assert(response_writer.control == null);
+    const maybe_fd: ?std.posix.fd_t = if (maybe_fd_index) |fd_index| unix_fds.take(fd_index) else null;
+    defer if (maybe_fd) |fd| std.posix.close(fd);
+    var write_entry: dbus.cmsg.Entry(std.posix.fd_t) = if (maybe_fd) |fd| .{
+        .level = std.os.linux.SOL.SOCKET,
+        .type = dbus.SCM.RIGHTS,
+        .data = fd,
+    } else undefined;
+    if (maybe_fd != null) response_writer.control = write_entry.singleEntryArray();
+    defer response_writer.control = null;
+    try response_writer.interface.writeAll(hold_buffer[0..writer.end]);
+    try response_writer.interface.flush();
 }
 
 fn echoBody(
@@ -48,6 +79,7 @@ fn echoBody(
     writer: *dbus.Writer,
     sig: []const u8,
     body_start: u32,
+    fd_index_ref: *?u32,
 ) !u32 {
     var sig_offset: usize = 0;
     var write_body_offset: u32 = body_start;
@@ -61,6 +93,14 @@ fn echoBody(
         'i' => {
             const value = try source.readBody(.i32, {});
             write_body_offset = try dbus.write(writer, write_body_offset, "i", .{value});
+            sig_offset += 1;
+        },
+        'h' => {
+            const fd_index = try source.readBody(.unix_fd_index, {});
+            std.debug.assert(fd_index == 0);
+            std.debug.assert(fd_index_ref.* == null);
+            fd_index_ref.* = 0;
+            write_body_offset = try dbus.write(writer, write_body_offset, "h", .{0});
             sig_offset += 1;
         },
         's' => {
@@ -79,7 +119,13 @@ fn echoBody(
                 "g",
                 .{variant.signature.sliceDbus()},
             );
-            write_body_offset = try echoBody(source, writer, variant.signature.slice(), write_body_offset);
+            write_body_offset = try echoBody(
+                source,
+                writer,
+                variant.signature.slice(),
+                write_body_offset,
+                fd_index_ref,
+            );
             sig_offset += 1;
         },
         'a' => {
@@ -113,6 +159,7 @@ fn echoBody(
                     writer,
                     element_sig,
                     write_body_offset,
+                    fd_index_ref,
                 );
             }
             sig_offset = array.sig_end;
@@ -129,6 +176,7 @@ fn echoBody(
                 writer,
                 sig[sig_offset + 1 .. sig_end - 1],
                 write_body_offset,
+                fd_index_ref,
             );
             sig_offset = sig_end;
         },

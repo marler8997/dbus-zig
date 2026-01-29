@@ -140,4 +140,35 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run.step);
         b.step("dbustest", "").dependOn(&run.step);
     }
+
+    {
+        const exe = b.addExecutable(.{
+            .name = "fuzz",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/fuzz.zig"),
+                .target = target,
+                .optimize = mode,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "dbus", .module = dbus_module },
+                },
+            }),
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        b.step("install-fuzz", "").dependOn(&install.step);
+
+        {
+            const run_test = b.addRunArtifact(exe);
+            _ = run_test.addOutputFileArg("seed");
+            run_test.addArg("2"); // 2 seconds
+            b.step("fuzz-test", "").dependOn(&run_test.step);
+            test_step.dependOn(&run_test.step);
+        }
+
+        const run = b.addRunArtifact(exe);
+        if (b.args) |args| {
+            run.addArgs(args);
+        }
+        b.step("fuzz", "Run the fuzz tester").dependOn(&run.step);
+    }
 }
