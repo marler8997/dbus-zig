@@ -1,6 +1,7 @@
 pub fn handle(
+    read_cmsg_buf: *dbus.cmsg.RecvBuffer(std.posix.fd_t),
     source: dbus.Source,
-    response_writer: *dbus.Writer,
+    response_writer: *dbus.MsgWriter,
     return_args: dbus.MethodReturn,
 ) !void {
     // this code tests and demonstrates that we can dynamically read/write data with
@@ -31,23 +32,56 @@ pub fn handle(
     if (maybe_sig) |sig| {
         try dbus.writeHeaderSig(writer, &header_align, .initAssume(sig.slice()));
     }
+    if (dbus.nonZeroFdCount(return_args.unix_fds)) |count| {
+        try dbus.writeHeaderU32(writer, &header_align, .unix_fds, count);
+    }
     try writer.splatByteAll(0, dbus.pad8Len(header_align));
 
     const body_start = writer.end;
+    var fd: std.posix.fd_t = -1;
+    defer if (fd != -1) {
+        std.log.info("closing fd {} (echo sent)", .{fd});
+        std.posix.close(fd);
+    };
 
-    const body_size: u32 = try echoBody(source, writer, if (maybe_sig) |s| s.slice() else "", 0);
+    const body_size: u32 = try echoBody(
+        read_cmsg_buf,
+        source,
+        writer,
+        if (maybe_sig) |s| s.slice() else "",
+        0,
+        &fd,
+    );
     try source.bodyEnd();
+
+    switch (return_args.unix_fds orelse 0) {
+        0 => std.debug.assert(fd == -1),
+        1 => std.debug.assert(fd != -1),
+        else => unreachable,
+    }
 
     std.debug.assert(writer.end - body_start == body_size);
     std.mem.writeInt(u32, hold_buffer[4..8], body_size, dbus.native_endian);
-    try response_writer.writeAll(hold_buffer[0..writer.end]);
+
+    std.debug.assert(response_writer.control == null);
+    var write_entry: dbus.cmsg.Entry(std.posix.fd_t) = if (fd == -1) undefined else .{
+        .level = std.os.linux.SOL.SOCKET,
+        .type = dbus.SCM.RIGHTS,
+        .data = fd,
+    };
+    if (fd != -1) response_writer.control = write_entry.singleEntryArray();
+    defer response_writer.control = null;
+    try response_writer.interface.writeAll(hold_buffer[0..writer.end]);
+    try response_writer.interface.flush();
 }
 
 fn echoBody(
+    read_cmsg_buf: *dbus.cmsg.RecvBuffer(std.posix.fd_t),
     source: dbus.Source,
     writer: *dbus.Writer,
     sig: []const u8,
     body_start: u32,
+    fd_ref: *std.posix.fd_t,
 ) !u32 {
     var sig_offset: usize = 0;
     var write_body_offset: u32 = body_start;
@@ -61,6 +95,22 @@ fn echoBody(
         'i' => {
             const value = try source.readBody(.i32, {});
             write_body_offset = try dbus.write(writer, write_body_offset, "i", .{value});
+            sig_offset += 1;
+        },
+        'h' => {
+            const fd_index = try source.readBody(.unix_fd_index, {});
+            std.debug.assert(fd_index == 0);
+            std.debug.assert(fd_ref.* == -1);
+            // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            std.log.info("read_cmsg_buf.recv_len={}", .{read_cmsg_buf.recv_len});
+            const data_len = read_cmsg_buf.dataLen();
+            // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            std.log.info("data_len={}", .{data_len});
+            std.debug.assert(data_len == @sizeOf(std.posix.fd_t));
+            fd_ref.* = read_cmsg_buf.entry.data;
+            std.debug.assert(fd_ref.* != -1);
+            std.log.info("fd={}", .{fd_ref.*});
+            write_body_offset = try dbus.write(writer, write_body_offset, "h", .{0});
             sig_offset += 1;
         },
         's' => {
@@ -79,7 +129,14 @@ fn echoBody(
                 "g",
                 .{variant.signature.sliceDbus()},
             );
-            write_body_offset = try echoBody(source, writer, variant.signature.slice(), write_body_offset);
+            write_body_offset = try echoBody(
+                read_cmsg_buf,
+                source,
+                writer,
+                variant.signature.slice(),
+                write_body_offset,
+                fd_ref,
+            );
             sig_offset += 1;
         },
         'a' => {
@@ -109,10 +166,12 @@ fn echoBody(
                     write_body_offset += pad_len;
                 }
                 write_body_offset = try echoBody(
+                    read_cmsg_buf,
                     source,
                     writer,
                     element_sig,
                     write_body_offset,
+                    fd_ref,
                 );
             }
             sig_offset = array.sig_end;
@@ -125,10 +184,12 @@ fn echoBody(
             }
             const sig_end = dbus.scanStructSig(sig, @intCast(sig_offset + 1));
             write_body_offset = try echoBody(
+                read_cmsg_buf,
                 source,
                 writer,
                 sig[sig_offset + 1 .. sig_end - 1],
                 write_body_offset,
+                fd_ref,
             );
             sig_offset = sig_end;
         },

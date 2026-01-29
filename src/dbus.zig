@@ -3,6 +3,7 @@ const std = @import("std");
 
 pub const address = @import("dbus/address.zig");
 pub const Address = address.Address;
+pub const cmsg = @import("cmsg.zig");
 
 const log_dbus = std.log.scoped(.dbus);
 
@@ -16,14 +17,12 @@ pub const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;
 pub const Writer = std15.Io.Writer;
 pub const Reader = std15.Io.Reader;
 
-pub fn socketWriter(s: std.net.Stream, buffer: []u8) Stream15.Writer {
-    if (zig_atleast_15) return s.writer(buffer);
-    return .init(s, buffer);
-}
-pub fn socketReader(s: std.net.Stream, buffer: []u8) Stream15.Reader {
-    if (zig_atleast_15) return s.reader(buffer);
-    return .init(s, buffer);
-}
+pub const MsgWriter = @import("MsgWriter.zig");
+pub const MsgReader = @import("MsgReader.zig");
+
+pub const SCM = struct {
+    pub const RIGHTS = 1;
+};
 
 const default_system_bus_path = "/var/run/dbus/system_bus_socket";
 pub const default_system_bus_address_str = "unix:path=" ++ default_system_bus_path;
@@ -263,6 +262,7 @@ const HeaderFieldSignature = enum {
 
 const HeaderFieldU32Kind = enum(u8) {
     reply_serial = 5,
+    unix_fds = 9,
 };
 const HeaderFieldStringKind = enum(u8) {
     path = 1,
@@ -329,9 +329,7 @@ const HeaderFieldKind = enum {
             .destination => .string,
             .sender => .string,
             .signature => .signature,
-            // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-            // Is this not supposed to be the unix_fd type 'h' ?
-            .unix_fds => .u32,
+            .unix_fds => .unix_fd,
         };
     }
 
@@ -458,7 +456,7 @@ pub const Type = union(enum) {
             .i64 => 'x',
             .u64 => 't',
             .f64 => 'd',
-            .unix_fd => 'x',
+            .unix_fd => 'h',
             .string => 's',
             .object_path => 'o',
             .signature => 'g',
@@ -480,7 +478,7 @@ pub const Type = union(enum) {
             .i64 => .initStatic("x"),
             .u64 => .initStatic("t"),
             .f64 => .initStatic("d"),
-            .unix_fd => .initStatic("x"),
+            .unix_fd => .initStatic("h"),
             .string => .initStatic("s"),
             .object_path => .initStatic("o"),
             .signature => .initStatic("g"),
@@ -509,7 +507,7 @@ pub const Type = union(enum) {
             .i64 => i64,
             .u64 => u64,
             .f64 => f64,
-            .unix_fd => std.posix.fd_t,
+            .unix_fd => u32,
             .string => Slice(u32, [*]const u8),
             .object_path => Slice(u32, [*]const u8),
             .signature => Slice(u8, [*]const u8),
@@ -523,7 +521,7 @@ pub const Type = union(enum) {
     fn advance(comptime sig_type: Type, start: u32, value: *const sig_type.Native()) error{Overflow}!u32 {
         switch (sig_type) {
             .u8 => return writeSum(&.{ start, 1 }),
-            .i32, .u32 => {
+            .i32, .u32, .unix_fd => {
                 const pad_len: u32 = pad4Len(@truncate(start));
                 return writeSum(&.{ start, pad_len + 4 });
             },
@@ -638,6 +636,7 @@ pub fn flushAuth(writer: *Writer) error{WriteFailed}!void {
     //     std.log.info("sending '{f}'", .{std.zig.fmtString(auth)})
     // else
     //     std.log.info("sending '{}'", .{std.zig.fmtEscapes(auth)});
+
     try writer.writeAll(auth);
     try writer.flush();
 }
@@ -757,6 +756,7 @@ pub const MethodCall = struct {
     destination: ?Slice(u32, [*]const u8) = null,
     interface: ?Slice(u32, [*]const u8) = null,
     member: ?Slice(u32, [*]const u8) = null,
+    unix_fds: ?u32 = null,
     pub fn calcHeaderArrayLen(self: *const MethodCall, signature: ?Slice(u8, [*]const u8)) u32 {
         var header_align: u3 = 0;
         const path_len = calcHeaderStringLen(&header_align, self.path);
@@ -764,7 +764,8 @@ pub const MethodCall = struct {
         const iface_len = if (self.interface) |s| calcHeaderStringLen(&header_align, s) else 0;
         const member_len = if (self.member) |s| calcHeaderStringLen(&header_align, s) else 0;
         const sig_len = if (signature) |s| calcHeaderSigLen(&header_align, s) else 0;
-        return path_len + dest_len + iface_len + member_len + sig_len;
+        const unix_fds_len = if (nonZeroFdCount(self.unix_fds) != null) calcHeaderU32Len(&header_align) else 0;
+        return path_len + dest_len + iface_len + member_len + sig_len + unix_fds_len;
     }
 };
 
@@ -833,6 +834,13 @@ pub fn write(
                 try writer.splatByteAll(0, pad_len);
                 index += pad_len;
                 try writer.writeInt(i32, @field(data, name), native_endian);
+                index += 4;
+            },
+            .unix_fd => {
+                const pad_len = pad4Len(@truncate(index));
+                try writer.splatByteAll(0, pad_len);
+                index += pad_len;
+                try writer.writeInt(u32, @field(data, name), native_endian);
                 index += 4;
             },
             .signature => {
@@ -926,6 +934,11 @@ pub const Align8 = enum {
     }
 };
 
+pub fn nonZeroFdCount(maybe_fd_count: ?u32) ?u32 {
+    const fd_count = maybe_fd_count orelse return null;
+    return if (fd_count == 0) null else fd_count;
+}
+
 pub fn writeStringSize(writer: *Writer, body_start: u32, string_size: u32) error{WriteFailed}!u32 {
     const pad_len = pad4Len(@truncate(body_start));
     try writer.splatByteAll(0, pad_len);
@@ -990,6 +1003,9 @@ pub fn writeMethodCall(
     if (body_sig.len > 0) {
         try writeHeaderSig(writer, &header_align, .initAssume(body_sig));
     }
+    if (nonZeroFdCount(call.unix_fds)) |count| {
+        try writeHeaderU32(writer, &header_align, .unix_fds, count);
+    }
     try writer.splatByteAll(0, pad8Len(header_align));
 
     if (body_sig.len > 0) {
@@ -1002,13 +1018,15 @@ pub const MethodReturn = struct {
     serial: u32,
     reply_serial: u32,
     destination: ?Slice(u32, [*]const u8) = null,
+    unix_fds: ?u32 = null,
 
     pub fn calcHeaderArrayLen(self: *const MethodReturn, signature: ?Slice(u8, [*]const u8)) u32 {
         var header_align: u3 = 0;
         const reply_serial_len = calcHeaderU32Len(&header_align);
         const dest_len = if (self.destination) |s| calcHeaderStringLen(&header_align, s) else 0;
         const sig_len = if (signature) |s| calcHeaderSigLen(&header_align, s) else 0;
-        return reply_serial_len + dest_len + sig_len;
+        const unix_fds_len = if (nonZeroFdCount(self.unix_fds) != null) calcHeaderU32Len(&header_align) else 0;
+        return reply_serial_len + dest_len + sig_len + unix_fds_len;
     }
 };
 
@@ -1382,6 +1400,7 @@ pub const Source = struct {
             .member = null,
             .error_name = null,
             .reply_serial = null,
+            .unix_fds = null,
         };
         var signature: ?Bounded(255) = null;
 
@@ -1449,6 +1468,13 @@ pub const Source = struct {
                     return error.DbusProtocol;
                 }
                 signature = str;
+            },
+            .unix_fds => |count| {
+                if (headers.unix_fds != null) {
+                    log_dbus.err("duplicate unix_fds header", .{});
+                    return error.DbusProtocol;
+                }
+                headers.unix_fds = count;
             },
         };
 
@@ -1729,6 +1755,17 @@ pub const Source = struct {
                 const value = try source.reader.takeInt(i32, it.endian);
                 it.body_offset += 4;
                 source.onBodyConsumed("i");
+                return value;
+            },
+            .unix_fd_index => {
+                const pad_len: u32 = pad4Len(@truncate(it.body_offset));
+                if (try incBody(&.{ it.body_offset, pad_len + 4 }) > it.body_size)
+                    return error.DbusProtocol;
+                try source.reader.discardAll(pad_len);
+                it.body_offset += pad_len;
+                const value = try source.reader.takeInt(u32, it.endian);
+                it.body_offset += 4;
+                source.onBodyConsumed("h");
                 return value;
             },
             .string_size, .object_path_size => {
@@ -2029,6 +2066,7 @@ pub const HeaderFieldIterator = struct {
         destination: Bounded(255),
         sender: Bounded(255),
         signature: Bounded(255),
+        unix_fds: u32,
     };
 
     endian: std.builtin.Endian,
@@ -2206,7 +2244,11 @@ pub const HeaderFieldIterator = struct {
                 return .{ .reply_serial = value };
             },
             .unix_fds => {
-                @panic("todo");
+                // we should already be aligned on a 4-byte boundary
+                std.debug.assert(pad4Len(@truncate(it.bytes_read)) == 0);
+                const value = try reader.takeInt(u32, it.endian);
+                it.bytes_read += 4;
+                return .{ .unix_fds = value };
             },
             .unknown => {
                 @panic("todo");
@@ -2227,6 +2269,7 @@ const ReadKind = enum {
     boolean,
     u32,
     i32,
+    unix_fd_index,
     string_size,
     object_path_size,
     variant_sig,
@@ -2236,6 +2279,7 @@ const ReadKind = enum {
             .boolean => bool,
             .u32 => u32,
             .i32 => i32,
+            .unix_fd_index => u32,
             .string_size => u32,
             .object_path_size => u32,
             .variant_sig => void,
@@ -2247,6 +2291,7 @@ const ReadKind = enum {
             .boolean,
             .u32,
             .i32,
+            .unix_fd_index,
             .string_size,
             .object_path_size,
             => void,
@@ -2270,6 +2315,7 @@ const ReadKind = enum {
             .boolean => 'b',
             .u32 => 'u',
             .i32 => 'i',
+            .unix_fd_index => 'h',
             .string_size => 's',
             .object_path_size => 'o',
             .variant_sig => 'v',
@@ -2345,6 +2391,9 @@ pub fn writeHeaders(
         try writer.print("  signature '{f}'\n", .{s.*});
     } else {
         try writer.writeAll("  signature (none)\n");
+    }
+    if (nonZeroFdCount(headers.unix_fds)) |count| {
+        try writer.print("  unix_fds {d}\n", .{count});
     }
 }
 
@@ -2485,7 +2534,7 @@ fn nextType(comptime sig: []const u8, start: u8) struct { Type, u8 } {
         'x' => .{ .i64, start + 1 },
         't' => .{ .u64, start + 1 },
         'd' => .{ .f64, start + 1 },
-        // 'h' => .{ u32, start+ 1 },
+        'h' => .{ .unix_fd, start + 1 },
 
         // string types
         's' => .{ .string, start + 1 },
