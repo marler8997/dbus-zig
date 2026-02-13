@@ -47,6 +47,10 @@ pub fn getStream(r: *const MsgReader) std.net.Stream {
     return r.net_stream;
 }
 
+pub fn getError(r: *const MsgReader) ?Error {
+    return r.err;
+}
+
 fn streamImpl(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
     const dest = limit.slice(try w.writableSliceGreedy(1));
     var bufs: [1][]u8 = .{dest};
