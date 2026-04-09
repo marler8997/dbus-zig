@@ -16,7 +16,6 @@ pub const Address = union(Transport) {
 
     pub const FromStringError = error{
         UnknownTransport,
-        UnknownUnixOption,
         MultipleUnixPaths,
         UnixMissingPath,
     } || AddrParser.InitError || AddrParser.KeysIterator.NextError || ResolveEscapesError;
@@ -39,8 +38,6 @@ pub const Address = union(Transport) {
                         //path = std.meta.assumeSentinel(resolved.ptr, 0);
                         //std.debug.assert(std.mem.len(path) == new_len);
                         path = kv.unescaped_value;
-                    } else {
-                        return error.UnknownUnixOption;
                     }
                 }
                 return Address{
@@ -176,6 +173,11 @@ test {
         }
         try testing.expect(null == try it.next());
     }
+}
+
+test "Address.fromString with guid option" {
+    const addr = try Address.fromString("unix:path=/run/user/1001/bus,guid=88c2324069201f7b3952bf6169d5c943");
+    try testing.expectEqualSlices(u8, "/run/user/1001/bus", addr.unix.unescaped_path);
 }
 
 // TODO: replace with something in std
