@@ -16,6 +16,7 @@ pub const Address = union(Transport) {
 
     pub const FromStringError = error{
         UnknownTransport,
+        UnknownUnixOption,
         MultipleUnixPaths,
         UnixMissingPath,
     } || AddrParser.InitError || AddrParser.KeysIterator.NextError || ResolveEscapesError;
@@ -38,6 +39,12 @@ pub const Address = union(Transport) {
                         //path = std.meta.assumeSentinel(resolved.ptr, 0);
                         //std.debug.assert(std.mem.len(path) == new_len);
                         path = kv.unescaped_value;
+                    } else if (std.mem.eql(u8, kv.key, "guid")) {
+                        // Per the D-Bus spec, guid is a general-purpose server
+                        // address key safe to ignore. See:
+                        // https://dbus.freedesktop.org/doc/dbus-specification.html
+                    } else {
+                        return error.UnknownUnixOption;
                     }
                 }
                 return Address{
