@@ -12,6 +12,7 @@ const transport_name_map = std.StaticStringMap(Transport).initComptime(.{
 pub const Address = union(Transport) {
     unix: struct {
         unescaped_path: []const u8,
+        guid: ?[]const u8 = null,
     },
 
     pub const FromStringError = error{
@@ -29,6 +30,7 @@ pub const Address = union(Transport) {
         switch (transport) {
             .unix => {
                 var path: ?[]const u8 = null;
+                var guid: ?[]const u8 = null;
                 while (try it.next()) |kv| {
                     if (std.mem.eql(u8, kv.key, "path")) {
                         if (path) |_| return error.MultipleUnixPaths;
@@ -40,9 +42,7 @@ pub const Address = union(Transport) {
                         //std.debug.assert(std.mem.len(path) == new_len);
                         path = kv.unescaped_value;
                     } else if (std.mem.eql(u8, kv.key, "guid")) {
-                        // Per the D-Bus spec, guid is a general-purpose server
-                        // address key safe to ignore. See:
-                        // https://dbus.freedesktop.org/doc/dbus-specification.html
+                        guid = kv.unescaped_value;
                     } else {
                         return error.UnknownUnixOption;
                     }
@@ -50,6 +50,7 @@ pub const Address = union(Transport) {
                 return Address{
                     .unix = .{
                         .unescaped_path = path orelse return error.UnixMissingPath,
+                        .guid = guid,
                     },
                 };
             },
@@ -185,6 +186,13 @@ test {
 test "Address.fromString with guid option" {
     const addr = try Address.fromString("unix:path=/run/user/1001/bus,guid=88c2324069201f7b3952bf6169d5c943");
     try testing.expectEqualSlices(u8, "/run/user/1001/bus", addr.unix.unescaped_path);
+    try testing.expectEqualSlices(u8, "88c2324069201f7b3952bf6169d5c943", addr.unix.guid.?);
+}
+
+test "Address.fromString without guid" {
+    const addr = try Address.fromString("unix:path=/tmp/dbus-test");
+    try testing.expectEqualSlices(u8, "/tmp/dbus-test", addr.unix.unescaped_path);
+    try testing.expect(addr.unix.guid == null);
 }
 
 // TODO: replace with something in std
