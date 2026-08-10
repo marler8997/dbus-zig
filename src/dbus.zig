@@ -1752,6 +1752,17 @@ pub const Source = struct {
                 source.onBodyConsumed("i");
                 return value;
             },
+            .u64 => {
+                const pad_len: u32 = pad8Len(@truncate(it.body_offset));
+                if (try incBody(&.{ it.body_offset, pad_len + 8 }) > it.body_size)
+                    return error.DbusProtocol;
+                try source.reader.discardAll(pad_len);
+                it.body_offset += pad_len;
+                const value = try source.reader.takeInt(u64, it.endian);
+                it.body_offset += 8;
+                source.onBodyConsumed("t");
+                return value;
+            },
             .unix_fd_index => {
                 const pad_len: u32 = pad4Len(@truncate(it.body_offset));
                 if (try incBody(&.{ it.body_offset, pad_len + 4 }) > it.body_size)
@@ -2264,6 +2275,7 @@ const ReadKind = enum {
     boolean,
     u32,
     i32,
+    u64,
     unix_fd_index,
     string_size,
     object_path_size,
@@ -2274,6 +2286,7 @@ const ReadKind = enum {
             .boolean => bool,
             .u32 => u32,
             .i32 => i32,
+            .u64 => u64,
             .unix_fd_index => u32,
             .string_size => u32,
             .object_path_size => u32,
@@ -2286,6 +2299,7 @@ const ReadKind = enum {
             .boolean,
             .u32,
             .i32,
+            .u64,
             .unix_fd_index,
             .string_size,
             .object_path_size,
@@ -2298,6 +2312,8 @@ const ReadKind = enum {
         return switch (kind) {
             .boolean => "boolean",
             .u32 => "u32",
+            .i32 => "i32",
+            .u64 => "u64",
             .string_size => "string",
             .object_path_size => "object path",
             .variant_sig => "variant",
@@ -2310,6 +2326,7 @@ const ReadKind = enum {
             .boolean => 'b',
             .u32 => 'u',
             .i32 => 'i',
+            .u64 => 't',
             .unix_fd_index => 'h',
             .string_size => 's',
             .object_path_size => 'o',
