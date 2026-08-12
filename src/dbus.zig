@@ -1971,6 +1971,24 @@ pub const Source = struct {
         it.body_offset += n;
         source.onDataConsumed(null);
     }
+
+    pub fn dataDiscard(source: Source, n: u32) error{ ReadFailed, EndOfStream }!void {
+        const it = switch (source.state.*) {
+            .err, .auth, .msg_start, .headers => unreachable,
+            .body => |*it| it,
+        };
+        errdefer source.state.* = .err;
+        const body_limit = switch (it.state) {
+            .value => unreachable,
+            .string => |*s| s.body_limit,
+            .variant => unreachable,
+            .array => |a| a.body_limit,
+        };
+        std.debug.assert(it.body_offset + n <= body_limit);
+        try source.reader.discardAll(n);
+        it.body_offset += n;
+        source.onDataConsumed(null);
+    }
 };
 
 pub fn Bounded(comptime max: comptime_int) type {

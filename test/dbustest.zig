@@ -13,6 +13,7 @@ const TestCase = enum {
     struct_uu,
     au,
     as,
+    s_discard,
     a_struct_uu,
     dict_uu,
     dict_us,
@@ -32,6 +33,7 @@ const TestCase = enum {
             .dict_uv => "a{uv}",
             .v_u => "v",
             .v_uu => "v",
+            .s_discard => "s",
             .u_again => "u",
             inline else => |ct| @tagName(ct),
         };
@@ -382,6 +384,19 @@ fn handleClientMessage(
                         }
                         try source.bodyEnd();
                     },
+                    .s_discard => {
+                        const expected = testValues(.s_discard)[0].nativeSlice();
+                        const string_size = try source.readBody(.string_size, {});
+                        std.debug.assert(string_size == expected.len);
+                        // Read only the first 4 bytes, then discard the rest
+                        const read_len = 4;
+                        var buf: [read_len]u8 = undefined;
+                        try source.dataReadSliceAll(&buf);
+                        std.debug.assert(std.mem.eql(u8, &buf, expected[0..read_len]));
+                        try source.dataDiscard(string_size - read_len);
+                        try source.dataReadNullTerm();
+                        try source.bodyEnd();
+                    },
                     .a_struct_uu => {
                         var array: dbus.SourceArray = undefined;
                         try source.readBody(.array_size, &array);
@@ -553,6 +568,7 @@ fn testValues(comptime case: TestCase) dbus.Tuple(case.sig()) {
         .struct_uu => .{.{ 0xb9bfbcc0, 0x264ecbea }},
         .au => .{&au_values},
         .as => .{&as_values},
+        .s_discard => .{.initStatic("a]string*longer/than/four/bytes")},
         .a_struct_uu => .{&a_struct_uu_values},
         .dict_uu => .{&dict_uu_values},
         .dict_us => .{&dict_us_values},
