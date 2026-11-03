@@ -1,8 +1,9 @@
 const std = @import("std");
 const dbus = @import("dbus");
 
-pub fn main() !u8 {
-    const session_addr_str = dbus.getSessionBusAddressString();
+pub fn main(init: std.process.Init.Minimal) !u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const session_addr_str = dbus.getSessionBusAddressString(init.environ);
     const addr = dbus.Address.fromString(session_addr_str.str) catch |err| {
         switch (session_addr_str.origin) {
             .hardcoded_default => unreachable,
@@ -13,7 +14,7 @@ pub fn main() !u8 {
         return 0xff;
     };
 
-    const stream = dbus.connect(addr) catch |err| {
+    const stream = dbus.connect(io, addr) catch |err| {
         std.log.info("failed to connect to '{s}': {s}", .{ session_addr_str.str, @errorName(err) });
         return 0xff;
     };
@@ -49,7 +50,7 @@ pub fn main() !u8 {
     var name_buf: [dbus.max_name:0]u8 = undefined;
 
     var stderr_buf: [1000]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_file.interface;
 
     const name = blk_name: {

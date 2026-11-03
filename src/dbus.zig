@@ -7,16 +7,6 @@ pub const cmsg = @import("cmsg.zig");
 
 const log_dbus = std.log.scoped(.dbus);
 
-pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const zig_atleast_15_2 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 2 }) != .lt;
-
-const std15 = if (zig_atleast_15) std else @import("std15");
-pub const Stream15 = if (zig_atleast_15) std.net.Stream else std15.net.Stream15;
-pub const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;
-
-pub const Writer = std15.Io.Writer;
-pub const Reader = std15.Io.Reader;
-
 pub const MsgWriter = @import("MsgWriter.zig");
 pub const MsgReader = @import("MsgReader.zig");
 pub const UnixFds = MsgReader.UnixFds;
@@ -47,111 +37,27 @@ pub fn getSystemBusAddress() Address {
     @panic("todo");
     //return std.os.getenv("DBUS_SYSTEM_BUS_ADDRESS") orelse default_system_bus_address;
 }
-pub fn getSessionBusAddressString() BusAddressString {
-    if (std.posix.getenv(DBUS_SESSION_BUS_ADDRESS)) |s|
+pub fn getSessionBusAddressString(environ: std.process.Environ) BusAddressString {
+    if (environ.getPosix(DBUS_SESSION_BUS_ADDRESS)) |s|
         return BusAddressString{ .origin = .environment_variable, .str = s };
     return BusAddressString{ .origin = .hardcoded_default, .str = default_system_bus_address_str };
 }
 
-pub const ConnectError = if (zig_atleast_15) error{
+pub const ConnectError = error{
     DbusAddrUnixPathTooBig,
     DbusAddrBadEscapeSequence,
-    AccessDenied,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    SystemResources,
-    AddressInUse,
-    ConnectionRefused,
-    ConnectionTimedOut,
-    FileNotFound,
-} else error{
-    DbusAddrUnixPathTooBig,
-    DbusAddrBadEscapeSequence,
-    PermissionDenied,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    SystemResources,
-    AddressInUse,
-    ConnectionRefused,
-    ConnectionTimedOut,
-    FileNotFound,
-};
-pub fn connect(addr: Address) ConnectError!std.net.Stream {
+} || std.Io.net.UnixAddress.ConnectError;
+pub fn connect(io: std.Io, addr: Address) ConnectError!std.Io.net.Stream {
     switch (addr) {
         .unix => |unix_addr| {
-            var sockaddr = std.posix.sockaddr.un{ .family = std.posix.AF.UNIX, .path = undefined };
-            const path_len = address.resolveEscapes(&sockaddr.path, unix_addr.unescaped_path) catch |err| switch (err) {
+            var path_buf: [std.Io.net.UnixAddress.max_len]u8 = undefined;
+            const path_len = address.resolveEscapes(&path_buf, unix_addr.unescaped_path) catch |err| switch (err) {
                 error.DestTooSmall => return error.DbusAddrUnixPathTooBig,
                 error.BadEscapeSequence => return error.DbusAddrBadEscapeSequence,
             };
-            if (path_len == sockaddr.path.len) return error.DbusAddrUnixPathTooBig;
-            sockaddr.path[path_len] = 0;
-
-            const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| if (zig_atleast_15) switch (err) {
-                error.AccessDenied,
-                error.ProcessFdQuotaExceeded,
-                error.SystemFdQuotaExceeded,
-                error.SystemResources,
-                => |e| return e,
-                error.ProtocolFamilyNotAvailable,
-                error.AddressFamilyNotSupported,
-                error.ProtocolNotSupported,
-                error.SocketTypeNotSupported,
-                error.Unexpected,
-                => unreachable,
-            } else switch (err) {
-                error.PermissionDenied,
-                error.ProcessFdQuotaExceeded,
-                error.SystemFdQuotaExceeded,
-                error.SystemResources,
-                => |e| return e,
-                error.ProtocolFamilyNotAvailable,
-                error.AddressFamilyNotSupported,
-                error.ProtocolNotSupported,
-                error.SocketTypeNotSupported,
-                error.Unexpected,
-                => unreachable,
-            };
-            errdefer std.posix.close(sock);
-
-            const addr_len: std.posix.socklen_t = @intCast(@offsetOf(std.posix.sockaddr.un, "path") + path_len + 1);
-
-            // TODO: should we set any socket options?
-            std.posix.connect(sock, @as(*std.posix.sockaddr, @ptrCast(&sockaddr)), addr_len) catch |err| if (zig_atleast_15) switch (err) {
-                error.PermissionDenied => return error.AccessDenied,
-                error.AccessDenied,
-                error.AddressInUse,
-                error.SystemResources,
-                error.ConnectionRefused,
-                error.ConnectionTimedOut,
-                error.FileNotFound,
-                => |e| return e,
-                error.Unexpected => @panic("unexpected errno from connect"),
-                error.AddressNotAvailable, // doesn't apply to unix sockets
-                error.NetworkUnreachable, // doesn't apply to unix sockets (I think)
-                error.ConnectionResetByPeer, // doesn't applyt to unix sockets
-                error.WouldBlock, // shouldn't happen to a blocking socket
-                error.ConnectionPending, // shouldn't happen to a blocking socket
-                error.AddressFamilyNotSupported,
-                => unreachable,
-            } else switch (err) {
-                error.PermissionDenied,
-                error.AddressInUse,
-                error.SystemResources,
-                error.ConnectionRefused,
-                error.ConnectionTimedOut,
-                error.FileNotFound,
-                => |e| return e,
-                error.Unexpected => @panic("unexpected errno from connect"),
-                error.AddressNotAvailable, // doesn't apply to unix sockets
-                error.NetworkUnreachable, // doesn't apply to unix sockets (I think)
-                error.ConnectionResetByPeer, // doesn't applyt to unix sockets
-                error.WouldBlock, // shouldn't happen to a blocking socket
-                error.ConnectionPending, // shouldn't happen to a blocking socket
-                error.AddressFamilyNotSupported,
-                => unreachable,
-            };
-            return .{ .handle = sock };
+            // path_buf.len is max_len so init can't fail
+            const unix_address = std.Io.net.UnixAddress.init(path_buf[0..path_len]) catch unreachable;
+            return unix_address.connect(io);
         },
     }
 }
@@ -180,18 +86,7 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
     return struct {
         const Self = @This();
         const ptr_info = @typeInfo(Ptr).pointer;
-        pub const NativeSlice = @Type(std.builtin.Type{
-            .pointer = .{
-                .size = .slice,
-                .is_const = ptr_info.is_const,
-                .is_volatile = ptr_info.is_volatile,
-                .alignment = ptr_info.alignment,
-                .address_space = ptr_info.address_space,
-                .child = ptr_info.child,
-                .is_allowzero = ptr_info.is_allowzero,
-                .sentinel_ptr = ptr_info.sentinel_ptr,
-            },
-        });
+        pub const NativeSlice = @Pointer(.slice, ptr_info.attrs, ptr_info.child, ptr_info.sentinel());
 
         ptr: Ptr,
         len: LenType,
@@ -212,8 +107,8 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
         }
 
         pub fn nativeSlice(self: @This()) NativeSlice {
-            if (ptr_info.sentinel_ptr) |sentinel_ptr| {
-                return self.ptr[0..self.len :@as(*const ptr_info.child, @ptrCast(sentinel_ptr)).*];
+            if (comptime ptr_info.sentinel()) |sentinel| {
+                return self.ptr[0..self.len :sentinel];
             } else {
                 return self.ptr[0..self.len];
             }
@@ -221,18 +116,7 @@ pub fn Slice(comptime LenType: type, comptime Ptr: type) type {
 
         pub const format = switch (@typeInfo(Ptr).pointer.child) {
             u8 => (struct {
-                pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-                fn formatNew(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
-                    try writer.writeAll(self.ptr[0..self.len]);
-                }
-                fn formatLegacy(
-                    self: Self,
-                    comptime fmt: []const u8,
-                    options: std.fmt.FormatOptions,
-                    writer: anytype,
-                ) !void {
-                    _ = fmt;
-                    _ = options;
+                fn format(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
                     try writer.writeAll(self.ptr[0..self.len]);
                 }
             }).format,
@@ -625,17 +509,11 @@ pub const Variant = union(enum) {
     }
 };
 
-pub fn flushAuth(writer: *Writer) error{WriteFailed}!void {
+pub fn flushAuth(writer: *std.Io.Writer) error{WriteFailed}!void {
     var auth_buf: [100]u8 = undefined;
-    const auth_len = serializeAuth(&auth_buf, if (zig_atleast_15)
-        std.posix.system.getuid()
-    else
-        std.os.linux.getuid());
+    const auth_len = serializeAuth(&auth_buf, std.os.linux.getuid());
     const auth = auth_buf[0..auth_len];
-    // if (zig_atleast_15)
-    //     std.log.info("sending '{f}'", .{std.zig.fmtString(auth)})
-    // else
-    //     std.log.info("sending '{}'", .{std.zig.fmtEscapes(auth)});
+    // std.log.info("sending '{f}'", .{std.zig.fmtString(auth)});
     try writer.writeAll(auth);
     try writer.flush();
 }
@@ -648,9 +526,7 @@ fn serializeAuth(out_buf: *[100]u8, uid: std.posix.uid_t) usize {
     const uid_str = std.fmt.bufPrint(&uid_str_buf, "{}", .{uid}) catch |err| switch (err) {
         error.NoSpaceLeft => unreachable,
     };
-    const uid_hex = if (zig_atleast_15) std.fmt.bufPrint(out_buf[prefix.len..], "{x}", .{uid_str}) catch |err| switch (err) {
-        error.NoSpaceLeft => unreachable,
-    } else std.fmt.bufPrint(out_buf[prefix.len..], "{}", .{std.fmt.fmtSliceHexLower(uid_str)}) catch |err| switch (err) {
+    const uid_hex = std.fmt.bufPrint(out_buf[prefix.len..], "{x}", .{uid_str}) catch |err| switch (err) {
         error.NoSpaceLeft => unreachable,
     };
     @memcpy(out_buf[prefix.len + uid_hex.len ..][0..2], "\r\n");
@@ -668,19 +544,19 @@ fn calcHeaderU32Len(header_align: *u3) u32 {
 }
 
 pub fn writeHeaderU32(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     header_align: *u3,
     kind: HeaderFieldU32Kind,
     value: u32,
 ) error{WriteFailed}!void {
     const pad_len = pad8Len(header_align.*);
     var buf: [8]u8 = undefined;
-    buf[0] = @intFromEnum(kind);
+    buf[0] = @backingInt(kind);
     buf[1] = 1; // type-sig length
     buf[2] = 'u';
     buf[3] = 0; // type-sig null terminator
     std.mem.writeInt(u32, buf[4..8], value, native_endian);
-    const pad_buf = [1]u8{0} ** 8;
+    const pad_buf: [8]u8 = @splat(0);
     var data = [_][]const u8{
         pad_buf[0..pad_len],
         &buf,
@@ -695,19 +571,19 @@ fn calcHeaderStringLen(header_align: *u3, str: Slice(u32, [*]const u8)) u32 {
     return string_len;
 }
 pub fn writeHeaderString(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     header_align: *u3,
     kind: HeaderFieldStringKind,
     str: Slice(u32, [*]const u8),
 ) error{WriteFailed}!void {
     const pad_len = pad8Len(header_align.*);
     var buf: [8]u8 = undefined;
-    buf[0] = @intFromEnum(kind);
+    buf[0] = @backingInt(kind);
     buf[1] = 1; // type-sig length
     buf[2] = kind.signature().char();
     buf[3] = 0; // type-sig null terminator
     std.mem.writeInt(u32, buf[4..8], str.len, native_endian);
-    const pad_buf = [1]u8{0} ** 8;
+    const pad_buf: [8]u8 = @splat(0);
     var data = [_][]const u8{
         pad_buf[0..pad_len],
         &buf,
@@ -726,16 +602,16 @@ fn calcHeaderSigLen(header_align: *u3, sig: Slice(u8, [*]const u8)) u32 {
     return sig_len;
 }
 pub fn writeHeaderSig(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     header_align: *u3,
     sig: Slice(u8, [*]const u8),
 ) error{WriteFailed}!void {
     const pad_len = pad8Len(header_align.*);
-    const pad_buf = [1]u8{0} ** 8;
+    const pad_buf: [8]u8 = @splat(0);
     var data = [_][]const u8{
         pad_buf[0..pad_len],
         &.{
-            @intFromEnum(HeaderFieldStringKind.sig),
+            @backingInt(HeaderFieldStringKind.sig),
             1, // type-sig length
             'g', // signature type
             0, // type-sig null terminator
@@ -770,26 +646,10 @@ pub const MethodCall = struct {
 
 pub fn Tuple(comptime signature: []const u8) type {
     const types = typesFromSig(signature);
-    var fields: [types.len]std.builtin.Type.StructField = undefined;
+    var field_types: [types.len]type = undefined;
     @setEvalBranchQuota(signature.len * 2000);
-    inline for (types, &fields, 0..) |field_type, *field, i| {
-        const name = std.fmt.comptimePrint("{d}", .{i});
-        field.* = .{
-            .name = name,
-            .type = field_type.Native(),
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(field_type.Native()),
-        };
-    }
-    return @Type(std.builtin.Type{
-        .@"struct" = .{
-            .layout = .auto,
-            .fields = &fields,
-            .decls = &.{},
-            .is_tuple = true,
-        },
-    });
+    for (types, &field_types) |field_type, *t| t.* = field_type.Native();
+    return @Tuple(&field_types);
 }
 
 fn advance(start: u32, comptime signature: []const u8, data: Tuple(signature)) error{Overflow}!u32 {
@@ -806,7 +666,7 @@ fn advance(start: u32, comptime signature: []const u8, data: Tuple(signature)) e
 /// be the case if used to write a message body because the body size must be pre-calculated so it can
 /// be written in the message header as a u32.
 pub fn write(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     full_write_start: u32,
     comptime signature: []const u8,
     data: Tuple(signature),
@@ -938,14 +798,14 @@ pub fn nonZeroFdCount(maybe_fd_count: ?u32) ?u32 {
     return if (fd_count == 0) null else fd_count;
 }
 
-pub fn writeStringSize(writer: *Writer, body_start: u32, string_size: u32) error{WriteFailed}!u32 {
+pub fn writeStringSize(writer: *std.Io.Writer, body_start: u32, string_size: u32) error{WriteFailed}!u32 {
     const pad_len = pad4Len(@truncate(body_start));
     try writer.splatByteAll(0, pad_len);
     try writer.writeInt(u32, string_size, native_endian);
     return body_start + @as(u32, pad_len) + 4;
 }
 pub fn writeArraySize(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     element_align8: Align8,
     body_start: u32,
     array_size: u32,
@@ -969,7 +829,7 @@ pub fn writeArraySize(
 }
 
 pub fn writeMethodCall(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     comptime body_sig: []const u8,
     call: MethodCall,
     body_data: Tuple(body_sig),
@@ -979,7 +839,7 @@ pub fn writeMethodCall(
     // NOTE: full header signature "yyyyuua(yv)"
     const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
-        @intFromEnum(MessageType.method_call), // 1
+        @backingInt(MessageType.method_call), // 1
         0, // flags,
         1, // protocol version
         body_len,
@@ -1030,7 +890,7 @@ pub const MethodReturn = struct {
 };
 
 pub fn writeMethodReturn(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     comptime body_sig: []const u8,
     args: MethodReturn,
     body_data: Tuple(body_sig),
@@ -1039,7 +899,7 @@ pub fn writeMethodReturn(
     const array_data_len = args.calcHeaderArrayLen(if (body_sig.len > 0) .initStatic(body_sig) else null);
     const after_serial = try write(writer, 0, "yyyyuu", .{
         endian_header_value,
-        @intFromEnum(MessageType.method_return), // 2
+        @backingInt(MessageType.method_return), // 2
         0, // flags
         1, // protocol version
         body_len,
@@ -1068,7 +928,7 @@ pub const SourceState = union(enum) {
     auth,
     msg_start,
     headers: struct {
-        endian: std.builtin.Endian,
+        endian: std.lang.Endian,
         msg_type: MessageType,
         body_size: u32,
         header_array_size: u32,
@@ -1077,7 +937,7 @@ pub const SourceState = union(enum) {
 };
 
 const BodyIterator = struct {
-    endian: std.builtin.Endian,
+    endian: std.lang.Endian,
     body_size: u32,
     body_offset: u32,
     body_signature: Bounded(255),
@@ -1134,7 +994,7 @@ pub const SourceVariant = struct {
 };
 
 /// Read a reply line, handling the delimiter and stripping trailing CR.
-fn takeLine(reader: *Reader, reply_name: []const u8) error{ DbusProtocol, ReadFailed, EndOfStream }![]const u8 {
+fn takeLine(reader: *std.Io.Reader, reply_name: []const u8) error{ DbusProtocol, ReadFailed, EndOfStream }![]const u8 {
     const reply = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
         error.ReadFailed, error.EndOfStream => |e| return e,
         error.StreamTooLong => {
@@ -1142,14 +1002,14 @@ fn takeLine(reader: *Reader, reply_name: []const u8) error{ DbusProtocol, ReadFa
             return error.DbusProtocol;
         },
     };
-    // 0.15.2 doesn't toss the delimiter
-    if (zig_atleast_15_2) reader.toss(1);
-    return std.mem.trimRight(u8, reply, "\r");
+    // takeDelimiterExclusive doesn't toss the delimiter
+    reader.toss(1);
+    return std.mem.trimEnd(u8, reply, "\r");
 }
 
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 pub const Source = struct {
-    reader: *Reader,
+    reader: *std.Io.Reader,
     state: *SourceState,
 
     pub fn hasBufferedData(source: Source) bool {
@@ -1162,10 +1022,7 @@ pub const Source = struct {
         errdefer source.state.* = .err;
 
         const reply = try takeLine(source.reader, "AUTH");
-        if (zig_atleast_15)
-            log_dbus.info("AUTH reply: '{f}'", .{std.zig.fmtString(reply)})
-        else
-            log_dbus.info("AUTH reply: '{}'", .{std.zig.fmtEscapes(reply)});
+        log_dbus.info("AUTH reply: '{f}'", .{std.zig.fmtString(reply)});
         if (std.mem.startsWith(u8, reply, "OK ")) {
             // should include a guid, maybe we don't need it though?
             source.state.* = .msg_start;
@@ -1190,7 +1047,7 @@ pub const Source = struct {
         if (std.mem.eql(u8, reply, "AGREE_UNIX_FD")) return .agree;
         const error_prefix = "ERROR";
         if (std.mem.startsWith(u8, reply, error_prefix)) return .{
-            .err = std.mem.trimLeft(u8, reply[error_prefix.len..], " "),
+            .err = std.mem.trimStart(u8, reply[error_prefix.len..], " "),
         };
         log_dbus.err("DBUS Protocol: unhandled NEGOTIATE_UNIX_FD reply from server '{f}'", .{std.zig.fmtString(reply)});
         return error.DbusProtocol;
@@ -1201,14 +1058,11 @@ pub const Source = struct {
         errdefer source.state.* = .err;
 
         const bytes = try source.reader.takeArray(16);
-        const endian: std.builtin.Endian = switch (bytes[0]) {
+        const endian: std.lang.Endian = switch (bytes[0]) {
             'l' => .little,
             'B' => .big,
             else => {
-                if (zig_atleast_15)
-                    log_dbus.err("expected endian 'l' or 'B' but got '{f}'", .{std.zig.fmtString(bytes[0..1])})
-                else
-                    log_dbus.err("expected endian 'l' or 'B' but got '{}'", .{std.zig.fmtEscapes(bytes[0..1])});
+                log_dbus.err("expected endian 'l' or 'B' but got '{f}'", .{std.zig.fmtString(bytes[0..1])});
                 return error.DbusProtocol;
             },
         };
@@ -1218,10 +1072,10 @@ pub const Source = struct {
             return error.DbusProtocol;
         }
         const msg_type: MessageType = switch (bytes[1]) {
-            @intFromEnum(MessageType.method_call) => .method_call,
-            @intFromEnum(MessageType.method_return) => .method_return,
-            @intFromEnum(MessageType.error_reply) => .error_reply,
-            @intFromEnum(MessageType.signal) => .signal,
+            @backingInt(MessageType.method_call) => .method_call,
+            @backingInt(MessageType.method_return) => .method_return,
+            @backingInt(MessageType.error_reply) => .error_reply,
+            @backingInt(MessageType.signal) => .signal,
             else => |t| {
                 log_dbus.err("unknown message type {}", .{t});
                 return error.DbusProtocol;
@@ -1276,7 +1130,7 @@ pub const Source = struct {
         try source.discardBody();
     }
 
-    pub fn streamRemaining(source: Source, writer: *Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
+    pub fn streamRemaining(source: Source, writer: *std.Io.Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
         const headers_read = blk: switch (source.state.*) {
             .err, .auth, .msg_start => unreachable,
             .headers => |*h| {
@@ -1661,7 +1515,7 @@ pub const Source = struct {
         source.state.* = .msg_start;
     }
 
-    pub fn streamBody(source: Source, writer: *Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
+    pub fn streamBody(source: Source, writer: *std.Io.Writer) error{ DbusProtocol, ReadFailed, EndOfStream, WriteFailed }!void {
         const it = switch (source.state.*) {
             .err, .auth, .headers, .msg_start => unreachable,
             .body => |*it| it,
@@ -1958,7 +1812,7 @@ pub const Source = struct {
         source.onDataConsumed(null);
     }
 
-    pub fn dataStreamExact(source: Source, writer: *Writer, n: u32) error{ ReadFailed, EndOfStream, WriteFailed }!void {
+    pub fn dataStreamExact(source: Source, writer: *std.Io.Writer, n: u32) error{ ReadFailed, EndOfStream, WriteFailed }!void {
         const it = switch (source.state.*) {
             .err, .auth, .msg_start, .headers => unreachable,
             .body => |*it| it,
@@ -2017,18 +1871,7 @@ pub fn Bounded(comptime max: comptime_int) type {
             return .{ .ptr = &self.buffer, .len = self.len };
         }
 
-        pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-        pub fn formatNew(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
-            try writer.print("{s}", .{self.slice()});
-        }
-        pub fn formatLegacy(
-            self: @This(),
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) !void {
-            _ = fmt;
-            _ = options;
+        pub fn format(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
             try writer.print("{s}", .{self.slice()});
         }
     };
@@ -2058,7 +1901,7 @@ const HeaderFieldKindNe = enum(u8) {
             log_dbus.err("DBUS Protocol: 0 header field code", .{});
             return error.DbusProtocol;
         }
-        return @enumFromInt(value);
+        return @fromBackingInt(value);
     }
     pub fn expectedSignature(self: HeaderFieldKindNe) ?HeaderFieldSignature {
         return switch (self) {
@@ -2097,7 +1940,7 @@ pub const HeaderFieldIterator = struct {
         unix_fds: u32,
     };
 
-    endian: std.builtin.Endian,
+    endian: std.lang.Endian,
     header_array_len: u32,
     bytes_read: u32 = 0,
 
@@ -2133,7 +1976,7 @@ pub const HeaderFieldIterator = struct {
         it.pending_path = null;
     }
 
-    pub fn next(it: *HeaderFieldIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!?Field {
+    pub fn next(it: *HeaderFieldIterator, reader: *std.Io.Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!?Field {
         if (it.pending_path != null) {
             @panic("notifyPathConsumed was not called");
         }
@@ -2285,7 +2128,7 @@ pub const HeaderFieldIterator = struct {
     }
 };
 
-pub fn consumeStringNullTerm(reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!void {
+pub fn consumeStringNullTerm(reader: *std.Io.Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!void {
     const nullterm = try reader.takeByte();
     if (nullterm != 0) {
         log_dbus.err("string missing 0-terminator", .{});
@@ -2368,7 +2211,7 @@ pub fn arrayPadLen(next_sig_char: u8, current_align: u3) u3 {
 }
 
 pub const MsgStart = struct {
-    endian: std.builtin.Endian,
+    endian: std.lang.Endian,
     type: MessageType,
     flags: MessageFlags,
     body_len: u32,
@@ -2377,7 +2220,7 @@ pub const MsgStart = struct {
 };
 
 pub fn writeHeaders(
-    writer: *Writer,
+    writer: *std.Io.Writer,
     path_buf: []const u8,
     signature: ?*const Bounded(255),
     headers: DynamicHeaders(null),
@@ -2612,9 +2455,9 @@ fn nextType(comptime sig: []const u8, start: u8) struct { Type, u8 } {
 }
 
 pub fn stream(
-    reader: *Reader,
-    writer: *Writer,
-    endian: std.builtin.Endian,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    endian: std.lang.Endian,
     signature: []const u8,
     limit: u32,
     start: u32,
@@ -2726,9 +2569,9 @@ pub fn stream(
 }
 
 fn streamArrayElement(
-    reader: *Reader,
-    writer: *Writer,
-    endian: std.builtin.Endian,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    endian: std.lang.Endian,
     signature: []const u8,
     limit: u32,
     start: u32,
@@ -2848,15 +2691,15 @@ pub fn DynamicHeaders(comptime message_type: ?MessageType) type {
 //     comptime sig: []const u8,
 //     comptime sig_index: *usize,
 //     comptime kind: ReadKind,
-// ) fn (*BodyIterator, *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
+// ) fn (*BodyIterator, *std.Io.Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
 //     const dbus_type, const char_count = nextType(sig[sig_index.*..]);
 //     sig_index.* += char_count;
 //     if (!dbus_type.matchesReadKind(kind)) @compileError("signature indicates type " ++ @tagName(dbus_type) ++ " but code is reading " ++ @tagName(kind));
 //     return readFn(kind);
 // }
-// fn readFn(comptime kind: ReadKind) fn (*BodyIterator, *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
+// fn readFn(comptime kind: ReadKind) fn (*BodyIterator, *std.Io.Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
 //     return (struct {
-//         fn func(it: *BodyIterator, reader: *Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
+//         fn func(it: *BodyIterator, reader: *std.Io.Reader) error{ DbusProtocol, ReadFailed, EndOfStream }!kind.Type() {
 //             const node = (try it.next(reader)) orelse {
 //                 log_dbus.err("expected {s} but body has ended", .{kind.valueName()});
 //                 return error.DbusProtocol;

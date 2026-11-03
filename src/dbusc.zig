@@ -1,43 +1,28 @@
-pub fn main() !u8 {
-    var args_arena = switch (builtin.os.tag) {
-        .windows => std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        else => {},
-    };
-    const cmdline: Cmdline = switch (builtin.os.tag) {
-        .windows => .alloc(args_arena.allocator()),
-        else => .{ .win32_slice = {} },
-    };
-    if (cmdline.len() <= 1) {
+pub fn main(init: std.process.Init.Minimal) !u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const argv = init.args.vector;
+    if (argv.len <= 1) {
         const usage =
             \\Usage:
             \\  dbus call DEST PATH IFACE.METHOD SIG [ARGS...]
             \\
         ;
-        if (dbus.zig_atleast_15) {
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
-            stderr_writer.interface.writeAll(usage) catch return stderr_writer.err orelse error.Unexpected;
-            return 0xff;
-        } else {
-            @panic("todo");
-        }
+        std.Io.File.stderr().writeStreamingAll(io, usage) catch {};
+        return 0xff;
     }
-    const cmd = cmdline.arg(1);
-    const cmd_args = switch (builtin.os.tag) {
-        .windows => cmdline.win32_slice[2..],
-        else => std.os.argv[2..],
-    };
-    if (std.mem.eql(u8, cmd, "call")) return call(cmd_args);
+    const cmd = std.mem.span(argv[1]);
+    if (std.mem.eql(u8, cmd, "call")) return call(io, init.environ, argv[2..]);
     errExit("unknown command '{s}'", .{cmd});
 }
 
-fn connect() !std.net.Stream {
-    const session_addr_str = dbus.getSessionBusAddressString();
+fn connect(io: std.Io, environ: std.process.Environ) !std.Io.net.Stream {
+    const session_addr_str = dbus.getSessionBusAddressString(environ);
     const addr = dbus.Address.fromString(session_addr_str.str) catch |err| errExit(
         "invalid dbus address from environment variable '{s}': {s}",
         .{ session_addr_str.str, @errorName(err) },
     );
 
-    const stream = dbus.connect(addr) catch |err| errExit(
+    const stream = dbus.connect(io, addr) catch |err| errExit(
         "failed to connect to '{s}': {s}",
         .{ session_addr_str.str, @errorName(err) },
     );
@@ -73,7 +58,7 @@ fn connect() !std.net.Stream {
     var name_buf: [dbus.max_name:0]u8 = undefined;
 
     var stderr_buf: [1000]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_file.interface;
 
     const name = blk_name: {
@@ -115,12 +100,12 @@ fn connect() !std.net.Stream {
     return stream;
 }
 
-fn call(call_args: []const Arg) !u8 {
+fn call(io: std.Io, environ: std.process.Environ, call_args: []const [*:0]const u8) !u8 {
     if (call_args.len < 4) errExit("call requires at least 5 args (DEST PATH IFACE.METHOD SIG) but got {}", .{call_args.len});
-    const dest = spanArg(call_args[0]);
-    const path = spanArg(call_args[1]);
-    const iface_dot_method = spanArg(call_args[2]);
-    const sig = spanArg(call_args[3]);
+    const dest = std.mem.span(call_args[0]);
+    const path = std.mem.span(call_args[1]);
+    const iface_dot_method = std.mem.span(call_args[2]);
+    const sig = std.mem.span(call_args[3]);
     const args = call_args[4..];
 
     const iface, const method = blk: {
@@ -131,7 +116,7 @@ fn call(call_args: []const Arg) !u8 {
         break :blk .{ iface_dot_method[0..last_dot], iface_dot_method[last_dot + 1 ..] };
     };
 
-    const stream = try connect();
+    const stream = try connect(io, environ);
     var write_buf: [1000]u8 = undefined;
     var read_buf: [1000]u8 = undefined;
     var msg_writer: dbus.MsgWriter = .init(stream, &write_buf);
@@ -158,7 +143,7 @@ fn call(call_args: []const Arg) !u8 {
     const array_data_len = method_call.calcHeaderArrayLen(sig_typed);
     try writer.writeAll(&[_]u8{
         dbus.endian_header_value,
-        @intFromEnum(dbus.MessageType.method_call), // 1
+        @backingInt(dbus.MessageType.method_call), // 1
         0, // flags,
         1, // protocol version
     });
@@ -189,7 +174,7 @@ fn call(call_args: []const Arg) !u8 {
     try writer.flush();
 
     var stderr_buf: [1000]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_file.interface;
 
     while (true) {
@@ -216,14 +201,14 @@ fn call(call_args: []const Arg) !u8 {
     std.log.info("result signature '{s}'", .{source.bodySignatureSlice()});
 
     var stdout_buf: [1000]u8 = undefined;
-    var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_file = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     try source.streamBody(&stdout_file.interface);
     try stdout_file.interface.flush();
     std.log.info("success", .{});
     return 0;
 }
 
-fn readError(reader: *dbus.Reader, fixed: *const dbus.Fixed) !void {
+fn readError(reader: *std.Io.Reader, fixed: *const dbus.Fixed) !void {
     const headers = try fixed.readErrorHeaders(reader, &.{});
     var it: dbus.BodyIterator = .{
         .endian = fixed.endian,
@@ -249,20 +234,9 @@ fn readError(reader: *dbus.Reader, fixed: *const dbus.Fixed) !void {
     };
 }
 
-const Arg = switch (builtin.os.tag) {
-    .windows => [:0]const u8,
-    else => [*:0]const u8,
-};
-fn spanArg(arg: Arg) [:0]const u8 {
-    return switch (builtin.os.tag) {
-        .windows => arg,
-        else => std.mem.span(arg),
-    };
-}
-
 fn calcBodyLen(
     sig: []const u8,
-    args: []const Arg,
+    args: []const [*:0]const u8,
 ) error{ BodyTooBig, NotEnoughArgs, TooManyArgs }!u32 {
     var total_len: u32 = 0;
     var body_align: u3 = 0;
@@ -270,7 +244,7 @@ fn calcBodyLen(
     var arg_index: usize = 0;
     while (sig_offset < sig.len) {
         if (arg_index >= args.len) return error.NotEnoughArgs;
-        const arg = spanArg(args[arg_index]);
+        const arg = std.mem.span(args[arg_index]);
         arg_index += 1;
         const field = try calcBodyLenField(body_align, sig[sig_offset..], arg);
         total_len, const overflow = @addWithOverflow(total_len, field.len);
@@ -302,8 +276,8 @@ fn calcBodyLenField(body_align: u3, sig: []const u8, arg: []const u8) error{Body
 
 fn writeBody(
     sig: []const u8,
-    args: []const Arg,
-    writer: *dbus.Writer,
+    args: []const [*:0]const u8,
+    writer: *std.Io.Writer,
 ) error{ BodyTooBig, NotEnoughArgs, TooManyArgs, WriteFailed }!u32 {
     var total_len: u32 = 0;
     var body_align: u3 = 0;
@@ -311,7 +285,7 @@ fn writeBody(
     var arg_index: usize = 0;
     while (sig_offset < sig.len) {
         if (arg_index >= args.len) return error.NotEnoughArgs;
-        const arg = spanArg(args[arg_index]);
+        const arg = std.mem.span(args[arg_index]);
         arg_index += 1;
         const field = try writeBodyField(body_align, sig[sig_offset..], arg, writer);
         total_len, const overflow = @addWithOverflow(total_len, field.len);
@@ -328,7 +302,7 @@ fn writeBodyField(
     body_align: u3,
     sig: []const u8,
     arg: []const u8,
-    writer: *dbus.Writer,
+    writer: *std.Io.Writer,
 ) error{ WriteFailed, BodyTooBig }!struct {
     sig_consumed: usize,
     len: u32,
@@ -356,8 +330,5 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(0xff);
 }
 
-const builtin = @import("builtin");
 const std = @import("std");
 const dbus = @import("dbus");
-
-const Cmdline = @import("Cmdline.zig");

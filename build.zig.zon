@@ -2,19 +2,12 @@
     .name = .dbus,
     .fingerprint = 0x45170d333e2eac86,
     .version = "0.0.0",
-    .zig_version = "0.15.2",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "examples",
     },
-    .dependencies = .{
-        .iobackport = .{
-            .url = "git+https://github.com/marler8997/zig-io-backport#16d6621a2b42874dc3a4822be48dbf7e3e7b50ff",
-            .hash = "iobackport-0.0.0-KeWQeDGeAwA_MbngHydEnyLQQuQ4V05Y-KQQSMEte7gw",
-            .lazy = true,
-        },
-    },
+    .dependencies = .{},
 }

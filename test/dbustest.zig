@@ -46,26 +46,27 @@ const TestCase = enum {
     }
 };
 
-pub fn main() !void {
-    const session_addr_str = dbus.getSessionBusAddressString();
+pub fn main(init: std.process.Init.Minimal) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const session_addr_str = dbus.getSessionBusAddressString(init.environ);
     const addr = dbus.Address.fromString(session_addr_str.str) catch |err| errExit(
         "invalid dbus address from environment variable '{s}': {s}",
         .{ session_addr_str.str, @errorName(err) },
     );
 
     var service_conn: Connection = undefined;
-    try service_conn.connect(session_addr_str.str, addr);
+    try service_conn.connect(io, session_addr_str.str, addr);
 
     var service_name_buf: [dbus.max_name]u8 = undefined;
-    const service_name_len = try service_conn.hello(&service_name_buf);
+    const service_name_len = try service_conn.hello(io, &service_name_buf);
     const service_name = service_name_buf[0..service_name_len];
     std.log.info("ServiceName '{s}'", .{service_name});
 
     var client_conn: Connection = undefined;
-    try client_conn.connect(session_addr_str.str, addr);
+    try client_conn.connect(io, session_addr_str.str, addr);
 
     var client_name_buf: [dbus.max_name]u8 = undefined;
-    const client_name_len = try client_conn.hello(&client_name_buf);
+    const client_name_len = try client_conn.hello(io, &client_name_buf);
     const client_name = client_name_buf[0..client_name_len];
     std.log.info("ClientName '{s}'", .{client_name});
 
@@ -78,6 +79,7 @@ pub fn main() !void {
 
     while (client_conn.getSource().hasBufferedData()) {
         try handleClientMessage(
+            io,
             &state,
             client_conn.getWriter(),
             &client_conn.msg_reader.unix_fds,
@@ -86,6 +88,7 @@ pub fn main() !void {
     }
     while (service_conn.getSource().hasBufferedData()) {
         try handleServiceMessage(
+            io,
             &state,
             service_conn.getWriter(),
             &service_conn.msg_reader.unix_fds,
@@ -97,27 +100,27 @@ pub fn main() !void {
         client_conn.getWriter(),
         .{ .ptr = &service_name_buf, .len = service_name_len },
         &state.client_serial,
-        @enumFromInt(0),
+        @fromBackingInt(0),
     );
-    state.client_waiting_for = @enumFromInt(0);
+    state.client_waiting_for = @fromBackingInt(0);
 
     while (state.client_waiting_for != null) {
-        try handleEvent(&state, &service_conn, &client_conn);
+        try handleEvent(io, &state, &service_conn, &client_conn);
     }
 }
 
 const Connection = struct {
     write_buf: [1000]u8,
     read_buf: [1000]u8,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     msg_writer: dbus.MsgWriter,
     msg_reader: dbus.MsgReader,
     source_state: dbus.SourceState,
 
     const fd_buf_count = 10;
 
-    pub fn connect(connection: *Connection, addr_str: []const u8, addr: dbus.Address) !void {
-        const stream = dbus.connect(addr) catch |err| errExit(
+    pub fn connect(connection: *Connection, io: std.Io, addr_str: []const u8, addr: dbus.Address) !void {
+        const stream = dbus.connect(io, addr) catch |err| errExit(
             "failed to connect to '{s}': {s}",
             .{ addr_str, @errorName(err) },
         );
@@ -142,7 +145,7 @@ const Connection = struct {
         };
     }
 
-    pub fn hello(connection: *Connection, out_name_buf: *[dbus.max_name]u8) !u8 {
+    pub fn hello(connection: *Connection, io: std.Io, out_name_buf: *[dbus.max_name]u8) !u8 {
         const writer = &connection.getWriter().interface;
         const source = connection.getSource();
 
@@ -173,7 +176,7 @@ const Connection = struct {
         try writer.flush();
 
         var stderr_buf: [1000]u8 = undefined;
-        var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+        var stderr_file = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
         const stderr = &stderr_file.interface;
 
         while (true) {
@@ -212,13 +215,14 @@ const Connection = struct {
 };
 
 fn handleEvent(
+    io: std.Io,
     state: *State,
     service_conn: *Connection,
     client_conn: *Connection,
 ) !void {
     var fds = [_]std.posix.pollfd{
-        .{ .fd = service_conn.stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = client_conn.stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = service_conn.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = client_conn.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
     };
     const ready = try std.posix.poll(&fds, -1);
     std.debug.assert(ready != 0); // should be impossible with infinite timeout
@@ -226,6 +230,7 @@ fn handleEvent(
     if (fds[0].revents & std.posix.POLL.IN != 0) {
         handled += 1;
         try handleServiceMessage(
+            io,
             state,
             service_conn.getWriter(),
             &service_conn.msg_reader.unix_fds,
@@ -235,6 +240,7 @@ fn handleEvent(
     if (fds[1].revents & std.posix.POLL.IN != 0) {
         handled += 1;
         try handleClientMessage(
+            io,
             state,
             client_conn.getWriter(),
             &client_conn.msg_reader.unix_fds,
@@ -245,13 +251,14 @@ fn handleEvent(
     return;
 }
 fn handleServiceMessage(
+    io: std.Io,
     state: *State,
     msg_writer: *dbus.MsgWriter,
     unix_fds: *dbus.UnixFds,
     source: dbus.Source,
 ) !void {
     var stderr_buf: [1000]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_file.interface;
 
     while (true) {
@@ -314,13 +321,14 @@ fn handleServiceMessage(
 }
 
 fn handleClientMessage(
+    io: std.Io,
     state: *State,
     msg_writer: *dbus.MsgWriter,
     unix_fds: *dbus.UnixFds,
     source: dbus.Source,
 ) !void {
     var stderr_buf: [1000]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_file.interface;
 
     while (true) {
@@ -491,8 +499,8 @@ fn handleClientMessage(
                         std.debug.assert(0 == try source.readBody(.unix_fd_index, {}));
                         try source.bodyEnd();
                         const fd = unix_fds.take(0).?;
-                        defer std.posix.close(fd);
-                        std.debug.assert(try isTestMemfd(fd));
+                        defer std.Io.Threaded.closeFd(fd);
+                        std.debug.assert(try isTestMemfd(io, fd));
                     },
                     .u_again => {
                         std.debug.assert(msg_start.body_len == 4);
@@ -502,12 +510,12 @@ fn handleClientMessage(
                 }
 
                 const next_case: TestCase = blk: {
-                    const int = @as(u32, @intFromEnum(waiting_for)) + 1;
-                    if (int == std.meta.fields(TestCase).len) {
+                    const int = @as(u32, @backingInt(waiting_for)) + 1;
+                    if (int == @typeInfo(TestCase).@"enum".field_names.len) {
                         state.client_waiting_for = null;
                         return;
                     }
-                    break :blk @enumFromInt(int);
+                    break :blk @fromBackingInt(@intCast(int));
                 };
                 try flushMethodCall(
                     msg_writer,
@@ -617,7 +625,7 @@ fn flushMethodCall(
         0 => {},
         1 => {
             std.log.info("closing fd {} (client message sent)", .{memfd});
-            std.posix.close(memfd);
+            std.Io.Threaded.closeFd(memfd);
         },
     };
 
@@ -650,11 +658,11 @@ fn flushMethodCall(
     client_serial_ref.* += 1;
 }
 
-fn isTestMemfd(fd: std.posix.fd_t) !bool {
+fn isTestMemfd(io: std.Io, fd: std.posix.fd_t) !bool {
     var buf: [200]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buf, "/proc/self/fd/{d}", .{fd}) catch unreachable;
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link_target = try std.posix.readlinkZ(path, &link_buf);
+    const path = std.fmt.bufPrint(&buf, "/proc/self/fd/{d}", .{fd}) catch unreachable;
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link_target = link_buf[0..try std.Io.Dir.cwd().readLink(io, path, &link_buf)];
     return std.mem.startsWith(u8, link_target, "/memfd:" ++ test_memfd_name);
 }
 
