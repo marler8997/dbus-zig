@@ -1,7 +1,5 @@
 const std = @import("std");
 
-pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardOptimizeOption(.{});
@@ -9,11 +7,6 @@ pub fn build(b: *std.Build) void {
     const dbus_module = b.addModule("dbus", .{
         .root_source_file = b.path("src/dbus.zig"),
     });
-    if (!zig_atleast_15) {
-        if (b.lazyDependency("iobackport", .{})) |iobackport_dep| {
-            dbus_module.addImport("std15", iobackport_dep.module("std15"));
-        }
-    }
 
     const test_step = b.step("test", "");
 
@@ -50,9 +43,7 @@ pub fn build(b: *std.Build) void {
 
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(&install.step);
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
 
         const run_step = b.step(example_name, "Run the " ++ example_name ++ " example");
         run_step.dependOn(&run_cmd.step);
@@ -75,9 +66,7 @@ pub fn build(b: *std.Build) void {
 
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(&install.step);
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
 
         const run_step = b.step("daemon", "Run the app");
         run_step.dependOn(&run_cmd.step);
@@ -101,9 +90,7 @@ pub fn build(b: *std.Build) void {
 
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(&install.step);
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
 
         const run_step = b.step("dbusc", "Run the cli tool");
         run_step.dependOn(&run_cmd.step);
@@ -177,9 +164,7 @@ pub fn build(b: *std.Build) void {
         }
 
         const run = b.addRunArtifact(exe);
-        if (b.args) |args| {
-            run.addArgs(args);
-        }
+        run.addPassthruArgs();
         b.step("fuzz", "Run the fuzz tester").dependOn(&run.step);
     }
 }

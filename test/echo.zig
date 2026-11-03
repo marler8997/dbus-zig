@@ -10,12 +10,12 @@ pub fn handle(
     // we first write the entire message to our own buffer so we can fill in the
     // body size (near the start of the message) after we've finished serializing it
     var hold_buffer: [2000]u8 = undefined;
-    var hold_writer: dbus.Writer = .fixed(&hold_buffer);
+    var hold_writer: std.Io.Writer = .fixed(&hold_buffer);
     const writer = &hold_writer;
 
     _ = try dbus.write(writer, 0, "yyyyuu", .{
         dbus.endian_header_value,
-        @intFromEnum(dbus.MessageType.method_return),
+        @backingInt(dbus.MessageType.method_return),
         0, // flags
         1, // protocol version
         0, // body placeholder
@@ -62,7 +62,9 @@ pub fn handle(
 
     std.debug.assert(response_writer.control == null);
     const maybe_fd: ?std.posix.fd_t = if (maybe_fd_index) |fd_index| unix_fds.take(fd_index) else null;
-    defer if (maybe_fd) |fd| std.posix.close(fd);
+    defer if (maybe_fd) |fd| {
+        std.Io.Threaded.closeFd(fd);
+    };
     var write_entry: dbus.cmsg.Entry(std.posix.fd_t) = if (maybe_fd) |fd| .{
         .level = std.os.linux.SOL.SOCKET,
         .type = dbus.SCM.RIGHTS,
@@ -76,7 +78,7 @@ pub fn handle(
 
 fn echoBody(
     source: dbus.Source,
-    writer: *dbus.Writer,
+    writer: *std.Io.Writer,
     sig: []const u8,
     body_start: u32,
     fd_index_ref: *?u32,

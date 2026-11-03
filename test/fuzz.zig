@@ -7,8 +7,9 @@ fn usage() noreturn {
     std.process.exit(1);
 }
 
-pub fn main() !void {
-    var args = std.process.args();
+pub fn main(init: std.process.Init.Minimal) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var args = init.args.iterate();
     _ = args.next(); // skip program name
     const seed_filename = args.next() orelse usage();
     const time_limit_ns: u64 = blk: {
@@ -21,11 +22,11 @@ pub fn main() !void {
     if (args.next() != null) errExit("error: too many cmdline args", .{});
 
     const initial_seed: u64 = blk: {
-        if (std.fs.path.dirname(seed_filename)) |d| try std.fs.cwd().makePath(d);
-        var file = std.fs.cwd().openFile(seed_filename, .{}) catch |err| switch (err) {
+        if (std.fs.path.dirname(seed_filename)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
+        var file = std.Io.Dir.cwd().openFile(io, seed_filename, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 std.log.info("no seed file '{s}' generating a new one", .{seed_filename});
-                try saveSeedFile(seed_filename, 0);
+                try saveSeedFile(io, seed_filename, 0);
                 break :blk 0;
             },
             else => |e| errExit(
@@ -33,20 +34,20 @@ pub fn main() !void {
                 .{ seed_filename, @errorName(e) },
             ),
         };
-        defer file.close();
-        const seed = try parseSeedFile(seed_filename, file);
+        defer file.close(io);
+        const seed = try parseSeedFile(io, seed_filename, file);
         std.log.info("restored seed {} from file", .{seed});
         break :blk seed;
     };
 
-    const start_ns = std.time.nanoTimestamp();
+    const start: std.Io.Timestamp = .now(io, .awake);
     var next_seed = initial_seed;
     while (true) {
         std.log.info("testing seed {}", .{next_seed});
         try testSeed(next_seed);
         next_seed += 1;
-        try saveSeedFile(seed_filename, next_seed);
-        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - start_ns);
+        try saveSeedFile(io, seed_filename, next_seed);
+        const elapsed: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (elapsed >= time_limit_ns) {
             std.log.info("time limit reached after {} seeds", .{next_seed - initial_seed});
             return;
@@ -54,39 +55,39 @@ pub fn main() !void {
     }
 }
 
-fn readSeedFile(seed_filename: []const u8) !u64 {
-    var file = std.fs.cwd().openFile(seed_filename, .{}) catch |e| errExit(
+fn readSeedFile(io: std.Io, seed_filename: []const u8) !u64 {
+    var file = std.Io.Dir.cwd().openFile(io, seed_filename, .{}) catch |e| errExit(
         "open seed file '{s}' failed with {s}",
         .{ seed_filename, @errorName(e) },
     );
-    defer file.close();
-    return parseSeedFile(seed_filename, file);
+    defer file.close(io);
+    return parseSeedFile(io, seed_filename, file);
 }
-fn parseSeedFile(seed_filename: []const u8, file: std.fs.File) !u64 {
-    var reader = file.reader(&.{});
+fn parseSeedFile(io: std.Io, seed_filename: []const u8, file: std.Io.File) !u64 {
+    var reader = file.reader(io, &.{});
     var read_buf: [100]u8 = undefined;
     const content_len = try reader.interface.readSliceShort(&read_buf);
     if (content_len == read_buf.len) errExit(
         "seed file '{s}' is too long",
         .{seed_filename},
     );
-    const content = std.mem.trimRight(u8, read_buf[0..content_len], "\r\n");
+    const content = std.mem.trimEnd(u8, read_buf[0..content_len], "\r\n");
     return std.fmt.parseInt(u64, content, 10) catch errExit(
         "seed file content '{s}' is not an integer",
         .{content},
     );
 }
 
-fn saveSeedFile(seed_filename: []const u8, seed: u64) !void {
+fn saveSeedFile(io: std.Io, seed_filename: []const u8, seed: u64) !void {
     // std.log.info("writing seed {}", .{seed});
     {
-        var file = try std.fs.cwd().createFile(seed_filename, .{});
-        defer file.close();
+        var file = try std.Io.Dir.cwd().createFile(io, seed_filename, .{});
+        defer file.close(io);
         var seed_buf: [100]u8 = undefined;
         const seed_str = std.fmt.bufPrint(&seed_buf, "{}\n", .{seed}) catch unreachable;
-        try file.writeAll(seed_str);
+        try file.writeStreamingAll(io, seed_str);
     }
-    std.debug.assert(seed == try readSeedFile(seed_filename));
+    std.debug.assert(seed == try readSeedFile(io, seed_filename));
 }
 
 fn testSeed(seed: u64) !void {
@@ -115,16 +116,16 @@ fn fuzzRoundTrip(input: []const u8) !void {
         },
     }
     defer {
-        std.posix.close(fds[0]);
-        std.posix.close(fds[1]);
+        std.Io.Threaded.closeFd(fds[0]);
+        std.Io.Threaded.closeFd(fds[1]);
     }
     const memfd = try std.posix.memfd_createZ("fuzz-test", 0);
-    defer std.posix.close(memfd);
+    defer std.Io.Threaded.closeFd(memfd);
 
     const write_buf_size = smith.nextMinMax(u16, 1, 4096);
     const read_buf_size = smith.nextMinMax(u16, 1, 4096);
 
-    const canary = [_]u8{0xde} ** 16;
+    const canary: [16]u8 = @splat(0xde);
     var write_buf_with_canary: [4096 + canary.len]u8 = undefined;
     const write_buf = write_buf_with_canary[0..write_buf_size];
     @memcpy(write_buf_with_canary[write_buf.len..][0..canary.len], &canary);
@@ -133,8 +134,8 @@ fn fuzzRoundTrip(input: []const u8) !void {
     const read_buf = read_buf_with_canary[0..read_buf_size];
     @memcpy(read_buf_with_canary[read_buf.len..][0..canary.len], &canary);
 
-    var msg_writer = dbus.MsgWriter.init(.{ .handle = fds[0] }, write_buf);
-    var msg_reader = dbus.MsgReader.init(.{ .handle = fds[1] }, read_buf);
+    var msg_writer = dbus.MsgWriter.init(socketStream(fds[0]), write_buf);
+    var msg_reader = dbus.MsgReader.init(socketStream(fds[1]), read_buf);
     defer msg_reader.deinit();
 
     const writer = &msg_writer.interface;
@@ -232,7 +233,7 @@ fn fuzzRoundTrip(input: []const u8) !void {
                     if (smith.next(bool)) {
                         const received_fd = msg_reader.unix_fds.take(0) orelse
                             std.debug.panic("expected to receive fd", .{});
-                        std.posix.close(received_fd);
+                        std.Io.Threaded.closeFd(received_fd);
                     }
                 }
             },
@@ -250,6 +251,10 @@ fn fuzzRoundTrip(input: []const u8) !void {
         ));
     }
     std.debug.assert(!expect_fd);
+}
+
+fn socketStream(handle: std.posix.socket_t) std.Io.net.Stream {
+    return .{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } };
 }
 
 const TestData = struct {

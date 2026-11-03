@@ -2,13 +2,18 @@ const MsgWriter = @This();
 
 interface: std.Io.Writer,
 err: ?Error = null,
-net_stream: std.net.Stream,
+net_stream: std.Io.net.Stream,
 
 control: ?cmsg.Array = null,
 
-pub const Error = std.posix.WriteError;
+pub const Error = error{
+    WouldBlock,
+    ConnectionResetByPeer,
+    SystemResources,
+    BrokenPipe,
+} || std.posix.UnexpectedError;
 
-pub fn init(net_stream: std.net.Stream, buffer: []u8) MsgWriter {
+pub fn init(net_stream: std.Io.net.Stream, buffer: []u8) MsgWriter {
     return .{
         .interface = .{
             .vtable = &.{ .drain = drain },
@@ -22,7 +27,7 @@ const max_buffers_len = 16;
 
 fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
     const w: *MsgWriter = @alignCast(@fieldParentPtr("interface", io_w));
-    const handle = w.net_stream.handle;
+    const handle = w.net_stream.socket.handle;
     const buffered = io_w.buffered();
     var iovecs: [max_buffers_len]std.posix.iovec_const = undefined;
 

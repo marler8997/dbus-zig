@@ -51,8 +51,8 @@ pub fn next(self: *@This(), T: type) T {
         },
         .@"struct" => |@"struct"| {
             var result: T = undefined;
-            inline for (@"struct".fields) |field| {
-                @field(result, field.name) = self.next(field.type);
+            inline for (@"struct".field_names, @"struct".field_types) |name, FieldType| {
+                @field(result, name) = self.next(FieldType);
             }
             return result;
         },
@@ -66,22 +66,22 @@ pub fn next(self: *@This(), T: type) T {
         },
         .@"enum" => |@"enum"| {
             // If we can, just treat the enum like a number
-            if (!@"enum".is_exhaustive) return @enumFromInt(self.next(@"enum".tag_type));
+            if (@"enum".mode == .nonexhaustive) return @fromBackingInt(self.next(@"enum".tag_type));
 
             // Otherwise, we pick a random field. We may use a larger type than strictly necessary
             // for a more even distribution.
-            const n = self.next(std.meta.Int(.unsigned, @max(@typeInfo(@"enum".tag_type).int.bits * 2, 16)));
-            const m = n % @"enum".fields.len;
-            inline for (@"enum".fields, 0..) |field, i| {
-                if (i == m) return @enumFromInt(field.value);
+            const n = self.next(@Int(.unsigned, @max(@typeInfo(@"enum".tag_type).int.bits * 2, 16)));
+            const m = n % @"enum".field_values.len;
+            inline for (@"enum".field_values, 0..) |value, i| {
+                if (i == m) return @fromBackingInt(value);
             }
             unreachable;
         },
         .@"union" => |@"union"| {
             const tag = self.next(@"union".tag_type.?);
-            inline for (@"union".fields) |field| {
-                if (std.mem.eql(u8, field.name, @tagName(tag))) {
-                    return @unionInit(T, field.name, self.next(field.type));
+            inline for (@"union".field_names, @"union".field_types) |name, FieldType| {
+                if (std.mem.eql(u8, name, @tagName(tag))) {
+                    return @unionInit(T, name, self.next(FieldType));
                 }
             }
             unreachable;
@@ -103,7 +103,7 @@ pub fn nextMinMax(self: *@This(), T: type, min: T, max: T) T {
 }
 
 fn nextRaw(self: *@This(), T: type) T {
-    var bytes: [@sizeOf(T)]u8 = .{0} ** @sizeOf(T);
+    var bytes: [@sizeOf(T)]u8 = @splat(0);
     for (0..bytes.len) |i| {
         bytes[i] = if (self.input.len == 0) 0 else self.input[self.index];
         self.index += 1;
