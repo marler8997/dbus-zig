@@ -284,11 +284,9 @@ test pad8Len {
 
     inline for (&.{ 4, 8 }) |align_to| {
         for (0..10) |multiplier| {
-            std.debug.print("test align={} value={}\n", .{ align_to, multiplier * align_to });
             try std.testing.expectEqual(0, padLen(align_to, @truncate(multiplier * align_to)));
         }
         for (1..align_to + 1) |i| {
-            std.debug.print("test align={} value={}\n", .{ align_to, i });
             try std.testing.expectEqual(align_to - i, padLen(align_to, @truncate(i)));
         }
     }
