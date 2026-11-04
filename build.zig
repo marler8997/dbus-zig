@@ -157,6 +157,9 @@ pub fn build(b: *std.Build) void {
 
         {
             const run_test = b.addRunArtifact(exe);
+            // the fuzzer logs every seed to stderr; let it through instead of having the
+            // build runner capture it and report it under "failed command:"
+            run_test.stdio = .inherit;
             _ = run_test.addOutputFileArg("seed");
             run_test.addArg("2"); // 2 seconds
             b.step("fuzz-test", "").dependOn(&run_test.step);
