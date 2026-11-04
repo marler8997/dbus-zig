@@ -43,16 +43,15 @@ pub fn getSessionBusAddressString(environ: std.process.Environ) BusAddressString
     return BusAddressString{ .origin = .hardcoded_default, .str = default_system_bus_address_str };
 }
 
-pub const ConnectError = error{
-    DbusAddrUnixPathTooBig,
-    DbusAddrBadEscapeSequence,
-} || std.Io.net.UnixAddress.ConnectError;
+pub const ConnectError = error{DbusAddrBadEscapeSequence} ||
+    std.Io.net.UnixAddress.InitError ||
+    std.Io.net.UnixAddress.ConnectError;
 pub fn connect(io: std.Io, addr: Address) ConnectError!std.Io.net.Stream {
     switch (addr) {
         .unix => |unix_addr| {
             var path_buf: [std.Io.net.UnixAddress.max_len]u8 = undefined;
             const path_len = address.resolveEscapes(&path_buf, unix_addr.unescaped_path) catch |err| switch (err) {
-                error.DestTooSmall => return error.DbusAddrUnixPathTooBig,
+                error.DestTooSmall => return error.NameTooLong,
                 error.BadEscapeSequence => return error.DbusAddrBadEscapeSequence,
             };
             // path_buf.len is max_len so init can't fail
@@ -60,6 +59,18 @@ pub fn connect(io: std.Io, addr: Address) ConnectError!std.Io.net.Stream {
             return unix_address.connect(io);
         },
     }
+}
+
+test "connect unix path length limit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = "/tmp/dbus-zig-test-nonexistent/";
+    const max = std.Io.net.UnixAddress.max_len;
+    const fill: [max + 1 - dir.len]u8 = @splat('x');
+    // a path that exactly fills sun_path is passed to the kernel
+    const fits = try Address.fromString("unix:path=" ++ dir ++ fill[1..]);
+    try std.testing.expectError(error.FileNotFound, connect(io, fits));
+    const too_long = try Address.fromString("unix:path=" ++ dir ++ fill);
+    try std.testing.expectError(error.NameTooLong, connect(io, too_long));
 }
 
 pub const MessageType = enum(u8) {
@@ -995,16 +1006,31 @@ pub const SourceVariant = struct {
 
 /// Read a reply line, handling the delimiter and stripping trailing CR.
 fn takeLine(reader: *std.Io.Reader, reply_name: []const u8) error{ DbusProtocol, ReadFailed, EndOfStream }![]const u8 {
-    const reply = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+    const reply = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
         error.ReadFailed, error.EndOfStream => |e| return e,
         error.StreamTooLong => {
             log_dbus.err("DBUS Protocol: {s} reply exceeded {} bytes", .{ reply_name, reader.buffer.len });
             return error.DbusProtocol;
         },
     };
-    // takeDelimiterExclusive doesn't toss the delimiter
-    reader.toss(1);
-    return std.mem.trimEnd(u8, reply, "\r");
+    return std.mem.trimEnd(u8, reply, "\r\n");
+}
+
+fn testReadAuth(calls: []const std.testing.Reader.Call) !SourceState {
+    var buf: [min_read_buf]u8 = undefined;
+    var reader: std.testing.Reader = .init(&buf, calls);
+    var state: SourceState = .auth;
+    const source: Source = .{ .reader = &reader.interface, .state = &state };
+    try source.readAuth();
+    return state;
+}
+
+test "readAuth reply split across reads" {
+    try std.testing.expectEqual(.msg_start, try testReadAuth(&.{ .{ .buffer = "OK 12" }, .{ .buffer = "34\r\n" } }));
+}
+
+test "readAuth reply without a newline" {
+    try std.testing.expectError(error.EndOfStream, testReadAuth(&.{.{ .buffer = "OK 1234" }}));
 }
 
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
