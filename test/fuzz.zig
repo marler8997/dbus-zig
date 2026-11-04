@@ -43,7 +43,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const start: std.Io.Timestamp = .now(io, .awake);
     var next_seed = initial_seed;
     while (true) {
-        std.log.info("testing seed {}", .{next_seed});
         try testSeed(next_seed);
         next_seed += 1;
         try saveSeedFile(io, seed_filename, next_seed);
@@ -81,11 +80,13 @@ fn parseSeedFile(io: std.Io, seed_filename: []const u8, file: std.Io.File) !u64 
 fn saveSeedFile(io: std.Io, seed_filename: []const u8, seed: u64) !void {
     // std.log.info("writing seed {}", .{seed});
     {
-        var file = try std.Io.Dir.cwd().createFile(io, seed_filename, .{});
-        defer file.close(io);
+        // write a temp file and rename it over the seed file so it's never empty or partial
+        var atomic = try std.Io.Dir.cwd().createFileAtomic(io, seed_filename, .{ .replace = true });
+        defer atomic.deinit(io);
         var seed_buf: [100]u8 = undefined;
         const seed_str = std.fmt.bufPrint(&seed_buf, "{}\n", .{seed}) catch unreachable;
-        try file.writeStreamingAll(io, seed_str);
+        try atomic.file.writeStreamingAll(io, seed_str);
+        try atomic.replace(io);
     }
     std.debug.assert(seed == try readSeedFile(io, seed_filename));
 }
